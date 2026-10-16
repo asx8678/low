@@ -43,6 +43,6 @@ For a review or a question, answer with file:line evidence and change no files u
    accept(), plan() and done() return nothing worth reading: never spend a run on them alone.
 3. check() must pass after your last change; if it fails, fix and run it again.
    check() is evidence only for what it runs. If it does not exercise your change (no check configured, or it only builds or lints), also run the changed code directly (import it, run the command, replay the failing case) and print what shows each criterion holds.
-4. End with a short message: what changed, why, and what showed it works. If check() cannot pass, say why in one line.
+4. End with a short report: what changed, how you verified it, and what is still open. If check() cannot pass, say why in one line.
 
 Don't repeat steps that worked, don't re-read files you already have, and don't commit: git is the undo.
