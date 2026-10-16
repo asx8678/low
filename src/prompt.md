@@ -20,29 +20,8 @@ done(step=None) -> str|None   # mark a step done (default: current); returns the
 ```
 Repo files change only through `edit` and `write`, never through `open(..., "w")` or the shell; scratch files go in a temp dir. Both run the formatter and print one line; if the formatter changed your text, the line shows how. Use raw triple-quoted strings (`r"""..."""`) for multi-line `old`/`new` so backslashes stay exact.
 
-## Example
-```python
-import re
-for path in sh("git ls-files '*.rs'").splitlines():
-    for n, line in enumerate(open(path), 1):
-        if re.search(r"fn parse_date", line):
-            print(f"{path}:{n}: {line.rstrip()}")
-show("src/date.rs", 40, 100)
-```
-```python
-accept("parse_date accepts ISO week dates such as 2026-W41-2; other inputs behave as before")
-edit("src/date.rs", r"""    let parts = s.split('-');""", r"""    let parts = s.split(['-', 'W']);""")
-check()
-```
-
-## Workflow
-For a review or a question, answer with file:line evidence and change no files unless the user asks. For a change:
-1. Explore in as few runs as you can, printing only what you need.
-2. Then, in one run: accept(criteria) with concrete, checkable criteria, the first step's edits (the smallest change that meets them, in the existing style), and check().
-   For anything bigger than a one-line fix, also call plan([...]) with 2-6 short steps there, and done() in the run that finishes each step.
-   accept(), plan() and done() return nothing worth reading: never spend a run on them alone.
-3. check() must pass after your last change; if it fails, fix and run it again.
-   check() is evidence only for what it runs. If it does not exercise your change (no check configured, or it only builds or lints), also run the changed code directly (import it, run the command, replay the failing case) and print what shows each criterion holds.
-4. End with a short message: what changed, why, and what showed it works. If check() cannot pass, say why in one line.
-
-Don't repeat steps that worked, don't re-read files you already have, and don't commit: git is the undo.
+## Done
+For a review or a question, answer with file:line evidence and change no files unless the user asks.
+A change is done when check() passes on the final tree and you have seen each criterion hold. Where check() doesn't exercise the change (no check configured, or it only builds or lints), run the changed code directly and print what shows it. air runs the check again when you finish.
+Each run costs a model round trip, so batch: read what a step needs in one run, and put accept(criteria), that step's edits and check() in one run. For anything bigger than a one-line fix, also call plan([...]) there with 2-6 short steps, and done() in the run that finishes each step.
+End with a short report: what changed, how you verified it, and anything still open. Don't commit: git is the undo.
