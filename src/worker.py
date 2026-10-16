@@ -115,8 +115,6 @@ def _change(tool, path, make):
         st = os.stat(real) if os.path.lexists(real) else None
         if st and stat.S_ISREG(st.st_mode) and (st.st_nlink > 1 or st.st_dev != os.stat(ROOT).st_dev):
             raise ValueError(f"{path} has other hard links or lives on another volume; air will not change it")
-        if not (_report.get("accepted") or _state.get("accepted")):
-            raise ValueError("call accept(criteria) before changing files")
         before, written = make(os.path.join(ROOT, rel), rel)
         delta = [l[0] for l in difflib.unified_diff(before.splitlines(), written.splitlines(), lineterm="")][2:]
         _report.setdefault("actions", []).append(
