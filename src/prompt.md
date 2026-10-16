@@ -20,21 +20,6 @@ done(step=None) -> str|None   # mark a step done (default: current); returns the
 ```
 Repo files change only through `edit` and `write`, never through `open(..., "w")` or the shell; scratch files go in a temp dir. Both run the formatter and print one line; if the formatter changed your text, the line shows how. Use raw triple-quoted strings (`r"""..."""`) for multi-line `old`/`new` so backslashes stay exact.
 
-## Example
-```python
-import re
-for path in sh("git ls-files '*.rs'").splitlines():
-    for n, line in enumerate(open(path), 1):
-        if re.search(r"fn parse_date", line):
-            print(f"{path}:{n}: {line.rstrip()}")
-show("src/date.rs", 40, 100)
-```
-```python
-accept("parse_date accepts ISO week dates such as 2026-W41-2; other inputs behave as before")
-edit("src/date.rs", r"""    let parts = s.split('-');""", r"""    let parts = s.split(['-', 'W']);""")
-check()
-```
-
 ## Workflow
 For a review or a question, answer with file:line evidence and change no files unless the user asks. For a change:
 1. Explore in as few runs as you can, printing only what you need.
