@@ -141,12 +141,39 @@ def _change(tool, path, make):
 
 
 def _forget():
+    """Unloads the repo's modules after a change. Names that runs bound to one of them, or to a function or class from
+    one, are rebound to the new code; anything else from them (instances) is dropped, as is a name whose module no
+    longer imports."""
+    stale = {}
     for name, mod in list(sys.modules.items()):
         path = getattr(mod, "__file__", None)
         if path and "site-packages" not in path and os.path.realpath(path).startswith(ROOT + os.sep):
-            del sys.modules[name]
-            for key in [k for k, v in G.items() if v is mod or getattr(v, "__module__", None) == name]:
+            stale[name] = sys.modules.pop(name)
+    fresh = {}
+
+    def load(name):
+        if name not in fresh:
+            fresh[name] = importlib.import_module(name)
+            for sub in [s for s in stale if s.startswith(name + ".")]:
+                with contextlib.suppress(Exception):
+                    importlib.import_module(sub)
+        return fresh[name]
+    for key, value in list(G.items()):
+        module, owner = next((n for n, m in stale.items() if m is value), None), None
+        with contextlib.suppress(Exception):
+            owner = module or getattr(value, "__module__", None)
+        if owner not in stale:
+            continue
+        attr = getattr(value, "__name__", None) if module is None else None
+        try:
+            if module:
+                G[key] = load(module)
+            elif attr and getattr(stale[owner], attr, None) is value:
+                G[key] = getattr(load(owner), attr)
+            else:
                 del G[key]
+        except Exception:
+            G.pop(key, None)
 
 
 def edit(path, old, new=None):
