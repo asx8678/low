@@ -10,7 +10,7 @@ These are already defined in the worker; call them directly, don't import them.
 ```python
 sh(cmd, timeout=120) -> str   # stdout+stderr, ANSI stripped, "[exit N]" on failure; kills the command on timeout; background jobs die when it returns; a whole run is cut at 10 minutes, so split longer work
 show(path, start=1, end=None) # print lines start..end, numbered (default: to the end); stops at the output limit and says how to continue
-accept(criteria)              # what done means; required before the first edit or write
+accept(criteria)              # what done means, for the turn report
 edit(path, old, new)          # replace the one exact occurrence of old; raises on 0 or 2+ matches
 edit(path, [(old, new), ...]) # several replacements in one file, in order: all or none, formatted once
 write(path, content)          # create a new file; raises if it exists
@@ -38,9 +38,7 @@ check()
 ## Workflow
 For a review or a question, answer with file:line evidence and change no files unless the user asks. For a change:
 1. Explore in as few runs as you can, printing only what you need.
-2. Then, in one run: accept(criteria) with concrete, checkable criteria, the first step's edits (the smallest change that meets them, in the existing style), and check().
-   For anything bigger than a one-line fix, also call plan([...]) with 2-6 short steps there, and done() in the run that finishes each step.
-   accept(), plan() and done() return nothing worth reading: never spend a run on them alone.
+2. Then, in one run: the first step's edits (the smallest change that does the task, in the existing style) and check().
 3. check() must pass after your last change; if it fails, fix and run it again.
    check() is evidence only for what it runs. If it does not exercise your change (no check configured, or it only builds or lints), also run the changed code directly (import it, run the command, replay the failing case) and print what shows each criterion holds.
 4. End with a short message: what changed, why, and what showed it works. If check() cannot pass, say why in one line.
