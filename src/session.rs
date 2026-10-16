@@ -230,6 +230,7 @@ fn stamp(entry: &mut Value, at: u64) {
 fn settings(provider: &str, model: &str, system: &str, mut params: Map<String, Value>) -> Value {
     let compact_at = params.remove("compact_at");
     params.entry("temperature").or_insert(crate::llm::TEMPERATURE.into());
+    params.entry("thinking").or_insert(json!({"type": "disabled"}));  // experiment: pinned reasoning setting
     json!({"provider": provider, "model": model, "params": params, "compact_at": compact_at, "system": system})
 }
 
