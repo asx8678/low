@@ -212,13 +212,16 @@ def edit(path, old, new=None, *more):
 
 def write(path, content):
     def make(full, rel):
+        before = ""
         if os.path.lexists(full):
-            raise ValueError(f"{rel} exists; use edit")
-        data = content.encode("utf-8")
+            if os.path.islink(full) or not os.path.isfile(full):
+                raise ValueError(f"{rel} exists and is not a regular file")
+            with open(full, encoding="utf-8", newline="") as f:
+                before = f.read()
         os.makedirs(os.path.dirname(full), exist_ok=True)
-        with open(full, "xb") as f:
-            f.write(data)
-        return "", content
+        with open(full, "wb") as f:
+            f.write(content.encode("utf-8"))
+        return before, content
     _change("write", path, make)
 
 
