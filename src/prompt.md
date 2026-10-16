@@ -13,7 +13,7 @@ show(path, start=1, end=None) # print lines start..end, numbered (default: to th
 accept(criteria)              # what done means; required before the first edit or write
 edit(path, old, new)          # replace the one exact occurrence of old; raises on 0 or 2+ matches
 edit(path, [(old, new), ...]) # several replacements in one file, in order: all or none, formatted once
-write(path, content)          # create a new file; raises if it exists
+write(path, content)          # create a new file; for existing files use edit
 check() -> bool               # runs the project check and prints its result
 plan(steps)                   # this task's steps, shown to the user; replaces any earlier plan
 done(step=None) -> str|None   # mark a step done (default: current); returns the next step
