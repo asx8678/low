@@ -43,6 +43,9 @@ const SECRETS: &[(&str, &str, usize, &str)] = &[
 const GATE: &str = "The project check failed on the current tree. Fix what fails, run check(), then finish again. \
                     If it cannot pass, say why in one line. The check output ended with:";
 const RETRY: &str = "Send one run() now with the next step, or a shorter answer.";
+const STRAY: &str = "This turn changed files without edit() or write():";
+const STRAY_END: &str = "Delete the ones that are scratch output from running code, keep any that are part of your answer, \
+                         then finish again.";
 const HELPERS: &[&str] = &["sh", "show", "accept", "edit", "write", "check", "plan", "done"];
 const SANDBOX: &str = "\n\n## Sandbox\nYour code runs in a sandbox. Writes outside the repo and temp dirs fail, as do \
                        writes into any .git directory and reads of credentials and private data in the home directory \
@@ -282,7 +285,7 @@ impl Agent {
         // The push first writes what the snapshot logged, so the turn begins at the task itself.
         let began = self.session.entries.len() - 1;
         self.current = Some((began, clock));
-        let (mut nudged, mut overflowed, mut retries, mut stalled) = (false, false, 0, false);
+        let (mut nudged, mut overflowed, mut retries, mut stalled, mut strayed) = (false, false, 0, false, false);
         let ceiling = self.compact_at * TURN_BUDGET;
         let mut spent = 0;
         let mut limit = format!("stopped after {MAX_REQUESTS} model requests in one turn");
@@ -379,6 +382,24 @@ impl Agent {
                 continue;
             }
             let changed = self.changed(&start, began).await;
+            // A turn that changed files without edit() or write() most likely left output from running code behind.
+            if changed && !strayed && !self.session.entries[began..].iter().any(|e| edited(&e["meta"])) {
+                strayed = true;
+                let since = std::time::SystemTime::now() - clock.elapsed();
+                let paths: Vec<String> = self.diff(began, since).await?.lines().filter_map(changed_path).collect();
+                if !paths.is_empty() {
+                    stalled = false;
+                    ui::event(
+                        "nudge",
+                        "files changed outside edit()/write(): asking the model about them",
+                        Value::Null,
+                    );
+                    ui::activity("waiting for the model");
+                    let text = format!("{STRAY} {}. {STRAY_END}", paths.join(", "));
+                    self.session.push(json!({"role": "user", "content": text, "meta": {"host": true}}))?;
+                    continue;
+                }
+            }
             let mut checked = false;
             if changed && let Some(check) = &self.config.check {
                 let (ok, out) = self.verify(&check.clone(), true).await;
@@ -599,19 +620,11 @@ impl Agent {
         clock: Instant,
     ) -> Result<bool> {
         self.session.flush()?;
+        let changes = self.diff(began, std::time::SystemTime::now() - clock.elapsed()).await?;
         let first = &self.session.entries[began];
         let snapshot = first["meta"]["snapshot"].as_str().and_then(|s| s.split(' ').next());
-        let index = self.session.index();
-        let since = std::time::SystemTime::now() - clock.elapsed();
-        let (root, base) = (self.root.clone(), snapshot.map(String::from));
-        let busy = ui::busy("diffing the working tree");
-        let changes =
-            tokio::task::spawn_blocking(move || changes(&root, base.as_deref().map(|t| (t, index.as_path())), since))
-                .await?;
-        drop(busy);
         let changed = changed.unwrap_or(changes != "none");
-        let path =
-            |l: &str| l.strip_suffix(" (new)").or_else(|| l.rsplit_once(" +").map(|(path, _)| path)).map(String::from);
+        let path = changed_path;
         let turn = &self.session.entries[began..];
         let actions = turn.iter().flat_map(|e| e["meta"]["actions"].as_array().into_iter().flatten());
         let own: Vec<&str> = actions.filter(|a| a["ok"] == true).filter_map(|a| a["path"].as_str()).collect();
@@ -700,6 +713,15 @@ impl Agent {
             "prompt": prompt, "cached": cached, "out": out, "ms": ms,
         }}))?;
         Ok(good)
+    }
+
+    /// What changed since the turn's snapshot, a line per file as the turn report lists them ("none" when nothing did).
+    async fn diff(&self, began: usize, since: std::time::SystemTime) -> Result<String> {
+        let snapshot = self.session.entries[began]["meta"]["snapshot"].as_str().and_then(|s| s.split(' ').next());
+        let (root, base, index) = (self.root.clone(), snapshot.map(String::from), self.session.index());
+        let _busy = ui::busy("diffing the working tree");
+        Ok(tokio::task::spawn_blocking(move || changes(&root, base.as_deref().map(|t| (t, index.as_path())), since))
+            .await?)
     }
 
     pub fn cost(&self) {
@@ -929,6 +951,11 @@ fn context(root: &Path, config: &Config, yolo: bool) -> serde_json::Map<String, 
         "check": config.check.as_deref().map(|c| redact(c).0), "fmt": config.fmt.as_deref().map(|f| redact(f).0),
     });
     context.as_object().cloned().unwrap_or_default()
+}
+
+/// The path in one of changes()'s lines.
+fn changed_path(line: &str) -> Option<String> {
+    line.strip_suffix(" (new)").or_else(|| line.rsplit_once(" +").map(|(path, _)| path)).map(String::from)
 }
 
 fn edited(meta: &Value) -> bool {
