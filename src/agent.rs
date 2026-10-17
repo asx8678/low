@@ -974,7 +974,7 @@ fn own_changes(turn: &[Value]) -> String {
             let file = files.entry(path).or_default();
             file.0 += action["added"].as_u64().unwrap_or(0);
             file.1 += action["removed"].as_u64().unwrap_or(0);
-            file.2 |= action["tool"] == "write";
+            file.2 |= action["tool"] == "write" && action["replaced"] != true;
         }
     }
     let lines: Vec<String> = files

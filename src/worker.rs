@@ -389,6 +389,15 @@ mod tests {
         let reply = run(&mut worker, "edit('a.py', 'return 4', 'return 5')\nassert check()\nfinish('done')").await;
         assert_eq!((&reply["finish"], &reply["own"], &reply["check"]), (&json!("done"), &json!(0), &json!(true)));
         assert_eq!(run(&mut worker, "print('x')\nfinish('done')").await["own"], 2);
+        // write() replaces a regular file, keeping CRLF line ends, and refuses anything else that exists.
+        let reply = run(&mut worker, "write('a.py', 'x = 1\\n')").await;
+        assert_eq!((&reply["out"], &reply["actions"][0]["replaced"]), (&json!("write a.py: ok\n"), &json!(true)));
+        std::fs::write(dir.join("w.txt"), "one\r\ntwo\r\n").unwrap();
+        run(&mut worker, "write('w.txt', 'three\\n')").await;
+        assert_eq!(std::fs::read_to_string(dir.join("w.txt")).unwrap(), "three\r\n");
+        std::fs::create_dir(dir.join("d")).unwrap();
+        let reply = run(&mut worker, "write('d', 'x')").await;
+        assert!(reply["out"].as_str().is_some_and(|out| out.contains("d exists and is not a regular file")), "{reply}");
         drop(worker);
         let _ = std::fs::remove_dir_all(&dir);
     }

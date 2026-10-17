@@ -117,8 +117,10 @@ def _change(tool, path, make):
             raise ValueError(f"{path} has other hard links or lives on another volume; low will not change it")
         before, written = make(os.path.join(ROOT, rel), rel)
         delta = [l[0] for l in difflib.unified_diff(before.splitlines(), written.splitlines(), lineterm="")][2:]
-        _report.setdefault("actions", []).append(
-            {"tool": tool, "path": rel, "ok": True, "added": delta.count("+"), "removed": delta.count("-")})
+        action = {"tool": tool, "path": rel, "ok": True, "added": delta.count("+"), "removed": delta.count("-")}
+        if tool == "write" and st:
+            action["replaced"] = True
+        _report.setdefault("actions", []).append(action)
     except Exception as e:
         _report.setdefault("actions", []).append({"tool": tool, "path": rel, "ok": False, "error": str(e)})
         raise
@@ -204,16 +206,19 @@ def edit(path, old, new=None):
 
 def write(path, content):
     def make(full, rel):
-        before = ""
+        before, text = "", content
         if os.path.lexists(full):
             if os.path.islink(full) or not os.path.isfile(full):
                 raise ValueError(f"{rel} exists and is not a regular file")
             with open(full, encoding="utf-8", newline="") as f:
                 before = f.read()
+            # A file with CRLF line ends keeps them, as it does under edit().
+            if "\r\n" in before and before.count("\r\n") == before.count("\n") and "\r" not in content:
+                text = content.replace("\n", "\r\n")
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "wb") as f:
-            f.write(content.encode("utf-8"))
-        return before, content
+            f.write(text.encode("utf-8"))
+        return before, text
     _change("write", path, make)
 
 
