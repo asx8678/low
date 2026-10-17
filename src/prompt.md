@@ -14,6 +14,7 @@ accept(criteria)              # what done means; required before the first edit 
 edit(path, old, new)          # replace the one exact occurrence of old; raises on 0 or 2+ matches
 edit(path, [(old, new), ...]) # several replacements in one file, in order: all or none, formatted once
 write(path, content)          # create a new file; raises if it exists
+undo(*paths)                  # put files back as they were when this turn began (default: all this turn changed); files write() created are removed
 check() -> bool               # runs the project check and prints its result
 plan(steps)                   # this task's steps, shown to the user; replaces any earlier plan
 done(step=None) -> str|None   # mark a step done (default: current); returns the next step

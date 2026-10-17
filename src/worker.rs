@@ -336,9 +336,13 @@ fn newest_python(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
 mod tests {
     use serde_json::{Value, json};
 
-    /// Runs code the way the agent does, answering check() with a pass.
     async fn run(worker: &mut super::Worker, code: &str) -> Value {
-        let mut reply = worker.run(code, &json!({})).await.unwrap();
+        run_with(worker, code, &json!({})).await
+    }
+
+    /// Runs code the way the agent does, answering check() with a pass.
+    async fn run_with(worker: &mut super::Worker, code: &str, state: &Value) -> Value {
+        let mut reply = worker.run(code, state).await.unwrap();
         while reply["needs_check"] == true {
             reply = worker.resume(true, "[check passed: true]").await.unwrap();
         }
@@ -386,6 +390,17 @@ mod tests {
             assert!(reply["out"].as_str().is_some_and(|out| out.contains(part)), "{code}: {reply}");
         }
         assert!(std::fs::read_to_string(dir.join("a.py")).unwrap().contains("return 4"));
+        let git =
+            |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&dir).output().unwrap().stdout;
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        let state = json!({"turn": 7, "snapshot": String::from_utf8_lossy(&git(&["write-tree"])).trim()});
+        let changed = "edit('a.py', 'return 4', 'return 9')\nwrite('c.py', 'x = 1\\n')";
+        assert_eq!(run_with(&mut worker, changed, &state).await["out"], "edit a.py: ok\nwrite c.py: ok\n");
+        assert_eq!(run_with(&mut worker, "undo()", &state).await["out"], "undo a.py: ok\nundo c.py: removed\n");
+        assert!(std::fs::read_to_string(dir.join("a.py")).unwrap().contains("return 4") && !dir.join("c.py").exists());
+        let reply = run_with(&mut worker, "undo('nope.py')", &state).await;
+        assert!(reply["out"].as_str().is_some_and(|out| out.contains("nope.py was not in the snapshot")), "{reply}");
         let reply = run(&mut worker, "edit('a.py', 'return 4', 'return 5')\nassert check()\nfinish('done')").await;
         assert_eq!((&reply["finish"], &reply["own"], &reply["check"]), (&json!("done"), &json!(0), &json!(true)));
         assert_eq!(run(&mut worker, "print('x')\nfinish('done')").await["own"], 2);

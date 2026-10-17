@@ -19,6 +19,7 @@ _report = {}
 _state = {}
 _checked = None
 _said = 0  # bytes this run printed through edit, write and check, the output the model can predict
+_turn = {}  # what this turn's edit() and write() changed and created, for undo()
 _groups = set()
 _deadline = time.monotonic() + RUN_CAP
 
@@ -101,7 +102,7 @@ def _say(text):
     _said += os.fstat(1).st_size - before
 
 
-def _change(tool, path, make):
+def _change(tool, path, make, fmt=True):
     rel = _rel(path)
     real = os.path.realpath(os.path.join(ROOT, rel))
     signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
@@ -119,14 +120,20 @@ def _change(tool, path, make):
         delta = [l[0] for l in difflib.unified_diff(before.splitlines(), written.splitlines(), lineterm="")][2:]
         _report.setdefault("actions", []).append(
             {"tool": tool, "path": rel, "ok": True, "added": delta.count("+"), "removed": delta.count("-")})
+        _turn.setdefault("touched", set()).add(rel)
+        if tool == "write":
+            _turn.setdefault("created", set()).add(rel)
     except Exception as e:
         _report.setdefault("actions", []).append({"tool": tool, "path": rel, "ok": False, "error": str(e)})
         raise
     finally:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
     _forget()
+    if not os.path.lexists(os.path.join(ROOT, rel)):
+        _say(f"{tool} {rel}: removed")
+        return
     note = ""
-    if FMT:
+    if FMT and fmt:
         out, code = _exec(f"{FMT} {shlex.quote('./' + rel if rel.startswith('-') else rel)}", 60)
         note = f"; fmt failed: {out.strip().splitlines()[0] if out.strip() else code}" if code else ""
     with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
@@ -214,6 +221,33 @@ def write(path, content):
     _change("write", path, make)
 
 
+def undo(*paths):
+    tree = str(_state.get("snapshot") or "").split(" ")[0]
+    if not tree:
+        raise ValueError("undo() needs the snapshot low takes when a turn begins, and it takes none outside a git repository")
+    for path in paths or sorted(_turn.get("touched", ())):
+        rel = _rel(path)
+        blob = subprocess.run(["git", "cat-file", "blob", f"{tree}:{rel}"], cwd=ROOT, capture_output=True)
+        if blob.returncode and rel not in _turn.get("created", ()):
+            raise ValueError(f"{rel} was not in the snapshot taken when this turn began, and write() did not create it")
+        _change("undo", rel, lambda full, rel: _put(full, None if blob.returncode else blob.stdout), fmt=False)
+
+
+def _put(full, data):
+    """Writes data (bytes) to full, or removes it when data is None; returns the text before and after."""
+    before = ""
+    if os.path.lexists(full):
+        with open(full, encoding="utf-8", errors="replace") as f:
+            before = f.read()
+    if data is None:
+        os.remove(full)
+        return before, ""
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "wb") as f:
+        f.write(data)
+    return before, data.decode("utf-8", "replace")
+
+
 def sh(cmd, timeout=120):
     entry = [str(cmd), None, []]
     _report.setdefault("cmds", []).append(entry)
@@ -293,8 +327,8 @@ def finish(report):
     _report["finish"] = str(report)
 
 
-TOOLS = {"sh": sh, "show": show, "edit": edit, "write": write, "accept": accept, "plan": plan, "done": done, "check": check,
-         "finish": finish}
+TOOLS = {"sh": sh, "show": show, "edit": edit, "write": write, "undo": undo, "accept": accept, "plan": plan, "done": done,
+         "check": check, "finish": finish}
 G = {"__name__": "__main__", **TOOLS}
 HELPERS = tuple(f"{name}()" for name in TOOLS)
 
@@ -320,6 +354,8 @@ _outbox.flush()
 for n, request in enumerate(_inbox, 1):
     request = json.loads(request)
     code, _state = request["code"], request.get("state") or {}
+    if _state.get("turn") != _turn.get("turn"):
+        _turn = {"turn": _state.get("turn")}
     _deadline = time.monotonic() + RUN_CAP
     _report.clear()
     _said = 0

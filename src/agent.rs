@@ -31,7 +31,7 @@ const RETRY: &str = "Send one run() now with the next step, or a shorter answer.
 const STRAY: &str = "This turn changed files without edit() or write():";
 const STRAY_END: &str = "Delete the ones that are scratch output from running code, keep any that are part of your answer, \
                          then finish again.";
-const HELPERS: &[&str] = &["sh", "show", "accept", "edit", "write", "check", "plan", "done", "finish"];
+const HELPERS: &[&str] = &["sh", "show", "accept", "edit", "write", "undo", "check", "plan", "done", "finish"];
 const SANDBOX: &str = "\n\n## Sandbox\nYour code runs in a sandbox. Writes outside the repo and temp dirs fail, as do \
                        writes into any .git directory and reads of credentials and private data in the home directory \
                        (ssh and cloud keys, shell history, browser data, other tools' configs). Only a fixed set of \
@@ -541,8 +541,11 @@ impl Agent {
 
     async fn run_code(&mut self, code: &str) -> (String, Value) {
         ui::run(code);
-        let state = self.session.state();
-        let state = json!({"accepted": state.accepted, "plan": state.plan});
+        let (state, turn) = (self.session.state(), self.current.map(|(began, _)| began));
+        // undo() restores from the snapshot this turn began with.
+        let snapshot =
+            turn.and_then(|began| self.session.entries[began]["meta"]["snapshot"].as_str()).unwrap_or_default();
+        let state = json!({"accepted": state.accepted, "plan": state.plan, "turn": turn, "snapshot": snapshot});
         let clock = Instant::now();
         let ran = async {
             let mut reply = self.worker()?.run(code, &state).await?;
