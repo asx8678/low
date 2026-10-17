@@ -155,6 +155,26 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
         ranked.iter().map(|(path, (rank, i))| format!("{} {path} #{i}", ["", "modified", "created"][*rank])).collect();
     let check_output: Vec<String> =
         failing_check.map(|i| format!("#{i}\n{}", quote(tail(text(i), 1536)))).into_iter().collect();
+    // The newest task's plan as plan() and done() left it, as Session::state() reads it: its steps are otherwise only in
+    // the code of the run that called plan(), which a summary can replace.
+    let mut plans = newest_task(entries).map_or(&[][..], |u| &entries[u..]).iter().rev().map(|e| &e["meta"]["plan"]);
+    let live = plans.find(|p| p.is_object()).unwrap_or(&Value::Null);
+    let done: Vec<u64> = live["done"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
+    let steps = live["steps"].as_array().map_or(&[][..], Vec::as_slice);
+    let next = (1..=steps.len() as u64).find(|n| !done.contains(n));
+    let plan: Vec<String> = (1..)
+        .zip(steps)
+        .map(|(n, step)| {
+            let mark = if done.contains(&n) {
+                "✓"
+            } else if next == Some(n) {
+                "▸"
+            } else {
+                "·"
+            };
+            format!("{mark} {n}. {}", line(step.as_str().unwrap_or_default(), 160))
+        })
+        .collect();
 
     // (entry, what happened)
     let mut events = vec![];
@@ -216,6 +236,7 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
     for (title, lines, cap) in [
         ("Recent user directions", dialogue, 16_384),
         ("Accepted criteria", criteria, 2_048),
+        ("Plan (✓ done, ▸ next)", plan, 1_536),
         ("Unresolved failures", failures.into_iter().map(|(_, l)| l).collect(), 3_072),
         ("Failing check output", check_output, 3_200),
         ("Status", status, 1_536),
