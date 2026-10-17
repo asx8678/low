@@ -18,13 +18,14 @@ while IFS= read -r task <&3 || [ -n "$task" ]; do
     case $task in '' | '#'*) continue ;; esac
     n=$((n + 1))
     printf '\n── task %d: %s\n' "$n" "$task" >&2
-    # low prints [session PATH] or [resumed PATH] on stderr before the turn starts; tee keeps it on screen too.
+    # low prints [session PATH] or [resumed PATH] on stderr before the turn starts; tee keeps it on screen too. The --
+    # keeps a task that starts with a dash, such as a "- fix the tests" bullet, from being read as an option.
     if [ -z "$session" ]; then
-        low "$@" "$task" </dev/null 2> >(tee "$err" >&2)
+        low "$@" -- "$task" </dev/null 2> >(tee "$err" >&2)
         status=$?
         session=$(sed -n 's/^\[session \(.*\)\]$/\1/p' "$err" | head -n 1)
     else
-        low "$@" --resume "$task" </dev/null 2> >(tee "$err" >&2)
+        low "$@" --resume -- "$task" </dev/null 2> >(tee "$err" >&2)
         status=$?
         resumed=$(sed -n 's/^\[resumed \(.*\)\]$/\1/p' "$err" | head -n 1)
         if [ "$resumed" != "$session" ]; then
