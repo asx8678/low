@@ -91,7 +91,7 @@ impl Agent {
             };
             web(provider, &config.providers[provider].base_url)?;
             let profile = config.models.get(&model).cloned().unwrap_or_default();
-            let system = system_prompt(root, yolo, config.check.is_some(), repo);
+            let system = system_prompt(root, yolo, config.check.as_deref(), repo);
             Session::create(home, root, provider, &model, &system, profile, context)?
         };
         let (provider, llm) = connect(&config.providers, session.header())?;
@@ -188,7 +188,7 @@ impl Agent {
         anyhow::ensure!(self.config.providers.contains_key(provider), "no provider named {provider}");
         web(provider, &self.config.providers[provider].base_url)?;
         let profile = self.config.models.get(model).cloned().unwrap_or_default();
-        let system = system_prompt(&self.root, self.yolo, self.config.check.is_some(), self.repo);
+        let system = system_prompt(&self.root, self.yolo, self.config.check.as_deref(), self.repo);
         self.session.switch(provider, model, &system, profile)?;
         (self.provider, self.llm) = connect(&self.config.providers, self.session.header())?;
         self.compact_at = self.session.header()["compact_at"].as_u64().unwrap_or(COMPACT_AT);
@@ -955,11 +955,12 @@ fn finish(mut meta: Value) -> (String, Value) {
     (out, meta)
 }
 
-fn system_prompt(root: &Path, yolo: bool, check: bool, repo: bool) -> String {
+fn system_prompt(root: &Path, yolo: bool, check: Option<&str>, repo: bool) -> String {
     let mut prompt = include_str!("prompt.md").to_string();
-    if !check {
-        prompt += "\nNo check command is configured, so check() runs nothing.";
-    }
+    prompt += &match check {
+        Some(check) => format!("\ncheck() runs `{}`.", redact(check).0),
+        None => "\nNo check command is configured, so check() runs nothing.".into(),
+    };
     let read_only = !yolo && worker::read_only(root);
     if read_only {
         prompt += "\n\nThis folder is the user's home directory or above it: you can read files here but not change them. \
