@@ -10,6 +10,7 @@ These are already defined in the worker; call them directly, don't import them.
 ```python
 sh(cmd, timeout=120) -> str   # stdout+stderr, ANSI stripped, "[exit N]" on failure; kills the command on timeout; background jobs die when it returns; a whole run is cut at 10 minutes, so split longer work
 show(path, start=1, end=None) # print lines start..end, numbered (default: to the end); stops at the output limit and says how to continue
+show(path, "regex")           # print each def/fn/class block with a line matching regex, numbered: find and read in one call
 accept(criteria)              # what done means; required before the first edit or write
 edit(path, old, new)          # replace the one exact occurrence of old; raises on 0 or 2+ matches
 edit(path, [(old, new), ...]) # several replacements in one file, in order: all or none, formatted once
@@ -22,12 +23,8 @@ Repo files change only through `edit` and `write`, never through `open(..., "w")
 
 ## Example
 ```python
-import re
-for path in sh("git ls-files '*.rs'").splitlines():
-    for n, line in enumerate(open(path), 1):
-        if re.search(r"fn parse_date", line):
-            print(f"{path}:{n}: {line.rstrip()}")
-show("src/date.rs", 40, 100)
+for path in sh("git grep -l 'fn parse_date'").splitlines():
+    show(path, r"fn parse_date")
 ```
 ```python
 accept("parse_date accepts ISO week dates such as 2026-W41-2; other inputs behave as before")

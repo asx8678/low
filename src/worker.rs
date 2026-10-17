@@ -386,6 +386,20 @@ mod tests {
             assert!(reply["out"].as_str().is_some_and(|out| out.contains(part)), "{code}: {reply}");
         }
         assert!(std::fs::read_to_string(dir.join("a.py")).unwrap().contains("return 4"));
+        let file = "import os\\n\\n\\ndef first():\\n    x = 1\\n    return x\\n\\n\\nclass K:\\n    def method(self):\\n        y = 2\\n        return y\\n";
+        for (code, out) in [
+            (
+                format!("write('b.py', '{file}')\nshow('b.py', r'return y')"),
+                "write b.py: ok\n[b.py: the blocks with a line matching 'return y', lines 10-12 of 12]\n10:     def method(self):\n11:         y = 2\n12:         return y\n",
+            ),
+            (
+                "show('b.py', r'x = 1|y = 2')".into(),
+                "[b.py: the blocks with a line matching 'x = 1|y = 2', lines 4-6, 10-12 of 12]\n4: def first():\n5:     x = 1\n6:     return x\n…\n10:     def method(self):\n11:         y = 2\n12:         return y\n",
+            ),
+            ("show('b.py', 'zzz')".into(), "[b.py: no line matches 'zzz']\n"),
+        ] {
+            assert_eq!(run(&mut worker, &code).await["out"], out, "{code}");
+        }
         drop(worker);
         let _ = std::fs::remove_dir_all(&dir);
     }

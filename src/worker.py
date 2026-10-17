@@ -8,6 +8,9 @@ PROTECTED = [os.path.realpath(d) for d in json.loads(os.environ.pop("LOW_PROTECT
 HALF = 16000
 LIMIT = 8 << 20
 RUN_CAP = 570
+DEFINITION = re.compile(r"\s*(?:(?:pub(?:\([^)]*\))?|async|export|default|static|public|private|protected|final|"
+                        r"abstract|override|unsafe|extern|const|inline|virtual)\s+)*(?:def|class|fn|func|function|impl|"
+                        r"struct|enum|trait|interface|module|mod|object|record|type)\b")
 IGNORABLE = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r(?!\n)")
 
@@ -211,21 +214,71 @@ def sh(cmd, timeout=120):
     return out.rstrip("\n") + (f"\n[exit {code}]" if code else "")
 
 
+def _block(lines, i):
+    """Lines (0-based, inclusive) of the definition around line i: the nearest def/fn/class/... line at or above it and
+    less indented, else the top-level statement it is in, down to the line before the next one at that indentation (a
+    closing bracket line included). Past 200 lines, the 10 lines above i and the 40 below instead."""
+    width = lambda s: len(s) - len(s.lstrip())  # noqa: E731
+    k = width(lines[i])
+    start = next((j for j in range(i, -1, -1)
+                  if lines[j].strip() and DEFINITION.match(lines[j]) and (j == i or width(lines[j]) < k)), None)
+    if start is None:
+        start = next((j for j in range(i, -1, -1) if lines[j].strip() and not width(lines[j])), i)
+    end, k = len(lines) - 1, width(lines[start])
+    for j in range(start + 1, len(lines)):
+        text = lines[j].strip()
+        if text and width(lines[j]) <= k and not (text[0] in ")]}" and text.endswith(("{", ":", "(", "[", "=>"))):
+            end = j if text[0] in ")]}" or re.match(r"end\b", text) else j - 1
+            break
+    while end > start and not lines[end].strip():
+        end -= 1
+    if start == end:  # no structure around it, as in prose: its paragraph
+        while start > 0 and lines[start - 1].strip():
+            start -= 1
+        while end + 1 < len(lines) and lines[end + 1].strip():
+            end += 1
+    while start > 0 and lines[start - 1].lstrip().startswith(("@", "#[", "///", "//!")):
+        start -= 1
+    return (start, end) if end - start < 200 else (max(0, i - 10), min(len(lines) - 1, i + 40))
+
+
 def show(path, start=1, end=None):
     with open(os.path.join(ROOT, path), encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
-    _report.setdefault("reads", []).append(_rel(path))
-    asked, start, end = end, max(start, 1), min(end or len(lines), len(lines))
+    rel = _rel(path)
+    _report.setdefault("reads", []).append(rel)
+    if isinstance(start, str):
+        spans = []
+        for a, b in sorted(_block(lines, i) for i, line in enumerate(lines) if re.search(start, line)):
+            if spans and a <= spans[-1][1] + 1:
+                spans[-1][1] = max(spans[-1][1], b)
+            else:
+                spans.append([a, b])
+        if not spans:
+            print(f"[{rel}: no line matches {start!r}]")
+            return
+        numbers = [n for a, b in spans for n in range(a + 1, b + 2)]
+        what = f"the blocks with a line matching {start!r}, lines {', '.join(f'{a + 1}-{b + 1}' if b > a else f'{a + 1}' for a, b in spans)}"
+    else:
+        asked, start, end = end, max(start, 1), min(end or len(lines), len(lines))
+        numbers, what = range(start, end + 1), None
     sys.stdout.flush()
-    room, rows = 2 * HALF - os.fstat(1).st_size - 2000, []
-    for n in range(start, end + 1):
+    room, rows, shown = 2 * HALF - os.fstat(1).st_size - 2000, [], 0
+    for n in numbers:
         room -= len(lines[n - 1]) + len(str(n)) + 3
-        if room < 0 and rows:
+        if room < 0 and shown:
             break
+        if shown and n != numbers[shown - 1] + 1:
+            rows.append("…")
         rows.append(f"{n}: {lines[n - 1]}")
-    stop = start + len(rows) - 1
-    rest = f"; show({_rel(path)!r}, {stop + 1}{f', {asked}' if asked else ''}) continues" if stop < end else ""
-    print(f"[{_rel(path)}: lines {start}-{stop} of {len(lines)}{rest}]")
+        shown += 1
+    if what is None:
+        stop = start + shown - 1
+        rest = f"; show({rel!r}, {stop + 1}{f', {asked}' if asked else ''}) continues" if stop < end else ""
+        print(f"[{rel}: lines {start}-{stop} of {len(lines)}{rest}]")
+    else:
+        rest = f"; output limit: show({rel!r}, {numbers[shown]}) continues" if shown < len(numbers) else ""
+        print(f"[{rel}: {what} of {len(lines)}{rest}]")
     print("\n".join(rows))
 
 
