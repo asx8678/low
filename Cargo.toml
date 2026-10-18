@@ -31,3 +31,7 @@ unicode-width = "0.2.2"
 strip = true
 lto = "fat"
 codegen-units = 1
+
+# What dist builds the release binaries with: the release profile as it is.
+[profile.dist]
+inherits = "release"

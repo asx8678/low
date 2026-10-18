@@ -32,6 +32,8 @@ stdout is a single JSON object (stderr has a `[session …]` line):
 | 4 | question | low needs an answer; `question` has it | answer it as the next task (below) |
 | 5 | stopped | interrupted or a limit hit | resume with a narrower task |
 
+`changes` marks a file git ignores as `(ignored by git)`: it changed, but the `undo` command can't restore it. `repos` lists git repositories the task made inside the tree, which git would run hooks from outside the sandbox.
+
 A task can outlast the 10-minute limit of a foreground Bash call: run long ones with `run_in_background` and read the JSON when notified. No JSON on stdout means low was killed; the session log still has the turn.
 
 ## Follow-ups and answers
@@ -71,15 +73,15 @@ low marks each line `[x]` done, `[!]` not verified or `[?]` asked a question, wr
 
 ## Choosing the model
 
-`-m provider:model` picks the provider when several list the same id, e.g. `low -m opendesign:deepseek-v4.1-flash --json "…"`; plain `-m model` takes the first provider that lists it. Providers live in `~/.config/low/providers.toml`.
+`-m provider:model` picks the provider when several list the same id, e.g. `low -m opendesign:deepseek-v4.1-flash --json "…"`; plain `-m model` takes the first provider that lists it. Providers live in `~/.config/low/providers.toml`. `--effort low|medium|high|xhigh|max` sets how hard the model thinks (DeepSeek runs medium and xhigh as high); with `--session` or `--resume` it switches the session.
 
 ## Web search
 
-Inside a task, low's model can call `search(query)` and `fetch(url)` (DeepSeek's search API) when a `[deepseek]` provider with an API key is in providers.toml, or `search = "<provider>"` in `~/.config/low/config.toml` names one. Without it the helpers are not offered.
+Inside a task, low's model can call `search(query)` and `fetch(url)` (DeepSeek's search API) when a `[deepseek]` provider with an API key is in providers.toml, or `search = "<provider>"` in `~/.config/low/config.toml` names one. Without it the helpers are not offered. `fetch(url)` takes only a URL that a `search()` returned or that the task text gives, so put a URL in the task when low should read a specific page.
 
 ## Rules
 
 - Keep low's sandbox on: don't pass `--yolo` unless the user asks.
-- One low per working tree at a time; for parallel tasks use separate git worktrees, or give each low its own paths and pass the others' with `--protect <path>` (repeatable), which the sandbox enforces.
+- One low per working tree at a time; for parallel tasks use separate git worktrees, or give each low its own paths and pass the others' with `--protect <path>` (repeatable), which the sandbox enforces. `--protect` and `--tasks` paths are relative to where low runs, like any shell path.
 - Treat `answer` as low's claim and the verdict as evidence: VERIFIED means the repo's check passed on the final tree, not that the task is fully right. Review `changes` before telling the user it's done.
 - Give low whole tasks with their acceptance criteria; it has its own tools and doesn't need step-by-step instructions.

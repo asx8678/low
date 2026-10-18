@@ -36,7 +36,7 @@ cost      3 requests · 2 runs · 4.9k tok in · 266 tok out · 0:10
 - **Code mode.** The model writes a program instead of making many small tool calls: fewer round trips, fewer tokens.
 - **Sandboxed by default.** No network, writes only inside the repo and temp dirs, and your SSH keys, cloud credentials and shell history are out of reach.
 - **Verified.** low runs your project's check on the final tree, and every turn ends with a verdict.
-- **Reversible.** Inside a git repository, low never commits: git is the undo, and every turn report prints the exact restore command.
+- **Reversible.** Inside a git repository, low never commits: git is the undo, and every turn report prints the exact restore command. A file git ignores, such as `.env`, is listed as changed but can't be restored that way, and the report says so.
 - **Low entropy.** A short system prompt, deterministic harness decisions, rule-based context compaction, and no hidden LLM calls.
 - **Any OpenAI-compatible model.** Point it at any `/chat/completions` endpoint.
 
@@ -91,6 +91,7 @@ low "the median of an even-length list is wrong; fix it"
 | `low --tasks <file>` | works through the open tasks of a markdown checklist (`- [ ] task`) in one session, marking each `[x]` done, `[!]` not verified or `[?]` asked a question, with its result under it; an `  - answer: …` line under a `[?]` task is sent next; text above the first task goes with the first task of each run; the model can read the checklist but not change it; a task cut off by a turn limit while it was still changing files gets up to 2 more turns; otherwise stops at the first task not done |
 | `low --json "<task>"` | shows nothing while the task runs and prints its result as one JSON object (session, verdict, status, exit, answer, changes, check, tokens) |
 | `low -m <model>` | picks the model for a new session; with `--resume`, switches the session to it. `provider:model` picks the provider too, for an id several providers list |
+| `low --effort <level>` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `reasoning_effort`; like `-m`, it sets a new session and switches a resumed one. DeepSeek runs `medium` and `xhigh` as `high` |
 | `low --yolo` | turns the sandbox off: network on, writes anywhere (environment variables stay filtered) |
 | `low --serve ["<task>"]` | keeps the session open after the task and takes the next ones from `low --send`; while it waits, it re-sends the prompt so the provider keeps it cached (`keep_warm`) |
 | `low --send "<task>"` | gives the task to the `low --serve` running in this repository and prints its result, with the same exit status as `low "<task>"`; `low --send /stop` ends the server |
@@ -99,7 +100,8 @@ In the REPL:
 
 | command | does |
 |---|---|
-| `/models [filter]` | lists the models your providers serve and switches to one |
+| `/model [filter]` | lists the models your providers serve and switches to one |
+| `/effort [level]` | shows the reasoning effort the session sends, or sets it: `low`, `medium`, `high`, `xhigh` or `max` |
 | `/providers` | adds, edits and removes providers |
 | `/cost` | shows the session's requests and tokens |
 | `/think` | shows the model's last reasoning |
@@ -111,7 +113,7 @@ In the REPL:
 |---|---|
 | `~/.config/low/providers.toml` | endpoints: `base_url`, optional `api_key`, `models` |
 | `~/.config/low/config.toml` | your defaults: `model`, extra sandbox `env`, and per-model request parameters |
-| `low.toml` (repo root) | `check`, `fmt` and `protect` for that repository |
+| `low.toml` (repo root) | `check`, `fmt` and `protect` for that repository (config.toml refuses them, since they belong to one repository) |
 
 A `config.toml` example:
 
@@ -121,7 +123,8 @@ env = ["MY_VAR"]                     # environment variables passed into the san
 search = "deepseek"                  # the provider whose key search() and fetch() use (default: one named deepseek)
 
 [models."deepseek-v4.1-flash"]       # sent with every request to this model
-temperature = 0.0
+temperature = 0.0                    # temperature = false sends none, for a model that refuses it
+reasoning_effort = "low"             # the default effort; --effort and /effort change it per session
 compact_at = 200000                  # compact the context at this many prompt tokens
 keep_warm = 600                      # low --serve: re-send the prompt after this many idle seconds (default 600, 0: never)
 turn_budget = 60                     # stop a turn after this many compact_at of tokens (cached input counts a quarter; default 60)
@@ -137,11 +140,11 @@ Inside `run(code)`, the model has a few helpers:
 | `sh(cmd)` | runs a shell command; returns stdout and stderr, with `[exit N]` on failure |
 | `show(path, start, end)` | prints numbered lines, paging long files |
 | `edit(path, old, new)` | replaces exactly one occurrence, or several pairs all-or-none, then runs `fmt` |
-| `write(path, content)` | creates a new file |
+| `write(path, content)` | creates a file, or replaces one |
 | `check()` | runs the repository's `check` inside the sandbox; with none configured it runs nothing and returns `True` |
 | `accept(criteria)` · `plan(steps)` · `done()` | record what done means and track progress for the turn report |
 | `finish(report)` · `ask(question)` | end the turn with the final report, or with a question for you that the next task answers |
-| `search(query)` · `fetch(url)` | web search and a page as markdown, through [DeepSeek's search API](https://api-docs.deepseek.com/guides/search/); low makes the request, since the sandbox has no network. Only when a provider is set up for it (below) |
+| `search(query)` · `fetch(url)` | web search and a page as markdown, through [DeepSeek's search API](https://api-docs.deepseek.com/guides/search/); low makes the request, since the sandbox has no network. Only when a provider is set up for it (below). `fetch` takes only a URL that a `search` returned or the task gives, and both refuse an argument that looks like a secret, so code in a run can't send what it read out through them |
 
 Repository files change only through `edit` and `write`, so low knows exactly what the model touched. A turn that changed files without using either is asked once to clean up its scratch output.
 
@@ -153,11 +156,12 @@ Every turn ends with one of four verdicts:
 | **UNVERIFIED** | files changed, but the check didn't pass, or the turn changed what the check runs |
 | **NO CHANGES** | nothing changed, e.g. a question or a review |
 | **NO CHECK** | files changed, and no check is configured |
+| **QUESTION** | the model asked you something (exit 4); answer it as the next task |
 
 **The sandbox:**
-- **Network:** off. On macOS only localhost is reachable; on Linux, only servers started inside the sandbox.
-- **Writes:** only the repository and temp directories. `.git` and the hooks directory are off limits.
-- **Reads:** credentials and private data in your home directory are hidden, including `~/.ssh`, cloud and Kubernetes configs, keychains, shell histories, browser data, other coding agents' keys and low's own config.
+- **Network:** off. On macOS only localhost is reachable; on Linux, only servers started inside the sandbox. `search()` and `fetch()`, when set up, send their query or URL out through low (above).
+- **Writes:** only the repository and temp directories. `.git` and the hooks directory are off limits. A git repository the model makes inside the tree is reported, since your git would run hooks and config from there outside the sandbox; `git config --global safe.bareRepository explicit` makes git refuse one laid out as a bare repository.
+- **Reads:** credentials and private data in your home directory are hidden: `~/.ssh` and `~/.gnupg`; cloud, Kubernetes and Docker configs; package-registry and database credentials (`.npmrc`, `.pypirc`, `.pgpass`, `.my.cnf`, …); keychains and keyrings; shell and REPL histories; the profiles of Chrome, Firefox, Safari, Brave, Edge, Chromium and Arc; other coding agents' keys; and low's own config.
 - **Environment:** only an allowlist of variables is passed in, plus your `env = [...]`.
 - **Redaction:** secrets that appear in output, such as API keys, tokens and private keys, are redacted before the model or the session log sees them.
 

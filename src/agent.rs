@@ -42,6 +42,9 @@ const RETRY: &str = "Send one run() now with the next step, or a shorter answer.
 const STRAY: &str = "This turn changed files without edit() or write():";
 const STRAY_END: &str = "Delete the ones that are scratch output from running code, keep any that are part of your answer, \
                          then finish again.";
+const PLANTED: &str = "This turn made a git repository inside the tree:";
+const PLANTED_END: &str = "The user's git would run hooks and config from there, outside the sandbox. Delete it if it is \
+                           scratch, or say in your final message why it belongs, then finish again.";
 const HELPERS: &[&str] =
     &["sh", "show", "accept", "edit", "write", "check", "plan", "done", "finish", "ask", "search", "fetch"];
 /// The helpers that reach the web, in the prompt only when config.toml's search names a provider.
@@ -314,7 +317,7 @@ impl Agent {
             if let Err(e) = &result {
                 let text = error_text(e);
                 self.session.push(json!({"event": "error", "text": text, "at": ui::now_ms()}))?;
-                if let Err(e) = self.unfinished().await {
+                if let Err(e) = self.unfinished(true).await {
                     ui::note(&format!("could not write the turn report: {e:#}"));
                 }
             }
@@ -351,12 +354,16 @@ impl Agent {
             }
         }
         ui::event("ctrl_c", "interrupted", Value::Null);
-        self.unfinished().await?;
+        self.unfinished(false).await?;
         Ok(false)
     }
 
-    async fn unfinished(&mut self) -> Result<()> {
+    /// Ends a turn that an error or a Ctrl-C cut short with its report. An error before the first request gets none: no
+    /// run could have changed a file, and a verdict would only dress up the error.
+    async fn unfinished(&mut self, errored: bool) -> Result<()> {
+        let requests = |began: usize| crate::stats::totals(&self.session.entries[began..])["requests"].as_u64();
         match self.current.take() {
+            Some((began, _)) if errored && requests(began).unwrap_or(0) == 0 => self.session.flush(),
             Some((began, clock)) => self.report(None, false, true, began, clock).await.map(drop),
             None => self.session.flush(),
         }
@@ -558,6 +565,19 @@ impl Agent {
                 state.stalled = false;
                 ui::event("nudge", "files changed outside edit()/write(): asking the model about them", Value::Null);
                 self.host(format!("{STRAY} {}. {STRAY_END}", paths.join(", ")))?;
+                return Ok(None);
+            }
+        }
+        // A git repository made inside the tree runs its hooks and config outside the sandbox once the user's git visits
+        // it. Under --yolo nothing is sandboxed, so nothing is asked.
+        if changed && !self.yolo && !state.planted {
+            state.planted = true;
+            let paths: Vec<String> = self.own_diff(began).await?.1.lines().filter_map(changed_path).collect();
+            let repos = repos(&self.root, &paths);
+            if !repos.is_empty() {
+                state.stalled = false;
+                ui::event("nudge", "a git repository was made inside the tree: asking the model about it", Value::Null);
+                self.host(format!("{PLANTED} {}. {PLANTED_END}", repos.join(", ")))?;
                 return Ok(None);
             }
         }
@@ -1012,6 +1032,12 @@ impl Agent {
         if !ignored.is_empty() {
             rows.push(("ignored", format!("{}: git ignores them, so no undo restores them", ignored.join(", "))));
         }
+        let paths: Vec<String> = changes.iter().filter_map(|l| changed_path(l)).collect();
+        let repos = if self.yolo { vec![] } else { repos(&self.root, &paths) };
+        if !repos.is_empty() {
+            let text = format!("git repositories made inside the tree, which the sandbox cannot contain: {}", repos.join(", "));
+            rows.push(("repos", text));
+        }
         let totals = crate::stats::totals(turn);
         let n = |v: &Value| v.as_u64().unwrap_or(0);
         let (requests, runs, tokens) = (n(&totals["requests"]), n(&totals["runs"]), &totals["tokens"]);
@@ -1040,6 +1066,7 @@ impl Agent {
             plan: state.plan,
             check: check.into(),
             changes: changes.clone(),
+            repos,
             elsewhere,
             limit: self.limit.take(),
             undo,
@@ -1347,6 +1374,8 @@ pub struct TurnReport {
     pub plan: Value,
     pub check: String,
     pub changes: Vec<String>,
+    /// Git repositories the turn made inside the tree, which git would run code from outside the sandbox.
+    pub repos: Vec<String>,
     pub elsewhere: usize,
     pub limit: Option<String>,
     pub undo: Option<String>,
@@ -1427,6 +1456,8 @@ struct TurnState {
     stalled: bool,
     /// The model was asked about files it changed without edit() or write().
     strayed: bool,
+    /// The model was asked about a git repository it made inside the tree.
+    planted: bool,
     /// The turn went on with the profile's fallback provider.
     failed_over: bool,
     /// Tokens spent, cached input counting a quarter.
@@ -1436,6 +1467,27 @@ struct TurnState {
 /// An error as low shows and logs it: the whole chain, without control characters or secrets.
 pub fn error_text(e: &anyhow::Error) -> String {
     redact(&ui::printable(&format!("{e:#}"))).0
+}
+
+/// The folders among these changed paths and their parents that git would take for a repository: one with a .git entry,
+/// or laid out as a bare repository (HEAD, objects/, refs/). The sandbox denies a new .git on macOS, but a bare layout
+/// under another name is data to it, and git runs the hooks and config it finds there outside the sandbox.
+fn repos(root: &Path, paths: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = vec![];
+    for path in paths {
+        let mut dir = Path::new(path.trim_end_matches('/'));
+        while !dir.as_os_str().is_empty() {
+            let full = root.join(dir);
+            let bare = full.join("HEAD").is_file() && full.join("objects").is_dir() && full.join("refs").is_dir();
+            let named = dir.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".git"));
+            let shown = dir.to_string_lossy();
+            if (bare || named || full.join(".git").exists()) && !found.iter().any(|f| *f == shown) {
+                found.push(shown.into_owned());
+            }
+            dir = dir.parent().unwrap_or(Path::new(""));
+        }
+    }
+    found
 }
 
 /// A URL as fetch() compares it: without its fragment or a trailing slash.

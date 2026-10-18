@@ -190,6 +190,8 @@ pub struct Llm {
     session: Option<String>,
     field: Cell<&'static str>,
     marked: Cell<bool>,
+    /// The provider refused stream_options, so requests go without it and the usage is estimated.
+    plain: Cell<bool>,
 }
 
 impl Llm {
@@ -212,6 +214,7 @@ impl Llm {
             session: session_id(base_url, header),
             field: Cell::new(FIELDS[0]),
             marked: Default::default(),
+            plain: Default::default(),
         }
     }
 
@@ -264,7 +267,9 @@ impl Llm {
         body.insert("messages".into(), Value::Array(messages));
         body.insert("tools".into(), tools.clone());
         body.insert("stream".into(), true.into());
-        body.insert("stream_options".into(), json!({"include_usage": true}));
+        if !self.plain.get() {
+            body.insert("stream_options".into(), json!({"include_usage": true}));
+        }
         body
     }
 
@@ -300,15 +305,22 @@ impl Llm {
 
     pub async fn complete(&self, messages: Vec<Value>, tools: &Value) -> Result<Value> {
         let count = messages.len();
-        let body = self.body(messages, tools);
-        let (url, bytes) = (format!("{}/chat/completions", self.base), serde_json::to_vec(&body)?);
-        let asked = json!({"url": endpoint(&url), "model": self.model, "messages": count, "bytes": bytes.len()});
-        let request = self.authorized(self.http.post(url).header("content-type", "application/json").body(bytes));
-        drop(body);
+        let mut body = self.body(messages, tools);
+        let url = format!("{}/chat/completions", self.base);
         let start = Instant::now();
         for attempt in 1.. {
+            let bytes = serde_json::to_vec(&body)?;
+            let asked = json!({"url": endpoint(&url), "model": self.model, "messages": count, "bytes": bytes.len()});
+            let request = self.authorized(self.http.post(&url).header("content-type", "application/json").body(bytes));
             let began = Instant::now();
             match self.stream(&request).await {
+                // A gateway that refuses stream_options gets the request without it, for the rest of the session.
+                Err(e) if !self.plain.get() && e.to_string().contains("stream_options") => {
+                    self.plain.set(true);
+                    body.remove("stream_options");
+                    let text = "the provider refused stream_options; sending requests without it (usage is estimated)";
+                    crate::ui::event("downgrade", text, json!({"error": e.to_string()}));
+                }
                 Err(e) if let Some(mut extra) = lost(&e).map(Lost::extra) => {
                     extra["attempt"] = attempt.into();
                     extra["ms"] = crate::ui::ms(began).into();
