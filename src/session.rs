@@ -92,9 +92,12 @@ impl Session {
                     file.write_all(b"\n")?;
                     text.push('\n');
                 } else {
-                    // A crash while writing left a part of a line; the rest of the log is whole.
+                    // A crash while writing left part of a line (a log that ends in its newline has nothing after it).
                     let torn = text.len() - cut;
-                    crate::ui::note(&format!("dropped an incomplete last line ({torn} bytes) from {}", path.display()));
+                    if torn > 0 {
+                        let what = format!("dropped an incomplete last line ({torn} bytes) from {}", path.display());
+                        crate::ui::note(&what);
+                    }
                     file.set_len(cut as u64)?;
                     text.truncate(cut);
                 }
