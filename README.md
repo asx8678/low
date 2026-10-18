@@ -138,7 +138,7 @@ Inside `run(code)`, the model has a few helpers:
 | `show(path, start, end)` | prints numbered lines, paging long files |
 | `edit(path, old, new)` | replaces exactly one occurrence, or several pairs all-or-none, then runs `fmt` |
 | `write(path, content)` | creates a new file |
-| `check()` | runs the repository's `check` inside the sandbox |
+| `check()` | runs the repository's `check` inside the sandbox; with none configured it runs nothing and returns `True` |
 | `accept(criteria)` · `plan(steps)` · `done()` | record what done means and track progress for the turn report |
 | `finish(report)` · `ask(question)` | end the turn with the final report, or with a question for you that the next task answers |
 | `search(query)` · `fetch(url)` | web search and a page as markdown, through [DeepSeek's search API](https://api-docs.deepseek.com/guides/search/); low makes the request, since the sandbox has no network. Only when a provider is set up for it (below) |

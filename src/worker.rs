@@ -411,6 +411,13 @@ mod tests {
         let reply = run(&mut worker, "write('d', 'x')").await;
         assert!(reply["out"].as_str().is_some_and(|out| out.contains("d exists and is not a regular file")), "{reply}");
         drop(worker);
+        // With no check configured, check() runs nothing and passes, so `assert check()` doesn't end the run, and its
+        // line is the helper's own, not output finish() waits for the model to read.
+        let mut worker = super::Worker::start(&dir, true, None, None).unwrap();
+        let reply = run(&mut worker, "assert check()\nfinish('done')").await;
+        assert_eq!((&reply["out"], &reply["own"]), (&json!("[no check configured: check() ran nothing]\n"), &json!(0)));
+        assert_eq!((&reply["check"], &reply["error"]), (&Value::Null, &json!(false)));
+        drop(worker);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

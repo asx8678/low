@@ -524,9 +524,10 @@ impl Agent {
         self.report(Some(changed), false, true, began, clock).await
     }
 
-    /// Whether finish() may end the turn in place of a reply: only where the check covers the report's claims and the
-    /// model has read everything the run printed. In a turn without edits nothing checks the report, and an answer
-    /// written in the run that gathers its evidence was written before reading it.
+    /// Whether finish() may end the turn in place of a reply: only where the check, if one is configured, covers the
+    /// report's claims and the model has read everything the run printed. In a turn without edits nothing checks the
+    /// report, and an answer written in the run that gathers its evidence was written before reading it. Without a
+    /// check the verdict says NO CHECK either way: refusing there only cost a request.
     fn finishing(&self, began: usize, meta: &Value, last: bool) -> Result<(), &'static str> {
         let edits = edited(meta) || self.session.entries[began..].iter().any(|e| edited(&e["meta"]));
         if meta["error"] == true {
@@ -535,9 +536,7 @@ impl Agent {
             Err("more code ran after it in this reply")
         } else if !edits {
             Err("this turn changed no files, so no check covers the report")
-        } else if self.config.check.is_none() {
-            Err("no check is configured")
-        } else if meta["check"] != true {
+        } else if self.config.check.is_some() && meta["check"] != true {
             Err("check() did not pass in this run")
         } else if meta["own"].as_u64().is_none_or(|own| own > 0) {
             Err("this run printed output you have not read")
