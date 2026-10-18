@@ -70,7 +70,8 @@ models = ["deepseek-v4.1-flash"]
 ```toml
 check = "cargo build -q && cargo test -q"   # run on the final tree; decides the verdict
 fmt = "rustfmt --edition 2024"              # run on each edited file (its path is appended)
-protect = ["Cargo.lock", "migrations"]      # files and folders the model may not change (also --protect <path> per run)
+protect = ["Cargo.lock", "migrations"]      # files and folders the model may not change (also --protect <path> per run;
+                                            # the sandbox enforces it, so under --yolo only edit()/write() refuse them)
 ```
 
 **3. Give it a task:**

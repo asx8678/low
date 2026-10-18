@@ -153,8 +153,9 @@ pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
         // A task cut off by a turn limit that was still changing files continues in a fresh turn of the same session.
         let progressed = result["changes"].as_array().is_some_and(|c| !c.is_empty());
         let limited = result["status"] == "stopped" && result["limit"].is_string();
-        let stop = mark != 'x' && !(limited && progressed && again < AGAIN);
-        again += usize::from(mark != 'x');
+        let more = mark != 'x' && limited && progressed && again < AGAIN;
+        let stop = mark != 'x' && !more;
+        again += usize::from(more);
         done.push(json!({"task": next.text, "result": result}));
         if stop {
             break;
