@@ -2,13 +2,18 @@
 //! line; low marks it `[x]` when done, `[!]` when not verified and `[?]` when the model asked a question, and puts its
 //! result under it as `  - low: …`. An `  - answer: …` line under a `[?]` task is sent as the next turn, then marked
 //! `answered:`. The file is read again before each write, so edits made while low runs stay. Its first line names the
-//! session, so the next run continues it.
+//! session, so the next run continues it. Text above the first task goes to the model with the first task of a run, and a
+//! task that a turn limit cut off while it was still changing files gets up to two more turns.
 use crate::agent::{self, Agent};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::path::Path;
 
 const SESSION: &str = "<!-- low session: ";
+/// How many changed files a task's result line names.
+const SHOWN: usize = 8;
+/// How many more turns a task stopped at a limit gets, as long as each one changes files.
+const AGAIN: usize = 2;
 
 struct Task {
     /// The task's line in the file.
@@ -91,9 +96,18 @@ fn summary(result: &Value) -> String {
     );
     let changes: Vec<&str> = result["changes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     if !changes.is_empty() {
-        line += &format!(" · {}", changes.join(", "));
+        line += &format!(" · {}", changes[..changes.len().min(SHOWN)].join(", "));
+    }
+    if changes.len() > SHOWN {
+        line += &format!(" and {} more", changes.len() - SHOWN);
     }
     line
+}
+
+/// The checklist's text before its first task, without low's session line: what every task in it is about.
+fn preamble(text: &str) -> String {
+    let lines = text.lines().filter(|l| !l.starts_with(SESSION));
+    lines.take_while(|l| task(l).is_none()).collect::<Vec<_>>().join("\n").trim().to_string()
 }
 
 /// Runs the open tasks in order and stops at the first that is not done; the result lists each task's.
@@ -102,9 +116,17 @@ pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
     // low rewrites the checklist after each task; the next turn need not hear about it.
     agent.quiet(file);
     let mut done = vec![];
+    // The text above the tasks goes to the model once per run, with the first task.
+    let read =
+        |file: &Path| std::fs::read_to_string(file).with_context(|| format!("could not read {}", file.display()));
+    let mut context = Some(preamble(&read(file)?)).filter(|p| !p.is_empty());
+    let (mut last, mut again) = (String::new(), 0);
     loop {
-        let text = std::fs::read_to_string(file).with_context(|| format!("could not read {}", file.display()))?;
+        let text = read(file)?;
         let Some(next) = tasks(&text).into_iter().find(|t| !matches!(t.mark, 'x' | 'X')) else { break };
+        if next.text != last {
+            (last, again) = (next.text.clone(), 0);
+        }
         let prompt = match (next.mark, next.answers.is_empty()) {
             ('?', true) => {
                 let why = format!("task on line {} waits for an answer: add `  - answer: …` under it", next.line + 1);
@@ -113,7 +135,13 @@ pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
                 break;
             }
             ('?', false) => next.answers.join("\n"),
-            _ => next.text.clone(),
+            _ => match context.take() {
+                Some(context) => {
+                    let name = file.file_name().map_or_else(|| file.display().to_string(), |n| n.display().to_string());
+                    format!("{}\n\nFrom {name}, above its tasks:\n{context}", next.text)
+                }
+                None => next.text.clone(),
+            },
         };
         let result = match agent.run(&prompt).await {
             Ok(_) => agent.last().clone(),
@@ -125,7 +153,11 @@ pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
             _ => '!',
         };
         update(file, &next.text, mark, &summary(&result), &id)?;
-        let stop = mark != 'x';
+        // A task cut off by a turn limit that was still changing files continues in a fresh turn of the same session.
+        let progressed = result["changes"].as_array().is_some_and(|c| !c.is_empty());
+        let limited = result["status"] == "stopped" && result["limit"].is_string();
+        let stop = mark != 'x' && !(limited && progressed && again < AGAIN);
+        again += usize::from(mark != 'x');
         done.push(json!({"task": next.text, "result": result}));
         if stop {
             break;

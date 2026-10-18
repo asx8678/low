@@ -32,7 +32,7 @@ Options:
       --yolo           No sandbox: network on, writes anywhere (env vars stay filtered; env = [...] in ~/.config/low/config.toml passes more)
       --serve          After the task, keep the session and take the next tasks from low --send, keeping the provider's prompt cache warm in between (from a script, start it without a task)
       --send           Give the task to the low --serve running in this repo and print its result, with the same exit status; /stop ends that server
-      --tasks <FILE>   Work through the open tasks of a markdown checklist (- [ ] task) in one session, marking each line with its result; stops at the first task not done
+      --tasks <FILE>   Work through the open tasks of a markdown checklist (- [ ] task) in one session, marking each line with its result; stops at the first task not done (one a turn limit cut off while it still changed files gets 2 more turns)
       --json           Show nothing while the task runs and print its result as one JSON object (with --send too)
   -h, --help           Print help
   -V, --version        Print version";

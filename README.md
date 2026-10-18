@@ -86,7 +86,7 @@ low "the median of an even-length list is wrong; fix it"
 | `low` | starts the REPL |
 | `low --resume` | continues the latest session in this repository |
 | `low --session <id>` | continues that session of this repository |
-| `low --tasks <file>` | works through the open tasks of a markdown checklist (`- [ ] task`) in one session, marking each `[x]` done, `[!]` not verified or `[?]` asked a question, with its result under it; an `  - answer: …` line under a `[?]` task is sent next; stops at the first task not done |
+| `low --tasks <file>` | works through the open tasks of a markdown checklist (`- [ ] task`) in one session, marking each `[x]` done, `[!]` not verified or `[?]` asked a question, with its result under it; an `  - answer: …` line under a `[?]` task is sent next; text above the first task goes with the first task of each run; a task cut off by a turn limit while it was still changing files gets up to 2 more turns; otherwise stops at the first task not done |
 | `low --json "<task>"` | shows nothing while the task runs and prints its result as one JSON object (session, verdict, status, exit, answer, changes, check, tokens) |
 | `low -m <model>` | picks the model for a new session; with `--resume`, switches the session to it. `provider:model` picks the provider too, for an id several providers list |
 | `low --yolo` | turns the sandbox off: network on, writes anywhere (environment variables stay filtered) |

@@ -79,6 +79,8 @@ pub struct Agent {
     question: Option<String>,
     /// A file low itself rewrites between turns (a --tasks checklist), relative to the root: not news to the model.
     quiet: Option<String>,
+    /// The limit that stopped the current turn, for its result: a --tasks run continues such a task.
+    limit: Option<String>,
 }
 
 impl Agent {
@@ -147,6 +149,7 @@ impl Agent {
             last: Value::Null,
             question: None,
             quiet: None,
+            limit: None,
         };
         agent.record()?;
         Ok(agent)
@@ -500,7 +503,7 @@ impl Agent {
             return self.report(Some(changed), checked, stalled && !changed, began, clock).await;
         }
         ui::event("limit", &limit, Value::Null);
-        self.current = None;
+        (self.current, self.limit) = (None, Some(limit));
         let changed = self.changed(&start, began).await;
         self.report(Some(changed), false, true, began, clock).await
     }
@@ -953,7 +956,7 @@ impl Agent {
             "session": self.session.path, "id": self.session.header()["id"], "status": status, "exit": exit,
             "verdict": verdict, "good": good, "answer": answer, "question": question, "criteria": state.accepted,
             "plan": state.plan,
-            "check": check, "changes": changes, "elsewhere": elsewhere, "undo": undo, "requests": requests,
+            "check": check, "changes": changes, "elsewhere": elsewhere, "limit": self.limit.take(), "undo": undo, "requests": requests,
             "tokens": {"prompt": prompt, "cached": cached, "out": out}, "cost": totals["cost"], "ms": ms, "rows": rows,
         });
         self.session.push(json!({"report": {

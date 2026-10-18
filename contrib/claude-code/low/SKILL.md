@@ -67,7 +67,7 @@ Write a markdown checklist and let low work through it in one session:
 low --tasks TASKS.md --json
 ```
 
-low marks each line `[x]` done, `[!]` not verified or `[?]` asked a question, writes its result under it as `  - low: …`, records the session in the file's first line, and stops at the first task not done. To answer a `[?]`, add `  - answer: …` under it and run the same command again. The user can read the file at any time; edits made while low runs are kept.
+low marks each line `[x]` done, `[!]` not verified or `[?]` asked a question, writes its result under it as `  - low: …`, records the session in the file's first line, and stops at the first task not done (a task cut off by a turn limit while it was still changing files first gets up to 2 more turns). Text above the first task, such as rules for all of them, goes to the model with the first task of each run. To answer a `[?]`, add `  - answer: …` under it and run the same command again. The user can read the file at any time; edits made while low runs are kept.
 
 ## Choosing the model
 
