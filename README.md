@@ -122,6 +122,7 @@ search = "deepseek"                  # the provider whose key search() and fetch
 temperature = 0.0
 compact_at = 200000                  # compact the context at this many prompt tokens
 keep_warm = 600                      # low --serve: re-send the prompt after this many idle seconds (default 600, 0: never)
+turn_budget = 60                     # stop a turn after this many compact_at of tokens (cached input counts a quarter; default 60)
 ```
 
 ## How it works

@@ -372,6 +372,9 @@ fn check_config(user: &Config) -> Result<()> {
         if let Some(value) = profile.get("keep_warm").filter(|v| !v.is_u64()) {
             bail!("{at} sets keep_warm = {value}; it takes a whole number of seconds, 0 to turn it off");
         }
+        if let Some(value) = profile.get("turn_budget").filter(|v| v.as_u64().is_none_or(|n| n < 1)) {
+            bail!("{at} sets turn_budget = {value}; it takes a whole number of compact_at units, at least 1");
+        }
     }
     Ok(())
 }

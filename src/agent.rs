@@ -28,6 +28,7 @@ const AGENTS_MAX: usize = 32 * 1024;
 const RESTARTS: usize = 2;
 const CHECK_TIMEOUT: Duration = Duration::from_mins(30);
 const CHECK_OUT: u64 = 1 << 20;
+/// A turn's budget in compact_at units (turn_budget in a model's profile), counting cached input at a quarter.
 const TURN_BUDGET: u64 = 60;
 /// How long a session log stays a candidate for another low working in this repository.
 const DAY: Duration = Duration::from_secs(86_400);
@@ -343,12 +344,14 @@ impl Agent {
             self.session.push(json!({"role": "user", "content": format!("[{moved}]"), "meta": {"host": true}}))?;
         }
         let (mut nudged, mut overflowed, mut retries, mut stalled, mut strayed) = (false, false, 0, false, false);
-        let ceiling = self.compact_at * TURN_BUDGET;
+        let budget = self.session.header()["turn_budget"].as_u64().unwrap_or(TURN_BUDGET);
+        let ceiling = self.compact_at * budget;
         let mut spent = 0;
         let mut limit = format!("stopped after {MAX_REQUESTS} model requests in one turn");
         for _ in 0..MAX_REQUESTS {
             if spent >= ceiling {
-                limit = format!("stopped after {} in one turn ({TURN_BUDGET} × compact_at)", ui::tokens(spent));
+                let rule = "cached input counts a quarter";
+                limit = format!("stopped after {} in one turn ({budget} × compact_at; {rule})", ui::tokens(spent));
                 break;
             }
             if self.upcoming() >= self.compact_at {
@@ -390,8 +393,11 @@ impl Agent {
             }
             let usage = &message["meta"]["usage"];
             let attempts = message["meta"]["timing"]["attempts"].as_u64().unwrap_or(1).max(1);
-            spent += usage["prompt_tokens"].as_u64().unwrap_or(0) * attempts
-                + usage["completion_tokens"].as_u64().unwrap_or(0);
+            // The budget follows what a request costs: cached input is billed at a fraction of fresh input, so a long,
+            // well-cached session isn't stopped for re-sending its own context.
+            let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+            let cached = ui::cached(usage).unwrap_or(0).min(prompt);
+            spent += (prompt - cached + cached / 4) * attempts + usage["completion_tokens"].as_u64().unwrap_or(0);
             ui::usage(usage);
             self.cache_miss(usage);
             let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
