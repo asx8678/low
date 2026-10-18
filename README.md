@@ -170,6 +170,10 @@ Every turn ends with one of four verdicts:
 
 **Sessions** are JSONL files in `~/.low/sessions`. When the context reaches `compact_at`, low compacts it without an LLM call: it keeps the task, the latest messages and a summary rebuilt from the log.
 
+## Development
+
+`low.toml`'s check runs rustfmt, the build, clippy and the unit tests. The end-to-end tests drive the built binary against a scripted provider in a throwaway HOME and repository: `cargo build && python3 tests/e2e/run.py`. `--slow` adds the tests that take minutes, and `LOW_BIN` picks another binary. The check can't run them, because a sandboxed check would start sandboxed lows inside it and macOS's `sandbox-exec` doesn't nest.
+
 ## License
 
 [MIT](https://github.com/asx8678/low/blob/main/LICENSE)
