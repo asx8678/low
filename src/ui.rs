@@ -168,8 +168,20 @@ pub fn minutes(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
+/// A token count as 950 tok, 99.7k tok, 1.2M tok or 2.7B tok: the largest unit that still shows under 1000.
 pub fn tokens(n: u64) -> String {
-    if n >= 1000 { format!("{:.1}k tok", n as f64 / 1000.0) } else { format!("{n} tok") }
+    if n < 1000 {
+        return format!("{n} tok");
+    }
+    let mut value = n as f64 / 1000.0;
+    for unit in ["k", "M"] {
+        // Rounded to one decimal, 999.96 would read 1000.0.
+        if (value * 10.0).round() < 10_000.0 {
+            return format!("{value:.1}{unit} tok");
+        }
+        value /= 1000.0;
+    }
+    format!("{value:.1}B tok")
 }
 
 pub fn activity(text: &str) {

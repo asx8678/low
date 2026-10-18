@@ -383,7 +383,12 @@ for n, request in enumerate(_inbox, 1):
     except BaseException as e:
         failed = True
         tb = traceback.extract_tb(e.__traceback__)
-        frames = [f for f in tb if f.filename.startswith("<run ")]
+        # The runs' own frames and the repo's files, not the worker's helpers or installed packages.
+        ours = lambda f: f.startswith(ROOT + os.sep) and "site-packages" not in f  # noqa: E731
+        frames = [f for f in tb if f.filename.startswith("<run ") or ours(f.filename)]
+        for f in frames:
+            if not f.filename.startswith("<run "):
+                f.filename = os.path.relpath(f.filename, ROOT)
         misuse = isinstance(e, TypeError) and tb and tb[-1].filename.startswith("<run ") and str(e).startswith(HELPERS)
         rejected = isinstance(e, (SyntaxError, NameError)) or misuse
         _report["exception"], _report["rejected"] = type(e).__name__, bool(rejected)

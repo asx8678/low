@@ -260,6 +260,31 @@ impl Agent {
             .collect()
     }
 
+    /// The reasoning effort the session's requests carry, if they carry one.
+    pub fn effort(&self) -> Option<&str> {
+        self.session.header()["params"]["reasoning_effort"].as_str()
+    }
+
+    /// Sends reasoning_effort = `effort` with the session's requests from now on: the same model, logged as a switch
+    /// so a resumed session keeps it. Switching the model with /model goes back to its profile.
+    pub fn set_effort(&mut self, effort: &str) -> Result<()> {
+        anyhow::ensure!(EFFORTS.contains(&effort), "the effort is one of: {}", EFFORTS.join(", "));
+        let header = self.session.header();
+        let (model, system) = (self.model().to_string(), header["system"].as_str().unwrap_or_default().to_string());
+        let mut profile = header["params"].as_object().cloned().unwrap_or_default();
+        for key in ["compact_at", "keep_warm", "turn_budget", "fallback"] {
+            if !header[key].is_null() {
+                profile.insert(key.into(), header[key].clone());
+            }
+        }
+        profile.insert("reasoning_effort".into(), effort.into());
+        let provider = self.provider.clone();
+        self.session.switch(&provider, &model, &system, profile)?;
+        (self.provider, self.llm) = connect(&self.config.providers, self.session.header())?;
+        ui::note(&format!("reasoning effort {effort} for {model}"));
+        Ok(())
+    }
+
     pub fn switch(&mut self, provider: &str, model: &str) -> Result<()> {
         anyhow::ensure!(self.config.providers.contains_key(provider), "no provider named {provider}");
         web(provider, &self.config.providers[provider].base_url)?;
@@ -791,9 +816,12 @@ impl Agent {
     }
 
     /// A search() or fetch() from a run, made here since the sandbox has no network: DeepSeek's tools API, with the
-    /// provider that config.toml's search names.
-    async fn web(&self, request: &Value) -> (bool, String) {
-        let Some(provider) = self.config.search.as_ref().and_then(|name| self.config.providers.get(name)) else {
+    /// provider that config.toml's search names. The request leaves the machine, so low refuses one whose argument holds
+    /// what looks like a secret, and fetch() only takes a URL that a search() returned or the user wrote: one the run made
+    /// up could carry what it read.
+    async fn web(&mut self, request: &Value) -> (bool, String) {
+        let provider = self.config.search.as_ref().and_then(|name| self.config.providers.get(name));
+        let Some((base, key)) = provider.map(|p| (p.base_url.clone(), p.api_key.clone())) else {
             return (false, "web search is not set up: config.toml's search names no provider".into());
         };
         let (tool, body, what) = match request["fetch"].as_str() {
@@ -804,13 +832,41 @@ impl Agent {
                 format!("search {}", request["search"]),
             ),
         };
-        let result = llm::tool(&provider.base_url, provider.api_key.as_deref(), tool, &body).await;
+        let (what, hidden) = redact(&what);
+        if hidden > 0 {
+            ui::record("web", &what, json!({"ok": false, "refused": "secret"}));
+            return (false, format!("{tool}() refused: its argument holds what looks like a secret"));
+        }
+        if let Some(url) = request["fetch"].as_str() {
+            // A search() earlier in this run is still queued for the log.
+            let _ = self.session.flush();
+            if !self.fetchable(url) {
+                ui::record("web", &what, json!({"ok": false, "refused": "url"}));
+                let why = "fetch() takes a URL that a search() in this session returned or that the task gives";
+                return (false, format!("{why}; search() for the page first"));
+            }
+        }
+        let result = llm::tool(&base, key.as_deref(), tool, &body).await;
         let (ok, out) = match result {
             Ok(text) => (true, text),
             Err(e) => (false, format!("{tool} failed: {e:#}")),
         };
-        ui::record("web", &what, json!({"request": body, "ok": ok, "bytes": out.len()}));
+        // The results' URLs are what a later fetch() may get, in this run or after a resume.
+        let found = serde_json::from_str::<Value>(&out).ok().filter(|_| ok && tool == "search");
+        let urls: Vec<&str> =
+            found.iter().flat_map(|f| f["results"].as_array().into_iter().flatten()).filter_map(|r| r["url"].as_str()).collect();
+        ui::record("web", &what, json!({"request": body, "ok": ok, "bytes": out.len(), "urls": urls}));
         (ok, out)
+    }
+
+    /// Whether fetch() may get this URL: a search() in this session returned it, or a task of the user's names it.
+    fn fetchable(&self, url: &str) -> bool {
+        let url = bare(url);
+        self.session.entries.iter().any(|e| {
+            let urls = e["urls"].as_array().filter(|_| e["event"] == "web").into_iter().flatten();
+            let task = e["content"].as_str().filter(|_| e["role"] == "user" && e["meta"]["host"].is_null());
+            urls.filter_map(Value::as_str).any(|u| bare(u) == url) || task.is_some_and(|t| t.contains(url))
+        })
     }
 
     fn worker(&mut self) -> Result<&mut Worker> {
@@ -1139,10 +1195,10 @@ fn connect(providers: &Providers, header: &Value) -> Result<(String, Llm)> {
         .with_context(|| format!("no provider: {}", crate::providers::example(model)))?;
     match recorded {
         Some(old) if old != name => {
-            ui::note(&format!("provider {old} is gone; sending {model} to {name} (/models or /providers changes it)"))
+            ui::note(&format!("provider {old} is gone; sending {model} to {name} (/model or /providers changes it)"))
         }
         None if listed.is_none() && providers.len() > 1 => {
-            ui::note(&format!("no provider lists {model}; using {name} (/models or /providers changes it)"))
+            ui::note(&format!("no provider lists {model}; using {name} (/model or /providers changes it)"))
         }
         _ => {}
     }
@@ -1187,6 +1243,10 @@ async fn grouped(mut cmd: tokio::process::Command) -> Result<(bool, String)> {
 
 /// The exit status for an error, as low gives it for a turn's outcome: see outcome().
 pub const ERROR: i64 = 3;
+
+/// The reasoning efforts /effort and --effort set, sent as the request's reasoning_effort. DeepSeek knows low, high
+/// and max, and runs medium and xhigh as high; other providers may tell them apart.
+pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// What a turn came to and the exit status low gives it, the same for a one-shot run, low --send and --tasks:
 /// 0 done, 1 not verified, 4 a question waiting for its answer, 5 stopped short. 2 is a bad argument and 3 an error
@@ -1327,6 +1387,12 @@ struct TurnState {
 /// An error as low shows and logs it: the whole chain, without control characters or secrets.
 pub fn error_text(e: &anyhow::Error) -> String {
     redact(&ui::printable(&format!("{e:#}"))).0
+}
+
+/// A URL as fetch() compares it: without its fragment or a trailing slash.
+fn bare(url: &str) -> &str {
+    let url = url.split('#').next().unwrap_or(url);
+    url.strip_suffix('/').unwrap_or(url)
 }
 
 fn quoted(path: &str) -> String {

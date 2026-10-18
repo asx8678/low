@@ -19,8 +19,18 @@ const SECRETS: &str = ".low, .config/low, .ssh, .gnupg, .aws, .azure, .kube, .do
                        .npmrc, .pypirc, .cargo/credentials, .cargo/credentials.toml, .vault-token, .claude, \
                        .claude.json, .codex, .local/share/opencode/auth.json, .zsh_history, .zsh_sessions, \
                        .bash_history, .python_history, .node_repl_history, Library/Keychains, Library/Cookies, \
-                       Library/Application Support/Google, Library/Application Support/Firefox, .terraform.d, \
-                       .m2/settings.xml, .gradle/gradle.properties, .oci, .subversion/auth, .config/helm";
+                       .terraform.d, .terraformrc, .m2/settings.xml, .gradle/gradle.properties, .oci, \
+                       .subversion/auth, .config/helm, .local/share/keyrings, \
+                       .gemini, .qwen, .cursor, .continue, .config/github-copilot, Library/Application Support/Claude, \
+                       .config/glab-cli, .config/hub, .config/stripe, .config/doctl, \
+                       Library/Application Support/doctl, .config/rclone, .config/sops, .fly, .wrangler, \
+                       .config/.wrangler, Library/Preferences/.wrangler, .s3cfg, .boto, .pgpass, .my.cnf, \
+                       .gem/credentials, .huggingface/token, .cache/huggingface/token, \
+                       Library/Application Support/Google, Library/Application Support/Firefox, \
+                       Library/Application Support/BraveSoftware, Library/Application Support/Microsoft Edge, \
+                       Library/Application Support/Chromium, Library/Application Support/Arc, Library/Safari, \
+                       Library/Containers/com.apple.Safari, Library/Thunderbird, .mozilla, .thunderbird, \
+                       .config/google-chrome, .config/chromium, .config/BraveSoftware, .config/microsoft-edge";
 const ENV: &str = "PATH HOME USER LOGNAME SHELL LANG LC_* TERM TMPDIR TZ PWD CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN \
                    GOPATH GOROOT GOFLAGS VIRTUAL_ENV CONDA_PREFIX PYENV_ROOT NVM_DIR JAVA_HOME MIX_HOME HEX_HOME ERL_* \
                    ELIXIR_* DEVELOPER_DIR SDKROOT";
@@ -173,7 +183,7 @@ pub fn sandboxed(root: &Path, yolo: bool, program: &str, args: &[&str]) -> Comma
         Command::new(program)
     } else if cfg!(target_os = "macos") {
         let subpaths = |dirs: &[PathBuf]| -> String { dirs.iter().map(|d| format!(" (subpath {d:?})")).collect() };
-        let (dirs, secrets, protected) = (subpaths(&writable), subpaths(&secrets), subpaths(&protected));
+        let (dirs, secrets, protected) = (subpaths(&writable), subpaths(secrets), subpaths(&protected));
         let sockets = root.join("tmp");
         let profile = format!(
             "(version 1)(allow default)(deny network*)\
@@ -229,16 +239,19 @@ pub fn sandboxed(root: &Path, yolo: bool, program: &str, args: &[&str]) -> Comma
 
 /// The secret paths in the home directory, which the sandbox hides from the worker and the check. The sandbox matches
 /// resolved paths, so each one also brings its real path and the targets of links inside it (a dotfiles repo's ~/.ssh
-/// or ~/.aws/credentials).
-fn secrets() -> Vec<PathBuf> {
-    let home = home();
-    let mut paths = vec![];
-    for path in SECRETS.split(',').map(|s| home.join(s.trim())) {
-        resolved(&path, &home, &mut paths);
-        linked(&path, &home, 3, &mut paths);
-        paths.push(path);
-    }
-    paths
+/// or ~/.aws/credentials). They are found once per process, since that walks each folder three levels deep.
+fn secrets() -> &'static [PathBuf] {
+    static FOUND: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    FOUND.get_or_init(|| {
+        let home = home();
+        let mut paths = vec![];
+        for path in SECRETS.split(',').map(|s| home.join(s.trim())) {
+            resolved(&path, &home, &mut paths);
+            linked(&path, &home, 3, &mut paths);
+            paths.push(path);
+        }
+        paths
+    })
 }
 
 /// The home directory $HOME names, resolved; empty when HOME is unset.

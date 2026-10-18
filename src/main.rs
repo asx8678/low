@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 /// The build `low --version` names and the session log records.
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " ", env!("LOW_BUILD"));
-const ABOUT: &str = "A low-entropy, code-mode coding agent. Without a task it starts a REPL (/compact, /cost, /think, /models [filter], /providers).";
+const ABOUT: &str = "A low-entropy, code-mode coding agent. Without a task it starts a REPL (/compact, /cost, /think, /effort [level], /model [filter], /providers).";
 const USAGE: &str = "Usage: low [OPTIONS] [TASK]";
 const HELP: &str = "\
 Arguments:
@@ -28,7 +28,9 @@ Arguments:
 Options:
       --resume         Resume the latest session in this repo
       --session <ID>   Resume this session of this repo (its id, as in [session ...])
-  -m, --model <MODEL>  Model for a new session; with --resume it switches the session to it (so does /models)
+  -m, --model <MODEL>  Model for a new session; with --resume it switches the session to it (so does /model)
+      --effort <LEVEL> How hard the model thinks: low, medium, high, xhigh or max, sent as reasoning_effort (DeepSeek runs
+                       medium and xhigh as high); like -m it sets a new session and switches a resumed one (so does /effort)
       --yolo           No sandbox: network on, writes anywhere (env vars stay filtered; env = [...] in ~/.config/low/config.toml passes more)
       --serve          After the task, keep the session and take the next tasks from low --send, keeping the provider's prompt cache warm in between (from a script, start it without a task)
       --send           Give the task to the low --serve running in this repo and print its result, with the same exit status; /stop ends that server
@@ -42,6 +44,7 @@ struct Cli {
     task: Option<String>,
     resume: bool,
     model: Option<String>,
+    effort: Option<String>,
     yolo: bool,
     serve: bool,
     send: bool,
@@ -65,11 +68,16 @@ impl Cli {
         let send = !self.serve
             && !self.resume
             && self.model.is_none()
+            && self.effort.is_none()
             && self.tasks.is_none()
             && !self.yolo
             && self.protect.is_empty();
         let refused = [
             (self.send && self.task.is_none(), "--send needs a task: low --send \"<task>\""),
+            (
+                self.effort.as_deref().is_some_and(|e| !agent::EFFORTS.contains(&e)),
+                "--effort takes low, medium, high, xhigh or max",
+            ),
             (
                 self.send && !send,
                 "--send takes only a task (and --session or --json); the server's session decides the rest",
@@ -93,6 +101,7 @@ impl Cli {
             task: None,
             resume: false,
             model: None,
+            effort: None,
             yolo: false,
             serve: false,
             send: false,
@@ -107,6 +116,7 @@ impl Cli {
                 Value(task) if cli.task.is_none() => cli.task = Some(task.string()?),
                 Long("resume") => cli.resume = true,
                 Short('m') | Long("model") => cli.model = Some(parser.value()?.string()?),
+                Long("effort") => cli.effort = Some(parser.value()?.string()?),
                 Long("yolo") => cli.yolo = true,
                 Long("serve") => cli.serve = true,
                 Long("send") => cli.send = true,
@@ -243,6 +253,9 @@ async fn start() -> Result<()> {
     if let Some(model) = picked {
         agent.resume_with(&model)?;
     }
+    if let Some(effort) = cli.effort.as_deref().filter(|e| agent.effort() != Some(*e)) {
+        agent.set_effort(effort)?;
+    }
     if !resume {
         eprintln!("[session {}]", agent.path().display());
     }
@@ -299,8 +312,11 @@ async fn start() -> Result<()> {
                 }
                 .await
             }
-            _ if let Some(filter) = line.strip_prefix("/models").filter(|f| f.is_empty() || f.starts_with(' ')) => {
+            _ if let Some(filter) = line.strip_prefix("/model").filter(|f| f.is_empty() || f.starts_with(' ')) => {
                 pick(&mut agent, &mut editor, filter.trim()).await
+            }
+            _ if let Some(level) = line.strip_prefix("/effort").filter(|f| f.is_empty() || f.starts_with(' ')) => {
+                effort(&mut agent, level.trim())
             }
             task => {
                 editor.add_history_entry(task)?;
@@ -362,7 +378,18 @@ fn exit_code(result: &serde_json::Value) -> i32 {
     result["exit"].as_i64().unwrap_or(agent::ERROR) as i32
 }
 
-const COMMANDS: &[&str] = &["/compact", "/cost", "/think", "/models", "/providers"];
+/// /effort alone shows the reasoning effort the session's requests carry and the choices; /effort <level> sets it.
+fn effort(agent: &mut agent::Agent, level: &str) -> Result<()> {
+    if level.is_empty() {
+        let now = agent.effort().unwrap_or("not set, so the provider's default");
+        let choices = agent::EFFORTS.join(" ");
+        println!("reasoning effort: {now}\nset it with /effort {choices} (DeepSeek runs medium and xhigh as high)");
+        return Ok(());
+    }
+    agent.set_effort(level)
+}
+
+const COMMANDS: &[&str] = &["/compact", "/cost", "/think", "/effort", "/model", "/providers"];
 
 /// A "/word" line that names no command is a typo, and must not reach the model as a task.
 fn unknown(line: &str) -> Option<String> {
