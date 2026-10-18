@@ -126,6 +126,8 @@ pub fn changes(root: &Path, snapshot: Option<(&str, &Path)>, since: std::time::S
         .lines()
         .filter_map(|l| match l.splitn(3, '\t').collect::<Vec<_>>()[..] {
             [_, _, path] if created.contains(&path) => Some(format!("{path} (new)")),
+            // numstat counts no lines in a binary file: "-\t-\tpath".
+            ["-", "-", path] => Some(format!("{path} (binary)")),
             [added, removed, path] => Some(format!("{path} +{added} −{removed}")),
             _ => None,
         })

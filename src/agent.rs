@@ -1244,7 +1244,8 @@ fn own_changes(turn: &[Value]) -> String {
 
 /// The path in one of changes()'s lines.
 fn changed_path(line: &str) -> Option<String> {
-    line.strip_suffix(" (new)").or_else(|| line.rsplit_once(" +").map(|(path, _)| path)).map(String::from)
+    let marked = line.strip_suffix(" (new)").or_else(|| line.strip_suffix(" (binary)"));
+    marked.or_else(|| line.rsplit_once(" +").map(|(path, _)| path)).map(String::from)
 }
 
 fn edited(meta: &Value) -> bool {
