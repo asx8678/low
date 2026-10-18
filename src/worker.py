@@ -59,23 +59,40 @@ def _exec(cmd, timeout):
     left = _deadline - time.monotonic()
     if not timeout or timeout > left:
         timeout = max(1, int(left))
-    with tempfile.TemporaryFile() as out:
-        p = subprocess.Popen(cmd, shell=True, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                             start_new_session=True)
-        _groups.add(p.pid)
-        try:
-            code = p.wait(timeout=timeout)
-        except BaseException as e:
-            with contextlib.suppress(OSError):
-                os.killpg(p.pid, signal.SIGKILL)
-            p.wait()
-            if not isinstance(e, subprocess.TimeoutExpired):
-                raise
-            code = f"timeout after {timeout}s"
+    p = subprocess.Popen(cmd, shell=True, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, start_new_session=True)
+    _groups.add(p.pid)
+    # Read as it comes, keeping both ends in memory, so a command that prints without end fills no disk.
+    head, tail, size = bytearray(), bytearray(), [0]
+
+    def drain():
+        for chunk in iter(lambda: p.stdout.read1(1 << 16), b""):
+            size[0] += len(chunk)
+            take = max(0, LIMIT // 2 - len(head))
+            head.extend(chunk[:take])
+            tail.extend(chunk[take:])
+            if len(tail) > LIMIT:
+                del tail[:len(tail) - LIMIT // 2]
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    try:
+        code = p.wait(timeout=timeout)
+    except BaseException as e:
         with contextlib.suppress(OSError):
             os.killpg(p.pid, signal.SIGKILL)
-        _groups.discard(p.pid)
-        return ANSI.sub("", _read(out).decode("utf-8", "replace")), code
+        p.wait()
+        if not isinstance(e, subprocess.TimeoutExpired):
+            raise
+        code = f"timeout after {timeout}s"
+    with contextlib.suppress(OSError):
+        os.killpg(p.pid, signal.SIGKILL)
+    # A process that left the group can hold the pipe open: what it prints after a second is not waited for.
+    reader.join(1)
+    _groups.discard(p.pid)
+    start, end = bytes(head), bytes(tail[-(LIMIT // 2):])
+    gap = size[0] - len(start) - len(end)
+    out = start + (f"\n[… {gap} bytes omitted]\n".encode() if gap > 0 else b"") + end
+    return ANSI.sub("", out.decode("utf-8", "replace")), code
 
 
 def _read(f):

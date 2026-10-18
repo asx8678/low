@@ -120,12 +120,15 @@ pub fn changes(root: &Path, snapshot: Option<(&str, &Path)>, since: std::time::S
     let diff =
         git(root, index, &["diff", "--numstat", "--summary", "--no-renames", "--no-ext-diff", "--no-textconv", base])
             .unwrap_or_default();
-    let created: Vec<&str> =
-        diff.lines().filter_map(|l| l.strip_prefix(" create mode ")?.split_once(' ')).map(|(_, p)| p).collect();
+    let summary = |mode: &str| -> Vec<&str> {
+        diff.lines().filter_map(|l| l.strip_prefix(mode)?.split_once(' ')).map(|(_, p)| p).collect()
+    };
+    let (created, deleted) = (summary(" create mode "), summary(" delete mode "));
     let mut out: Vec<String> = diff
         .lines()
         .filter_map(|l| match l.splitn(3, '\t').collect::<Vec<_>>()[..] {
             [_, _, path] if created.contains(&path) => Some(format!("{path} (new)")),
+            [_, _, path] if deleted.contains(&path) => Some(format!("{path} (deleted)")),
             // numstat counts no lines in a binary file: "-\t-\tpath".
             ["-", "-", path] => Some(format!("{path} (binary)")),
             [added, removed, path] => Some(format!("{path} +{added} −{removed}")),

@@ -237,8 +237,8 @@ async fn start() -> Result<()> {
     let config = Config {
         model: cli.model.or(user.model),
         base_url: None,
-        check: repo.check.or(user.check).filter(|c| !c.trim().is_empty()),
-        fmt: repo.fmt.or(user.fmt),
+        check: repo.check.filter(|c| !c.trim().is_empty()),
+        fmt: repo.fmt,
         search,
         env: user.env,
         models: user.models,
@@ -246,9 +246,12 @@ async fn start() -> Result<()> {
         providers,
     };
     worker::allow_env(config.env.clone());
-    // A --tasks checklist is low's to mark: the model reads it but doesn't change it.
-    let protect = repo.protect.iter().map(PathBuf::from).chain(cli.protect).chain(cli.tasks.clone());
-    worker::protect(protect.map(|p| root.join(&p).canonicalize().unwrap_or_else(|_| root.join(p))).collect());
+    // A --tasks checklist is low's to mark: the model reads it but doesn't change it. low.toml's paths are the
+    // repository's; --protect and --tasks paths are the shell's, from wherever low runs.
+    let cwd = std::env::current_dir()?;
+    let given = cli.protect.iter().chain(&cli.tasks).map(|p| cwd.join(p));
+    let protect = repo.protect.iter().map(|p| root.join(p)).chain(given);
+    worker::protect(protect.map(|p| p.canonicalize().unwrap_or(p)).collect());
     let mut agent = agent::Agent::new(&root, &home, config, resume, id.as_deref(), cli.yolo, repo_dir)?;
     if let Some(model) = picked {
         agent.resume_with(&model)?;
@@ -405,8 +408,12 @@ fn unknown(line: &str) -> Option<String> {
     })
 }
 
-/// Stops on a setting low no longer reads, or on a compact_at it cannot use.
+/// Stops on a setting that belongs in a repository's low.toml or that low no longer reads, or on a profile value it
+/// cannot use.
 fn check_config(user: &Config) -> Result<()> {
+    if user.check.is_some() || user.fmt.is_some() {
+        bail!("~/.config/low/config.toml sets check or fmt; they belong to one repository, so they go in its low.toml");
+    }
     if !user.protect.is_empty() {
         bail!(
             "~/.config/low/config.toml sets protect; it names paths of one repository, so it goes in that repository's low.toml"

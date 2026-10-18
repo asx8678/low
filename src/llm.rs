@@ -215,6 +215,18 @@ impl Llm {
         }
     }
 
+    /// Sends reasoning back under the field this endpoint used last in the session, so that after a resume, a model
+    /// switch or an /effort the first request carries the same bytes as before (the prompt stays cached) and the field
+    /// the provider expects.
+    pub fn recall(&self, entries: &[Value]) {
+        let url = endpoint(&format!("{}/chat/completions", self.base));
+        let mut ours = entries.iter().rev().filter(|e| e["meta"]["request"]["url"] == url.as_str());
+        let used = ours.find_map(|e| e["meta"]["reasoning_field"].as_str());
+        if let Some(field) = used.and_then(|used| FIELDS.into_iter().find(|f| *f == used)) {
+            self.field.set(field);
+        }
+    }
+
     /// What every request carries besides the user agent: OpenCode's session id and the API key.
     fn authorized(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(id) = &self.session {
@@ -632,7 +644,7 @@ impl Reply {
         if !self.thinking.is_empty() || self.echo.is_some() {
             message["reasoning_content"] = self.thinking.into();
         }
-        if let Some(field) = self.via {
+        if let Some(field) = self.via.or(self.echo) {
             message["meta"]["reasoning_field"] = field.into();
         }
         if !self.calls.is_empty() {

@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{BufRead, Read};
+use tokio::io::AsyncReadExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -128,7 +129,7 @@ impl Agent {
             let system = system_prompt(root, yolo, config.check.as_deref(), repo, config.search.is_some());
             Session::create(home, root, provider, &model, &system, profile, context)?
         };
-        let (provider, llm) = connect(&config.providers, session.header())?;
+        let (provider, llm) = connect(&config.providers, &session)?;
         let mut since = session.entries.iter().rev().take_while(|e| e["switch"].is_null());
         let learned = since.find_map(|e| e["compact"]["at"].as_u64());
         let compact_at = learned.or(session.header()["compact_at"].as_u64()).unwrap_or(COMPACT_AT);
@@ -225,7 +226,7 @@ impl Agent {
 
     pub fn set_providers(&mut self, providers: Providers) -> Result<()> {
         self.config.providers = providers;
-        match connect(&self.config.providers, self.session.header()) {
+        match connect(&self.config.providers, &self.session) {
             Ok((provider, llm)) => (self.provider, self.llm) = (provider, llm),
             Err(e) => {
                 ui::note(&format!("{e:#}; still connected as before until a provider is added"));
@@ -278,9 +279,11 @@ impl Agent {
             }
         }
         profile.insert("reasoning_effort".into(), effort.into());
+        // A profile that sends no temperature (temperature = false) keeps sending none.
+        profile.entry("temperature").or_insert(false.into());
         let provider = self.provider.clone();
         self.session.switch(&provider, &model, &system, profile)?;
-        (self.provider, self.llm) = connect(&self.config.providers, self.session.header())?;
+        (self.provider, self.llm) = connect(&self.config.providers, &self.session)?;
         ui::note(&format!("reasoning effort {effort} for {model}"));
         Ok(())
     }
@@ -292,7 +295,7 @@ impl Agent {
         let web = self.config.search.is_some();
         let system = system_prompt(&self.root, self.yolo, self.config.check.as_deref(), self.repo, web);
         self.session.switch(provider, model, &system, profile)?;
-        (self.provider, self.llm) = connect(&self.config.providers, self.session.header())?;
+        (self.provider, self.llm) = connect(&self.config.providers, &self.session)?;
         self.compact_at = self.session.header()["compact_at"].as_u64().unwrap_or(COMPACT_AT);
         ui::note(&format!("now using {model} on {provider}"));
         Ok(())
@@ -961,9 +964,11 @@ impl Agent {
             (own.clone(), own)
         };
         let lines = |list: &str| list.lines().filter(|l| *l != "none").map(String::from).collect::<Vec<_>>();
-        let changes = lines(&listed);
+        let mut changes = lines(&listed);
         // Files another writer changed during the turn: neither this turn's to report nor its to undo.
         let elsewhere = lines(&all).len() - changes.len();
+        let ignored = if self.repo { self.ignored(began, &changes).await } else { vec![] };
+        changes.extend(ignored.iter().map(|path| format!("{path} (ignored by git)")));
         let first = &self.session.entries[began];
         let snapshot = first["meta"]["snapshot"].as_str().and_then(|s| s.split(' ').next()).map(String::from);
         let changed = changed.unwrap_or(!changes.is_empty());
@@ -990,7 +995,7 @@ impl Agent {
         if !inputs.is_empty() {
             rows.push(("inputs", format!("check inputs changed: {}", inputs.join(", "))));
         }
-        rows.push(("changes", listed));
+        rows.push(("changes", if changes.is_empty() { "none".into() } else { changes.join("\n") }));
         if elsewhere > 0 {
             rows.push(("elsewhere", format!("{elsewhere} more changed by another writer in this tree, left out")));
         }
@@ -1003,6 +1008,9 @@ impl Agent {
         }
         if let Some(tree) = snapshot.filter(|_| changed && self.repo) {
             rows.push(("undo", self.undo(&tree, mine, outside.is_empty() && elsewhere == 0).await?));
+        }
+        if !ignored.is_empty() {
+            rows.push(("ignored", format!("{}: git ignores them, so no undo restores them", ignored.join(", "))));
         }
         let totals = crate::stats::totals(turn);
         let n = |v: &Value| v.as_u64().unwrap_or(0);
@@ -1072,6 +1080,28 @@ impl Agent {
         let check = self.config.check.as_deref().unwrap_or_default();
         let mut words = check.split(|c: char| c.is_whitespace() || "'\"();&|<>=`".contains(c));
         path == "low.toml" || words.any(|w| w.trim_start_matches("./") == path)
+    }
+
+    /// The files this turn's edit() and write() changed that git ignores: no diff or snapshot holds them, so the report
+    /// lists them itself and says no undo brings them back.
+    async fn ignored(&self, began: usize, changes: &[String]) -> Vec<String> {
+        let listed: Vec<String> = changes.iter().filter_map(|line| changed_path(line)).collect();
+        let actions = self.session.entries[began..].iter().flat_map(|e| e["meta"]["actions"].as_array().into_iter().flatten());
+        let mut paths: Vec<String> = actions
+            .filter(|a| a["ok"] == true)
+            .filter_map(|a| a["path"].as_str())
+            .filter(|path| !listed.iter().any(|l| l == path))
+            .map(String::from)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            return paths;
+        }
+        let args: Vec<String> = ["check-ignore", "--"].into_iter().map(String::from).chain(paths).collect();
+        let root = self.root.clone();
+        let out = tokio::task::spawn_blocking(move || git(&root, None, &args)).await.ok().and_then(Result::ok);
+        out.unwrap_or_default().lines().map(String::from).collect()
     }
 
     /// The undo row: restore from the turn's snapshot the whole tree when nothing else changed it meanwhile (`alone`),
@@ -1181,7 +1211,8 @@ fn holding<'a>(providers: &'a Providers, model: &str) -> Option<&'a String> {
     providers.iter().find(|(_, p)| p.models.iter().any(|m| m == model)).map(|(name, _)| name)
 }
 
-fn connect(providers: &Providers, header: &Value) -> Result<(String, Llm)> {
+fn connect(providers: &Providers, session: &Session) -> Result<(String, Llm)> {
+    let header = session.header();
     let model = header["model"].as_str().unwrap_or_default();
     let recorded = header["provider"].as_str();
     let listed = holding(providers, model).map(String::as_str);
@@ -1207,21 +1238,35 @@ fn connect(providers: &Providers, header: &Value) -> Result<(String, Llm)> {
     let url = llm::endpoint(&p.base_url);
     let extra = json!({"provider": name, "model": model, "base_url": url, "key": crate::providers::key(p)});
     ui::record("connect", &format!("{model} on {name} at {url}"), extra);
-    Ok((name.into(), Llm::new(&p.base_url, p.api_key.as_deref(), header)))
+    let llm = Llm::new(&p.base_url, p.api_key.as_deref(), header);
+    llm.recall(&session.entries);
+    Ok((name.into(), llm))
 }
 
 async fn grouped(mut cmd: tokio::process::Command) -> Result<(bool, String)> {
-    let path = std::env::temp_dir().join(format!("low-check-{}-{}", std::process::id(), ui::now_ms()));
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)?;
-    let _ = std::fs::remove_file(&path);
-    let mut child = cmd.stdin(Stdio::null()).stdout(file.try_clone()?).process_group(0).spawn()?;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).process_group(0).spawn()?;
     let pid = child.id().context("the check exited before it started")?.cast_signed();
     ui::CHECK.store(pid, Ordering::Relaxed);
     let mut group = Group(vec![pid]);
+    let mut stdout = child.stdout.take().context("the check's output")?;
+    // The output is read as it comes and only its end is kept, so a check that prints without end fills no disk.
+    let (mut kept, mut size, mut buf, mut open) = (Vec::new(), 0, vec![0; 1 << 16], true);
+    let mut keep = |kept: &mut Vec<u8>, chunk: &[u8]| {
+        size += chunk.len() as u64;
+        kept.extend_from_slice(chunk);
+        if kept.len() as u64 > 2 * CHECK_OUT {
+            kept.drain(..kept.len() - CHECK_OUT as usize);
+        }
+    };
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     let status = loop {
         tokio::select! {
             status = child.wait() => break status?,
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+            read = stdout.read(&mut buf), if open => match read {
+                Ok(n @ 1..) => keep(&mut kept, &buf[..n]),
+                _ => open = false,
+            },
+            _ = tick.tick() => {
                 let seen = worker::descendants(pid);
                 for g in seen {
                     if !group.0.contains(&g) {
@@ -1232,11 +1277,15 @@ async fn grouped(mut cmd: tokio::process::Command) -> Result<(bool, String)> {
         }
     };
     drop(group);
-    let size = file.seek(SeekFrom::End(0))?;
-    file.seek(SeekFrom::Start(size.saturating_sub(CHECK_OUT)))?;
-    let mut out = vec![];
-    file.read_to_end(&mut out)?;
-    let out = String::from_utf8_lossy_owned(out);
+    // What the check printed last, and its processes before low stopped them; one that slipped away is not waited for.
+    let rest = async {
+        while let Ok(n @ 1..) = stdout.read(&mut buf).await {
+            keep(&mut kept, &buf[..n]);
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_millis(500), rest).await;
+    let tail = &kept[kept.len().saturating_sub(CHECK_OUT as usize)..];
+    let out = String::from_utf8_lossy(tail).into_owned();
     let out = if size > CHECK_OUT { format!("[… {} bytes omitted]\n{out}", size - CHECK_OUT) } else { out };
     Ok((status.success(), out))
 }
@@ -1480,7 +1529,8 @@ fn own_changes(turn: &[Value]) -> String {
 
 /// The path in one of changes()'s lines.
 fn changed_path(line: &str) -> Option<String> {
-    let marked = line.strip_suffix(" (new)").or_else(|| line.strip_suffix(" (binary)"));
+    let marks = [" (new)", " (deleted)", " (binary)", " (ignored by git)"];
+    let marked = marks.iter().find_map(|mark| line.strip_suffix(mark));
     marked.or_else(|| line.rsplit_once(" +").map(|(path, _)| path)).map(String::from)
 }
 

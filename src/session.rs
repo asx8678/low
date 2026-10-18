@@ -234,7 +234,12 @@ fn stamp(entry: &mut Value, at: u64) {
 fn settings(provider: &str, model: &str, system: &str, mut params: Map<String, Value>) -> Value {
     let (compact_at, keep_warm) = (params.remove("compact_at"), params.remove("keep_warm"));
     let (turn_budget, fallback) = (params.remove("turn_budget"), params.remove("fallback"));
-    params.entry("temperature").or_insert(crate::llm::TEMPERATURE.into());
+    // temperature = false in a model's profile sends none, for models that refuse the field.
+    if params.get("temperature") == Some(&Value::Bool(false)) {
+        params.remove("temperature");
+    } else {
+        params.entry("temperature").or_insert(crate::llm::TEMPERATURE.into());
+    }
     json!({"provider": provider, "model": model, "params": params, "compact_at": compact_at, "keep_warm": keep_warm,
            "turn_budget": turn_budget, "fallback": fallback, "system": system})
 }

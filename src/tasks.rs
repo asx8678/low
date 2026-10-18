@@ -84,8 +84,11 @@ fn update(file: &Path, line: usize, text: &str, mark: char, result: &str, id: &s
         }
         lines.insert(at + 1, format!("  - low: {result}"));
     }
+    // The rewrite keeps the file's line ends and permissions.
+    let eol = if old.contains("\r\n") { "\r\n" } else { "\n" };
     let temp = file.with_extension("low-part");
-    std::fs::write(&temp, lines.join("\n") + "\n")?;
+    std::fs::write(&temp, lines.join(eol) + eol)?;
+    std::fs::set_permissions(&temp, std::fs::metadata(file)?.permissions())?;
     std::fs::rename(&temp, file).with_context(|| format!("could not update {}", file.display()))
 }
 
