@@ -70,6 +70,7 @@ models = ["deepseek-v4.1-flash"]
 ```toml
 check = "cargo build -q && cargo test -q"   # run on the final tree; decides the verdict
 fmt = "rustfmt --edition 2024"              # run on each edited file (its path is appended)
+protect = ["Cargo.lock", "migrations"]      # files and folders the model may not change (also --protect <path> per run)
 ```
 
 **3. Give it a task:**
@@ -109,7 +110,7 @@ In the REPL:
 |---|---|
 | `~/.config/low/providers.toml` | endpoints: `base_url`, optional `api_key`, `models` |
 | `~/.config/low/config.toml` | your defaults: `model`, extra sandbox `env`, and per-model request parameters |
-| `low.toml` (repo root) | `check` and `fmt` for that repository |
+| `low.toml` (repo root) | `check`, `fmt` and `protect` for that repository |
 
 A `config.toml` example:
 

@@ -80,6 +80,6 @@ Inside a task, low's model can call `search(query)` and `fetch(url)` (DeepSeek's
 ## Rules
 
 - Keep low's sandbox on: don't pass `--yolo` unless the user asks.
-- One low per working tree at a time; for parallel tasks use separate git worktrees.
+- One low per working tree at a time; for parallel tasks use separate git worktrees, or give each low its own paths and pass the others' with `--protect <path>` (repeatable), which the sandbox enforces.
 - Treat `answer` as low's claim and the verdict as evidence: VERIFIED means the repo's check passed on the final tree, not that the task is fully right. Review `changes` before telling the user it's done.
 - Give low whole tasks with their acceptance criteria; it has its own tools and doesn't need step-by-step instructions.

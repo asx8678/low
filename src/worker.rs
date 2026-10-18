@@ -31,6 +31,17 @@ pub fn allow_env(names: Vec<String>) {
     let _ = EXTRA_ENV.set(names);
 }
 
+static LOCKED: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+/// Paths a repository's low.toml (`protect`) or `--protect` keeps the model's code and edits from changing.
+pub fn protect(paths: Vec<PathBuf>) {
+    let _ = LOCKED.set(paths);
+}
+
+fn locked() -> &'static [PathBuf] {
+    LOCKED.get().map_or(&[], Vec::as_slice)
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("the worker could not start")]
 pub struct StartFailed;
@@ -57,6 +68,7 @@ impl Worker {
             .env("LOW_CHECK", if check.is_some() { "1" } else { "" })
             .env("LOW_FMT", fmt.unwrap_or_default())
             .env("LOW_PROTECTED", guarded)
+            .env("LOW_LOCKED", json!(locked().iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>()).to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .process_group(0)
@@ -156,7 +168,7 @@ pub fn descendants(pid: i32) -> Vec<i32> {
 pub fn sandboxed(root: &Path, yolo: bool, program: &str, args: &[&str]) -> Command {
     let writable = writable(root);
     let secrets = secrets();
-    let protected = protected(root);
+    let protected: Vec<PathBuf> = protected(root).into_iter().chain(locked().iter().cloned()).collect();
     let mut cmd = if yolo {
         Command::new(program)
     } else if cfg!(target_os = "macos") {

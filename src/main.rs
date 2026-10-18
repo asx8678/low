@@ -32,6 +32,7 @@ Options:
       --yolo           No sandbox: network on, writes anywhere (env vars stay filtered; env = [...] in ~/.config/low/config.toml passes more)
       --serve          After the task, keep the session and take the next tasks from low --send, keeping the provider's prompt cache warm in between (from a script, start it without a task)
       --send           Give the task to the low --serve running in this repo and print its result, with the same exit status; /stop ends that server
+      --protect <PATH> Keep this file or folder from being changed in this run (repeatable; protect = [...] in low.toml does it always)
       --tasks <FILE>   Work through the open tasks of a markdown checklist (- [ ] task) in one session, marking each line with its result; stops at the first task not done (one a turn limit cut off while it still changed files gets 2 more turns)
       --json           Show nothing while the task runs and print its result as one JSON object (with --send too)
   -h, --help           Print help
@@ -47,6 +48,7 @@ struct Cli {
     json: bool,
     session: Option<String>,
     tasks: Option<PathBuf>,
+    protect: Vec<PathBuf>,
 }
 
 impl Cli {
@@ -60,7 +62,12 @@ impl Cli {
 
     /// Options that don't go together.
     fn combined(self) -> Result<Self, String> {
-        let send = !self.serve && !self.resume && self.model.is_none() && self.tasks.is_none() && !self.yolo;
+        let send = !self.serve
+            && !self.resume
+            && self.model.is_none()
+            && self.tasks.is_none()
+            && !self.yolo
+            && self.protect.is_empty();
         let refused = [
             (self.send && self.task.is_none(), "--send needs a task: low --send \"<task>\""),
             (self.send && !send, "--send takes only a task (and --session or --json); the server's session decides the rest"),
@@ -86,6 +93,7 @@ impl Cli {
             json: false,
             session: None,
             tasks: None,
+            protect: vec![],
         };
         let mut parser = lexopt::Parser::from_env();
         while let Some(arg) = parser.next()? {
@@ -99,6 +107,7 @@ impl Cli {
                 Long("json") => cli.json = true,
                 Long("session") => cli.session = Some(parser.value()?.string()?),
                 Long("tasks") => cli.tasks = Some(parser.value()?.into()),
+                Long("protect") => cli.protect.push(parser.value()?.into()),
                 Short('h') | Long("help") => {
                     println!("{ABOUT}\n\n{USAGE}\n\n{HELP}");
                     std::process::exit(0)
@@ -127,6 +136,9 @@ pub struct Config {
     pub env: Vec<String>,
     #[serde(default)]
     pub models: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    /// Paths, relative to the repository, that the model's code and edits may not change (low.toml only).
+    #[serde(default)]
+    pub protect: Vec<String>,
     #[serde(skip)]
     pub providers: providers::Providers,
 }
@@ -210,9 +222,12 @@ async fn start() -> Result<()> {
         search,
         env: user.env,
         models: user.models,
+        protect: vec![],
         providers,
     };
     worker::allow_env(config.env.clone());
+    let protect = repo.protect.iter().map(PathBuf::from).chain(cli.protect);
+    worker::protect(protect.map(|p| root.join(&p).canonicalize().unwrap_or_else(|_| root.join(p))).collect());
     let mut agent = agent::Agent::new(&root, &home, config, resume, id.as_deref(), cli.yolo, repo_dir)?;
     if let Some(model) = picked {
         agent.resume_with(&model)?;
@@ -357,6 +372,9 @@ fn unknown(line: &str) -> Option<String> {
 
 /// Stops on a setting low no longer reads, or on a compact_at it cannot use.
 fn check_config(user: &Config) -> Result<()> {
+    if !user.protect.is_empty() {
+        bail!("~/.config/low/config.toml sets protect; it names paths of one repository, so it goes in that repository's low.toml");
+    }
     if user.base_url.is_some() {
         let model = user.model.as_deref().unwrap_or("model-id");
         bail!("~/.config/low/config.toml sets base_url, which low no longer reads; {}", providers::example(model));

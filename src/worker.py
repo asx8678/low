@@ -5,6 +5,7 @@ sys.path.append(ROOT)
 CHECK = os.environ.pop("LOW_CHECK", "")
 FMT = os.environ.pop("LOW_FMT", "")
 PROTECTED = [os.path.realpath(d) for d in json.loads(os.environ.pop("LOW_PROTECTED", "[]"))]
+LOCKED = [os.path.realpath(d) for d in json.loads(os.environ.pop("LOW_LOCKED", "[]"))]
 HALF = 16000
 LIMIT = 8 << 20
 RUN_CAP = 570
@@ -109,6 +110,8 @@ def _change(tool, path, make):
         if rel.startswith("..") or not real.startswith(ROOT + os.sep):
             raise ValueError(f"{path} is outside the repo")
         parts = (rel + os.sep + os.path.relpath(real, ROOT)).split(os.sep)
+        if any(d == real or real.startswith(d + os.sep) for d in LOCKED):
+            raise ValueError(f"{path} is protected (protect in low.toml, or --protect); low will not change it")
         if any(d == real or real.startswith(d + os.sep) for d in PROTECTED) or any(
                 IGNORABLE.sub("", p).casefold() == ".git" for p in parts):
             raise ValueError(f"{path} is off limits: git runs code from there outside the sandbox")
