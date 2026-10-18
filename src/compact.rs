@@ -1,3 +1,4 @@
+use crate::agent::Report;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -97,14 +98,13 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
         .filter_map(|&u| {
             let next = (u + 1..entries.len()).find(|&i| role(i) == "user" && entries[i]["meta"]["host"].is_null());
             let end = next.unwrap_or(entries.len());
-            let report = entries[u..end].iter().rev().find(|e| e["report"].is_object()).map(|e| &e["report"]);
+            let report = entries[u..end].iter().rev().find_map(Report::of);
             if report.is_none() && next.is_none() {
                 return None;
             }
-            let verdict = report.map_or("no verdict".to_string(), |r| {
-                let changed = r["changes"].as_array().map_or(0, Vec::len);
-                let verdict = r["verdict"].as_str().unwrap_or("?");
-                if changed > 0 { format!("{verdict}, {changed} files changed") } else { verdict.to_string() }
+            let verdict = report.map_or("no verdict".to_string(), |r| match r.changes.len() {
+                0 => r.verdict,
+                changed => format!("{}, {changed} files changed", r.verdict),
             });
             Some(format!("#{u} {} → {verdict}", line(text(u), 80)))
         })

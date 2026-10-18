@@ -12,8 +12,8 @@ pub fn totals(entries: &[Value]) -> Value {
         if let Some(kind) = e["event"].as_str() {
             count(&mut events, kind, 1);
         }
-        if let Some(verdict) = e["report"]["verdict"].as_str() {
-            count(&mut verdicts, verdict, 1);
+        if let Some(report) = crate::agent::Report::of(e) {
+            count(&mut verdicts, &report.verdict, 1);
         }
         count(&mut n, "turns", u64::from(e["role"] == "user" && meta["host"].is_null()));
         count(&mut n, "compactions", u64::from(e["compact"].is_object()));

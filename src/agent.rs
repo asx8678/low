@@ -6,6 +6,7 @@ use crate::session::Session;
 use crate::worker::{self, Worker};
 use crate::{Config, compact, ui};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom};
@@ -74,8 +75,8 @@ pub struct Agent {
     passed: Option<(String, String)>,
     /// Whether the root is a git repository; outside one there are no snapshots and no undo.
     repo: bool,
-    /// The last turn's verdict, report rows and final answer, for a `low --send` client.
-    last: Value,
+    /// The last turn's result: its verdict, report rows and final answer.
+    last: Option<Outcome>,
     /// The question an ask() ended the turn with, for its report.
     question: Option<String>,
     /// A file low itself rewrites between turns (a --tasks checklist), relative to the root: not news to the model.
@@ -147,7 +148,7 @@ impl Agent {
             broken: None,
             passed: None,
             repo,
-            last: Value::Null,
+            last: None,
             question: None,
             quiet: None,
             limit: None,
@@ -175,8 +176,14 @@ impl Agent {
         self.switch(&provider, model)
     }
 
-    pub fn last(&self) -> &Value {
-        &self.last
+    /// Runs one task and returns its result as `low --json`, `low --send` and `--tasks` give it.
+    pub async fn task(&mut self, task: &str) -> Outcome {
+        match self.run(task).await {
+            Ok(_) => {
+                self.last.clone().unwrap_or_else(|| failed(None, &anyhow::anyhow!("stopped before the turn began")))
+            }
+            Err(e) => failed(self.last.as_ref(), &e),
+        }
     }
 
     /// How often an idle --serve session re-sends its prompt: keep_warm seconds from the model's profile, where 0 turns
@@ -267,7 +274,7 @@ impl Agent {
     }
 
     pub async fn run(&mut self, task: &str) -> Result<bool> {
-        self.last = Value::Null;
+        self.last = None;
         let _bar = ui::Turn::start();
         let finished = tokio::select! {
             biased;
@@ -343,185 +350,207 @@ impl Agent {
             ui::event("moved", &moved, Value::Null);
             self.session.push(json!({"role": "user", "content": format!("[{moved}]"), "meta": {"host": true}}))?;
         }
-        let (mut nudged, mut overflowed, mut retries, mut stalled, mut strayed) = (false, false, 0, false, false);
-        let mut failed_over = false;
+        let mut state = TurnState::default();
         let budget = self.session.header()["turn_budget"].as_u64().unwrap_or(TURN_BUDGET);
         let ceiling = self.compact_at * budget;
-        let mut spent = 0;
         let mut limit = format!("stopped after {MAX_REQUESTS} model requests in one turn");
         for _ in 0..MAX_REQUESTS {
-            if spent >= ceiling {
+            if state.spent >= ceiling {
                 let rule = "cached input counts a quarter";
-                limit = format!("stopped after {} in one turn ({budget} × compact_at; {rule})", ui::tokens(spent));
+                limit =
+                    format!("stopped after {} in one turn ({budget} × compact_at; {rule})", ui::tokens(state.spent));
                 break;
             }
             if self.upcoming() >= self.compact_at {
                 self.compact()?;
             }
-            let result = self.llm.complete(self.session.messages(), &tools()).await;
-            if let Some(lost) = result.as_ref().err().and_then(llm::lost) {
-                self.discard("the provider cut the stream", &lost.thinking);
-            }
-            let mut message = match result {
-                Err(e) if e.is::<llm::ContextOverflow>() && !overflowed => {
-                    overflowed = true;
-                    self.overflow(e.downcast_ref::<llm::ContextOverflow>().and_then(|o| o.window))?;
-                    continue;
-                }
-                Err(e) if e.is::<llm::ContextOverflow>() => {
-                    let system = self.session.header()["system"].as_str().map_or(0, str::len);
-                    let agents = repo_text(&self.root, "AGENTS.md", 0).map_or(0, |(_, size)| size as usize);
-                    anyhow::bail!(
-                        "{e}; still over after compacting: the request is {} KB, of which the system prompt is {} KB \
-                         (including {} KB of AGENTS.md)",
-                        self.sent() * 4 / 1024,
-                        system / 1024,
-                        agents.min(AGENTS_MAX) / 1024
-                    );
-                }
-                // Out of credit or quota on this provider: once a turn, go on with the model profile's fallback.
-                Err(e) if e.is::<llm::Exhausted>() && !failed_over && self.fallback().is_some() => {
-                    failed_over = true;
-                    let (provider, model) = self.fallback().unwrap_or_default();
-                    ui::event("failover", &format!("{e:#}; going on with {provider}:{model}"), Value::Null);
-                    self.switch(&provider, &model)?;
-                    continue;
-                }
-                Err(e) if retries < 2 && llm::lost(&e).is_some_and(|l| !l.stalled) => {
-                    (spent, retries) = (spent + self.sent(), retries + 1);
-                    self.retry("was lost: the provider cut the stream")?;
-                    continue;
-                }
-                result => result?,
-            };
-            overflowed = false;
-            if !message["meta"]["usage"]["prompt_tokens"].is_u64() {
-                let usage = &mut message["meta"]["usage"];
-                usage["prompt_tokens"] = self.sent().into();
-                usage["estimated"] = true.into();
-            }
-            let usage = &message["meta"]["usage"];
-            let attempts = message["meta"]["timing"]["attempts"].as_u64().unwrap_or(1).max(1);
-            // The budget follows what a request costs: cached input is billed at a fraction of fresh input, so a long,
-            // well-cached session isn't stopped for re-sending its own context.
-            let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
-            let cached = ui::cached(usage).unwrap_or(0).min(prompt);
-            spent += (prompt - cached + cached / 4) * attempts + usage["completion_tokens"].as_u64().unwrap_or(0);
-            ui::usage(usage);
-            self.cache_miss(usage);
+            let Some(message) = self.request(&mut state).await? else { continue };
             let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
-            let empty = calls.is_empty() && message["content"].as_str().is_none_or(|c| c.trim().is_empty());
-            let cut = calls.is_empty() && !empty && message["meta"]["finish"] == "length";
-            if (empty || cut) && retries < 2 {
-                retries += 1;
-                if empty {
-                    // The reply is dropped, so its usage stays on the event.
-                    let meta = &message["meta"];
-                    let extra =
-                        json!({"meta": {"usage": meta["usage"], "timing": meta["timing"]}, "finish": meta["finish"]});
-                    ui::event("empty", "the model sent an empty reply; asking it to act", extra);
-                    let thinking = message["reasoning_content"].as_str().unwrap_or_default();
-                    self.discard("the reply was empty", thinking);
-                    self.retry("was empty")?;
-                } else {
-                    ui::event("length", "the reply hit the output limit; asking the model to continue", Value::Null);
-                    self.session.push(message)?;
-                    self.retry("hit the output limit and was cut off; continue from where it stopped")?;
-                }
-                continue;
-            }
-            // Retries count in a row: a reply that is kept starts them over, and one that is still unusable after
-            // them ends the turn as stopped.
-            if empty || cut {
-                let (kind, what) = if empty { ("empty", "an empty reply") } else { ("length", "a cut-off reply") };
-                ui::event(kind, &format!("the model sent {what} again; finishing the turn"), Value::Null);
-                stalled = true;
-            } else {
-                retries = 0;
-            }
             self.session.push(message)?;
-            let (mut finished, mut asked) = (None, None);
-            for (i, call) in calls.iter().enumerate() {
-                self.pending = Some(call["id"].clone());
-                let (mut content, mut meta) = self.call(call).await;
-                asked = meta["ask"].as_str().map(String::from).or(asked);
-                if let Some(report) = meta["finish"].as_str() {
-                    match self.finishing(began, &meta, i + 1 == calls.len()) {
-                        Ok(()) => finished = Some(report.to_string()),
-                        Err(why) => {
-                            content += &format!("\n[finish() ignored: {why}; reply when you are ready]");
-                            meta["finish_ignored"] = why.into();
-                        }
-                    }
-                }
-                self.session
-                    .push(json!({"role": "tool", "tool_call_id": call["id"], "content": content, "meta": meta}))?;
-                self.pending = None;
-            }
-            if let Some(why) = self.broken.take() {
-                anyhow::bail!(why);
-            }
+            let (finished, asked) = self.act(began, &calls).await?;
             // The model waits for an answer, which comes as the next task: no nudges or check gate before it.
             if let Some(question) = asked {
-                ui::prose();
-                let mut markdown = crate::render::Markdown::default();
-                markdown.push(&question);
-                markdown.finish();
-                self.session.push(json!({"role": "assistant", "content": question, "meta": {"via": "ask()"}}))?;
+                self.reply(&question, "ask()")?;
                 self.question = Some(question);
                 let changed = self.changed(&start, began).await;
                 self.current = None;
                 return self.report(Some(changed), false, false, began, clock).await;
             }
             if let Some(report) = finished {
-                ui::prose();
-                let mut markdown = crate::render::Markdown::default();
-                markdown.push(&report);
-                markdown.finish();
-                self.session.push(json!({"role": "assistant", "content": report, "meta": {"via": "finish()"}}))?;
+                self.reply(&report, "finish()")?;
             } else if !calls.is_empty() {
                 ui::activity("waiting for the model");
                 continue;
             }
-            let changed = self.changed(&start, began).await;
-            // A turn that changed files without edit() or write() most likely left output from running code behind. With
-            // another low in this tree its files can land inside our runs' windows too, so it is not asked about then.
-            if changed && !strayed && !self.session.entries[began..].iter().any(|e| edited(&e["meta"])) {
-                strayed = true;
-                let paths: Vec<String> = self.own_diff(began).await?.1.lines().filter_map(changed_path).collect();
-                if !paths.is_empty() && !self.shared() {
-                    stalled = false;
-                    ui::event(
-                        "nudge",
-                        "files changed outside edit()/write(): asking the model about them",
-                        Value::Null,
-                    );
-                    ui::activity("waiting for the model");
-                    let text = format!("{STRAY} {}. {STRAY_END}", paths.join(", "));
-                    self.session.push(json!({"role": "user", "content": text, "meta": {"host": true}}))?;
-                    continue;
-                }
-            }
-            let mut checked = false;
-            if changed && let Some(check) = &self.config.check {
-                let (ok, out) = self.verify(&check.clone(), true).await;
-                if !ok && !nudged {
-                    (nudged, stalled) = (true, false);
-                    ui::event("nudge", "the check failed on the final tree: asking the model to fix it", Value::Null);
-                    ui::activity("waiting for the model");
-                    let gate = format!("{GATE}\n{}", compact::tail(&out, 1500));
-                    self.session.push(json!({"role": "user", "content": gate, "meta": {"host": true}}))?;
-                    continue;
-                }
-                checked = ok;
-            }
+            let Some((changed, checked)) = self.gates(&mut state, &start, began).await? else { continue };
             self.current = None;
-            return self.report(Some(changed), checked, stalled && !changed, began, clock).await;
+            return self.report(Some(changed), checked, state.stalled && !changed, began, clock).await;
         }
         ui::event("limit", &limit, Value::Null);
         (self.current, self.limit) = (None, Some(limit));
         let changed = self.changed(&start, began).await;
         self.report(Some(changed), false, true, began, clock).await
+    }
+
+    /// Asks the model for its next reply. What can be retried is handled here: a context overflow (compact and ask
+    /// again), a provider out of credit (go on with the profile's fallback, once a turn), a lost stream, and an empty
+    /// or cut-off reply (ask again, twice in a row at most). None when the turn asks again; otherwise the reply, counted
+    /// against the turn's budget.
+    async fn request(&mut self, state: &mut TurnState) -> Result<Option<Value>> {
+        let result = self.llm.complete(self.session.messages(), &tools()).await;
+        if let Some(lost) = result.as_ref().err().and_then(llm::lost) {
+            self.discard("the provider cut the stream", &lost.thinking);
+        }
+        let mut message = match result {
+            Err(e) if e.is::<llm::ContextOverflow>() && !state.overflowed => {
+                state.overflowed = true;
+                self.overflow(e.downcast_ref::<llm::ContextOverflow>().and_then(|o| o.window))?;
+                return Ok(None);
+            }
+            Err(e) if e.is::<llm::ContextOverflow>() => {
+                let system = self.session.header()["system"].as_str().map_or(0, str::len);
+                let agents = repo_text(&self.root, "AGENTS.md", 0).map_or(0, |(_, size)| size as usize);
+                anyhow::bail!(
+                    "{e}; still over after compacting: the request is {} KB, of which the system prompt is {} KB \
+                     (including {} KB of AGENTS.md)",
+                    self.sent() * 4 / 1024,
+                    system / 1024,
+                    agents.min(AGENTS_MAX) / 1024
+                );
+            }
+            // Out of credit or quota on this provider: once a turn, go on with the model profile's fallback.
+            Err(e) if e.is::<llm::Exhausted>() && !state.failed_over && self.fallback().is_some() => {
+                state.failed_over = true;
+                let (provider, model) = self.fallback().unwrap_or_default();
+                ui::event("failover", &format!("{e:#}; going on with {provider}:{model}"), Value::Null);
+                self.switch(&provider, &model)?;
+                return Ok(None);
+            }
+            Err(e) if state.retries < 2 && llm::lost(&e).is_some_and(|l| !l.stalled) => {
+                (state.spent, state.retries) = (state.spent + self.sent(), state.retries + 1);
+                self.retry("was lost: the provider cut the stream")?;
+                return Ok(None);
+            }
+            result => result?,
+        };
+        state.overflowed = false;
+        if !message["meta"]["usage"]["prompt_tokens"].is_u64() {
+            let usage = &mut message["meta"]["usage"];
+            usage["prompt_tokens"] = self.sent().into();
+            usage["estimated"] = true.into();
+        }
+        let usage = &message["meta"]["usage"];
+        let attempts = message["meta"]["timing"]["attempts"].as_u64().unwrap_or(1).max(1);
+        // The budget follows what a request costs: cached input is billed at a fraction of fresh input, so a long,
+        // well-cached session isn't stopped for re-sending its own context.
+        let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+        let cached = ui::cached(usage).unwrap_or(0).min(prompt);
+        state.spent += (prompt - cached + cached / 4) * attempts + usage["completion_tokens"].as_u64().unwrap_or(0);
+        ui::usage(usage);
+        self.cache_miss(usage);
+        let calls = message["tool_calls"].as_array().is_some_and(|c| !c.is_empty());
+        let empty = !calls && message["content"].as_str().is_none_or(|c| c.trim().is_empty());
+        let cut = !calls && !empty && message["meta"]["finish"] == "length";
+        if (empty || cut) && state.retries < 2 {
+            state.retries += 1;
+            if empty {
+                // The reply is dropped, so its usage stays on the event.
+                let meta = &message["meta"];
+                let extra =
+                    json!({"meta": {"usage": meta["usage"], "timing": meta["timing"]}, "finish": meta["finish"]});
+                ui::event("empty", "the model sent an empty reply; asking it to act", extra);
+                let thinking = message["reasoning_content"].as_str().unwrap_or_default();
+                self.discard("the reply was empty", thinking);
+                self.retry("was empty")?;
+            } else {
+                ui::event("length", "the reply hit the output limit; asking the model to continue", Value::Null);
+                self.session.push(message)?;
+                self.retry("hit the output limit and was cut off; continue from where it stopped")?;
+            }
+            return Ok(None);
+        }
+        // Retries count in a row: a reply that is kept starts them over, and one that is still unusable after them ends
+        // the turn as stopped.
+        if empty || cut {
+            let (kind, what) = if empty { ("empty", "an empty reply") } else { ("length", "a cut-off reply") };
+            ui::event(kind, &format!("the model sent {what} again; finishing the turn"), Value::Null);
+            state.stalled = true;
+        } else {
+            state.retries = 0;
+        }
+        Ok(Some(message))
+    }
+
+    /// Runs a reply's tool calls in order and logs each result. Returns the report a finish() ends the turn with, if
+    /// low takes it, and the question an ask() ends it with.
+    async fn act(&mut self, began: usize, calls: &[Value]) -> Result<(Option<String>, Option<String>)> {
+        let (mut finished, mut asked) = (None, None);
+        for (i, call) in calls.iter().enumerate() {
+            self.pending = Some(call["id"].clone());
+            let (mut content, mut meta) = self.call(call).await;
+            asked = meta["ask"].as_str().map(String::from).or(asked);
+            if let Some(report) = meta["finish"].as_str() {
+                match self.finishing(began, &meta, i + 1 == calls.len()) {
+                    Ok(()) => finished = Some(report.to_string()),
+                    Err(why) => {
+                        content += &format!("\n[finish() ignored: {why}; reply when you are ready]");
+                        meta["finish_ignored"] = why.into();
+                    }
+                }
+            }
+            self.session.push(json!({"role": "tool", "tool_call_id": call["id"], "content": content, "meta": meta}))?;
+            self.pending = None;
+        }
+        if let Some(why) = self.broken.take() {
+            anyhow::bail!(why);
+        }
+        Ok((finished, asked))
+    }
+
+    /// Shows a reply that a run's finish() or ask() gave, and logs it as the model's message.
+    fn reply(&mut self, text: &str, via: &str) -> Result<()> {
+        ui::prose();
+        let mut markdown = crate::render::Markdown::default();
+        markdown.push(text);
+        markdown.finish();
+        self.session.push(json!({"role": "assistant", "content": text, "meta": {"via": via}}))
+    }
+
+    /// The end of a reply that ran no code. A turn that changed files without edit() or write() is asked once to clean
+    /// up after itself, and one whose check fails on the final tree is asked once to fix it. None when the model was
+    /// asked something; otherwise whether the turn changed files and whether the check passed.
+    async fn gates(&mut self, state: &mut TurnState, start: &str, began: usize) -> Result<Option<(bool, bool)>> {
+        let changed = self.changed(start, began).await;
+        // A turn that changed files without edit() or write() most likely left output from running code behind. With
+        // another low in this tree its files can land inside our runs' windows too, so it is not asked about then.
+        if changed && !state.strayed && !self.session.entries[began..].iter().any(|e| edited(&e["meta"])) {
+            state.strayed = true;
+            let paths: Vec<String> = self.own_diff(began).await?.1.lines().filter_map(changed_path).collect();
+            if !paths.is_empty() && !self.shared() {
+                state.stalled = false;
+                ui::event("nudge", "files changed outside edit()/write(): asking the model about them", Value::Null);
+                self.host(format!("{STRAY} {}. {STRAY_END}", paths.join(", ")))?;
+                return Ok(None);
+            }
+        }
+        let mut checked = false;
+        if changed && let Some(check) = &self.config.check {
+            let (ok, out) = self.verify(&check.clone(), true).await;
+            if !ok && !state.nudged {
+                (state.nudged, state.stalled) = (true, false);
+                ui::event("nudge", "the check failed on the final tree: asking the model to fix it", Value::Null);
+                self.host(format!("{GATE}\n{}", compact::tail(&out, 1500)))?;
+                return Ok(None);
+            }
+            checked = ok;
+        }
+        Ok(Some((changed, checked)))
+    }
+
+    /// Tells the model something from low, and waits for its reply.
+    fn host(&mut self, text: String) -> Result<()> {
+        ui::activity("waiting for the model");
+        self.session.push(json!({"role": "user", "content": text, "meta": {"host": true}}))
     }
 
     /// Whether finish() may end the turn in place of a reply: only where the check, if one is configured, covers the
@@ -548,7 +577,7 @@ impl Agent {
     /// The files that changed between the end of the last turn and the start of this one, outside the conversation: the
     /// user's editor, a pull, a branch switch. None when nothing did or the last turn's tree is unknown.
     async fn moved_since(&self, start: &str) -> Option<String> {
-        let last = self.session.entries.iter().rev().find_map(|e| e["report"]["tree"].as_str())?;
+        let last = self.session.entries.iter().rev().find_map(|e| Report::of(e)?.tree)?;
         let (last, now) = (last.split(' ').next()?.to_string(), start.split(' ').next()?.to_string());
         if last == now || now.is_empty() {
             return None;
@@ -869,44 +898,28 @@ impl Agent {
         self.session.flush()?;
         // The next turn compares its starting tree with this one to tell the model what moved in between.
         let tree = if self.repo { self.tree().await.ok() } else { None };
-        let (all, changes) = if self.repo {
+        let (all, listed) = if self.repo {
             self.own_diff(began).await?
         } else {
             let own = own_changes(&self.session.entries[began..]);
             (own.clone(), own)
         };
-        let count = |list: &str| list.lines().filter(|l| *l != "none").count();
+        let lines = |list: &str| list.lines().filter(|l| *l != "none").map(String::from).collect::<Vec<_>>();
+        let changes = lines(&listed);
         // Files another writer changed during the turn: neither this turn's to report nor its to undo.
-        let elsewhere = count(&all) - count(&changes);
+        let elsewhere = lines(&all).len() - changes.len();
         let first = &self.session.entries[began];
-        let snapshot = first["meta"]["snapshot"].as_str().and_then(|s| s.split(' ').next());
-        let changed = changed.unwrap_or(changes != "none");
-        let path = changed_path;
+        let snapshot = first["meta"]["snapshot"].as_str().and_then(|s| s.split(' ').next()).map(String::from);
+        let changed = changed.unwrap_or(!changes.is_empty());
         let turn = &self.session.entries[began..];
         let actions = turn.iter().flat_map(|e| e["meta"]["actions"].as_array().into_iter().flatten());
         let own: Vec<&str> = actions.filter(|a| a["ok"] == true).filter_map(|a| a["path"].as_str()).collect();
-        let (mine, outside): (Vec<&str>, Vec<&str>) =
-            changes.lines().filter(|l| *l != "none").partition(|l| path(l).is_some_and(|p| own.contains(&p.as_str())));
-        let outside: Vec<String> = outside.into_iter().filter_map(path).collect();
-        let named = |path: &str| {
-            let words = self
-                .config
-                .check
-                .as_deref()
-                .unwrap_or_default()
-                .split(|c: char| c.is_whitespace() || "'\"();&|<>=`".contains(c));
-            path == "low.toml" || words.map(|w| w.trim_start_matches("./")).any(|w| w == path)
-        };
-        let inputs: Vec<String> = changes.lines().filter_map(path).filter(|p| named(p)).collect();
+        let paths = changes.iter().filter_map(|l| changed_path(l));
+        let (mine, outside): (Vec<String>, Vec<String>) = paths.partition(|p| own.contains(&p.as_str()));
+        let inputs: Vec<String> = changes.iter().filter_map(|l| changed_path(l)).filter(|p| self.checks(p)).collect();
         let question = self.question.take();
-        let (check, verdict) = match (changed, checked, &self.config.check) {
-            _ if question.is_some() => ("not run: the model asked a question", "QUESTION"),
-            (false, _, _) => ("-", "NO CHANGES"),
-            (true, true, _) if !inputs.is_empty() => ("passed, but this turn changed what it runs", "UNVERIFIED"),
-            (true, true, _) => ("passed on the final tree", "VERIFIED"),
-            (true, false, None) => ("none configured: set check in low.toml", "NO CHECK"),
-            (true, false, Some(_)) => ("not passed on the final tree", "UNVERIFIED"),
-        };
+        let configured = self.config.check.is_some();
+        let (check, verdict) = verdict(changed, checked, configured, !inputs.is_empty(), question.is_some());
         let checked = checked && inputs.is_empty();
         let state = self.session.state();
         let task = first["content"].as_str().unwrap_or_default();
@@ -921,7 +934,7 @@ impl Agent {
         if !inputs.is_empty() {
             rows.push(("inputs", format!("check inputs changed: {}", inputs.join(", "))));
         }
-        rows.push(("changes", changes.clone()));
+        rows.push(("changes", listed));
         if elsewhere > 0 {
             rows.push(("elsewhere", format!("{elsewhere} more changed by another writer in this tree, left out")));
         }
@@ -933,28 +946,7 @@ impl Agent {
             rows.push(("undo", "none: not a git repository, so these changes can't be undone".into()));
         }
         if let Some(tree) = snapshot.filter(|_| changed && self.repo) {
-            let short = tree.get(..12).unwrap_or(tree);
-            let mine: Vec<String> = mine.into_iter().filter_map(path).collect();
-            let known = if mine.is_empty() {
-                String::new()
-            } else {
-                let mut args =
-                    ["--literal-pathspecs", "ls-tree", "-z", "--name-only", tree, "--"].map(String::from).to_vec();
-                args.extend(mine);
-                let root = self.root.clone();
-                tokio::task::spawn_blocking(move || git(&root, None, &args)).await?.unwrap_or_default()
-            };
-            let modified: Vec<&str> = known.split('\0').filter(|p| !p.is_empty()).collect();
-            // Restoring the whole tree would also undo what other writers did meanwhile.
-            let undo = match (outside.is_empty() && elsewhere == 0, modified.is_empty()) {
-                (true, _) => format!("git restore --source={short} --worktree -- .  (new files stay)"),
-                (false, false) => format!(
-                    "git restore --source={short} --worktree -- {}  (low's edit()/write() paths; new files stay)",
-                    modified.iter().map(|p| quoted(p)).collect::<Vec<_>>().join(" ")
-                ),
-                (false, true) => format!("git restore --source={short} --worktree -- <path>  (new files stay)"),
-            };
-            rows.push(("undo", undo));
+            rows.push(("undo", self.undo(&tree, mine, outside.is_empty() && elsewhere == 0).await?));
         }
         let totals = crate::stats::totals(turn);
         let n = |v: &Value| v.as_u64().unwrap_or(0);
@@ -968,25 +960,86 @@ impl Agent {
             ui::minutes(ms / 1000)
         );
         rows.push(("cost", cost));
-        let good = (!changed || checked || self.config.check.is_none()) && !stopped;
+        let good = (!changed || checked || !configured) && !stopped;
         ui::report(&rows, verdict, good);
         let answer = turn.iter().rev().find(|e| e["role"] == "assistant").and_then(|e| e["content"].as_str());
-        let changes: Vec<&str> = changes.lines().filter(|l| *l != "none").collect();
         let (status, exit) = outcome(good, stopped, question.is_some());
-        let undo = rows.iter().find(|(label, _)| *label == "undo").map(|(_, undo)| undo);
-        self.last = json!({
-            "session": self.session.path, "id": self.session.header()["id"], "status": status, "exit": exit,
-            "verdict": verdict, "good": good, "answer": answer, "question": question, "criteria": state.accepted,
-            "plan": state.plan,
-            "check": check, "changes": changes, "elsewhere": elsewhere, "limit": self.limit.take(), "undo": undo, "requests": requests,
-            "tokens": {"prompt": prompt, "cached": cached, "out": out}, "cost": totals["cost"], "ms": ms, "rows": rows,
-        });
-        self.session.push(json!({"report": {
-            "verdict": verdict, "tree": tree, "changed": changed, "checked": checked, "stopped": stopped, "check_inputs": inputs, "outside": outside, "elsewhere": elsewhere, "criteria": state.accepted,
-            "plan_steps": steps, "plan_done": done, "changes": changes, "requests": requests, "runs": runs,
-            "prompt": prompt, "cached": cached, "out": out, "ms": ms,
-        }}))?;
+        let undo = rows.iter().find(|(label, _)| *label == "undo").map(|(_, undo)| undo.clone());
+        let report = TurnReport {
+            session: self.session.path.clone(),
+            id: self.session.header()["id"].as_str().unwrap_or_default().into(),
+            verdict: verdict.into(),
+            good,
+            answer: answer.map(String::from),
+            question,
+            criteria: state.accepted.clone(),
+            plan: state.plan,
+            check: check.into(),
+            changes: changes.clone(),
+            elsewhere,
+            limit: self.limit.take(),
+            undo,
+            requests,
+            tokens: Tokens { prompt, cached, out },
+            cost: totals["cost"].as_f64(),
+            ms,
+            rows: rows.into_iter().map(|(label, value)| (label.into(), value)).collect(),
+        };
+        self.last = Some(Outcome { turn: Some(report), status: status.into(), exit, error: None });
+        let record = Report {
+            verdict: verdict.into(),
+            tree,
+            changed,
+            checked,
+            stopped,
+            check_inputs: inputs,
+            outside,
+            elsewhere,
+            criteria: state.accepted,
+            plan_steps: steps,
+            plan_done: done,
+            changes,
+            requests,
+            runs,
+            prompt,
+            cached,
+            out,
+            ms,
+        };
+        self.session.push(json!({"report": record}))?;
         Ok(good)
+    }
+
+    /// Whether the check runs this file (its command names it) or it is low.toml: a turn that changed it changed what
+    /// verifies it.
+    fn checks(&self, path: &str) -> bool {
+        let check = self.config.check.as_deref().unwrap_or_default();
+        let mut words = check.split(|c: char| c.is_whitespace() || "'\"();&|<>=`".contains(c));
+        path == "low.toml" || words.any(|w| w.trim_start_matches("./") == path)
+    }
+
+    /// The undo row: restore from the turn's snapshot the whole tree when nothing else changed it meanwhile (`alone`),
+    /// else only low's edit()/write() paths, since restoring the rest would also undo what other writers did.
+    async fn undo(&self, tree: &str, mine: Vec<String>, alone: bool) -> Result<String> {
+        let short = tree.get(..12).unwrap_or(tree);
+        let known = if mine.is_empty() {
+            String::new()
+        } else {
+            let mut args =
+                ["--literal-pathspecs", "ls-tree", "-z", "--name-only", tree, "--"].map(String::from).to_vec();
+            args.extend(mine);
+            let root = self.root.clone();
+            tokio::task::spawn_blocking(move || git(&root, None, &args)).await?.unwrap_or_default()
+        };
+        let modified: Vec<&str> = known.split('\0').filter(|p| !p.is_empty()).collect();
+        Ok(match (alone, modified.is_empty()) {
+            (true, _) => format!("git restore --source={short} --worktree -- .  (new files stay)"),
+            (false, false) => format!(
+                "git restore --source={short} --worktree -- {}  (low's edit()/write() paths; new files stay)",
+                modified.iter().map(|p| quoted(p)).collect::<Vec<_>>().join(" ")
+            ),
+            (false, true) => format!("git restore --source={short} --worktree -- <path>  (new files stay)"),
+        })
     }
 
     /// What changed since the turn's snapshot, a line per file as the turn report lists them ("none" when nothing did).
@@ -1148,10 +1201,127 @@ fn outcome(good: bool, stopped: bool, question: bool) -> (&'static str, i64) {
 }
 
 /// The result of a task that ended in an error: the turn's report if one was written, marked as the error.
-pub fn failed(last: &Value, e: &anyhow::Error) -> Value {
-    let mut result = if last.is_object() { last.clone() } else { json!({}) };
-    (result["status"], result["exit"], result["error"]) = ("error".into(), ERROR.into(), error_text(e).into());
-    result
+pub fn failed(last: Option<&Outcome>, e: &anyhow::Error) -> Outcome {
+    let turn = last.and_then(|outcome| outcome.turn.clone());
+    Outcome { turn, status: "error".into(), exit: ERROR, error: Some(error_text(e)) }
+}
+
+/// A task's result as `low --json`, `low --send` and `--tasks` give it: how it ended, and its turn's report when one was
+/// written (an error can come before any, and then the result is only status, exit and error).
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Outcome {
+    #[serde(flatten)]
+    pub turn: Option<TurnReport>,
+    pub status: String,
+    pub exit: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl std::fmt::Display for Outcome {
+    /// The result as one line of JSON.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&serde_json::to_string(self).map_err(|_| std::fmt::Error)?)
+    }
+}
+
+/// What a turn's report gives a result: the verdict, the final answer or question, and the rows low printed.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TurnReport {
+    pub session: PathBuf,
+    pub id: String,
+    pub verdict: String,
+    pub good: bool,
+    pub answer: Option<String>,
+    pub question: Option<String>,
+    pub criteria: Option<String>,
+    pub plan: Value,
+    pub check: String,
+    pub changes: Vec<String>,
+    pub elsewhere: usize,
+    pub limit: Option<String>,
+    pub undo: Option<String>,
+    pub requests: u64,
+    pub tokens: Tokens,
+    pub cost: Option<f64>,
+    pub ms: u64,
+    pub rows: Vec<(String, String)>,
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Tokens {
+    pub prompt: u64,
+    pub cached: u64,
+    pub out: u64,
+}
+
+/// A turn's `{"report": …}` line in the session log, which the next turn, compaction and the run's totals read back.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Report {
+    pub verdict: String,
+    /// The tree at the end of the turn, which the next turn compares with its own start.
+    pub tree: Option<String>,
+    pub changed: bool,
+    pub checked: bool,
+    pub stopped: bool,
+    pub check_inputs: Vec<String>,
+    pub outside: Vec<String>,
+    pub elsewhere: usize,
+    pub criteria: Option<String>,
+    pub plan_steps: Option<usize>,
+    pub plan_done: usize,
+    pub changes: Vec<String>,
+    pub requests: u64,
+    pub runs: u64,
+    pub prompt: u64,
+    pub cached: u64,
+    pub out: u64,
+    pub ms: u64,
+}
+
+impl Report {
+    /// The report a session log entry holds, if it is a report line.
+    pub fn of(entry: &Value) -> Option<Self> {
+        Self::deserialize(entry.get("report")?).ok()
+    }
+}
+
+/// A turn report's check row and verdict.
+fn verdict(
+    changed: bool,
+    checked: bool,
+    configured: bool,
+    inputs: bool,
+    question: bool,
+) -> (&'static str, &'static str) {
+    match (changed, checked, configured) {
+        _ if question => ("not run: the model asked a question", "QUESTION"),
+        (false, _, _) => ("-", "NO CHANGES"),
+        (true, true, _) if inputs => ("passed, but this turn changed what it runs", "UNVERIFIED"),
+        (true, true, _) => ("passed on the final tree", "VERIFIED"),
+        (true, false, false) => ("none configured: set check in low.toml", "NO CHECK"),
+        (true, false, true) => ("not passed on the final tree", "UNVERIFIED"),
+    }
+}
+
+/// What a turn has used so far: its nudges and retries, and the tokens it spent against its budget.
+#[derive(Default)]
+struct TurnState {
+    /// The check gate asked the model to fix a failing check.
+    nudged: bool,
+    /// The last request overflowed the context window, and the context was compacted for it.
+    overflowed: bool,
+    /// Unusable replies in a row: lost, empty or cut off.
+    retries: usize,
+    /// A reply was still unusable after its retries.
+    stalled: bool,
+    /// The model was asked about files it changed without edit() or write().
+    strayed: bool,
+    /// The turn went on with the profile's fallback provider.
+    failed_over: bool,
+    /// Tokens spent, cached input counting a quarter.
+    spent: u64,
 }
 
 /// An error as low shows and logs it: the whole chain, without control characters or secrets.
@@ -1186,8 +1356,6 @@ fn context(root: &Path, config: &Config, yolo: bool) -> serde_json::Map<String, 
     context.as_object().cloned().unwrap_or_default()
 }
 
-/// What edit() and write() changed in a turn, listed as changes() lists it: outside a git repository that is all low
-/// can see.
 /// The lines of `changes` (as `changes()` writes them) that this turn made: paths it wrote with edit() or write(), and
 /// files that last changed while one of its runs or checks was executing (for a deleted file, its folder). The rest
 /// came from another writer in the same tree, such as the user's editor or another low.
@@ -1221,6 +1389,8 @@ fn attributed(root: &Path, turn: &[Value], changes: &str) -> String {
     if lines.is_empty() { "none".into() } else { lines.join("\n") }
 }
 
+/// What edit() and write() changed in a turn, listed as changes() lists it: outside a git repository that is all low
+/// can see.
 fn own_changes(turn: &[Value]) -> String {
     let mut files: BTreeMap<&str, (u64, u64, bool)> = BTreeMap::new();
     for action in turn.iter().flat_map(|e| e["meta"]["actions"].as_array().into_iter().flatten()) {

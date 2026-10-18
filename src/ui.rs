@@ -574,13 +574,13 @@ impl Drop for Quiet {
     }
 }
 
-pub fn report(rows: &[(&str, String)], verdict: &str, good: bool) {
+pub fn report(rows: &[(impl AsRef<str>, String)], verdict: &str, good: bool) {
     settle();
     let head = format!("── {verdict} ") + &"─".repeat(36);
     println!("\n{}", paint(if good { "1;32" } else { "1;31" }, &head));
     let room = width().saturating_sub(12).max(30);
     for (label, value) in rows.iter().filter(|(_, value)| !matches!(value.as_str(), "-" | "none")) {
-        println!("{} {}", paint("2", &format!("{label:<9}")), wrap(value, room).join("\n          "));
+        println!("{} {}", paint("2", &format!("{:<9}", label.as_ref())), wrap(value, room).join("\n          "));
     }
 }
 

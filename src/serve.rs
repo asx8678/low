@@ -4,6 +4,7 @@
 //! live server from one that died. While it waits, the server keeps the provider's prompt cache warm (Agent::warm).
 use crate::agent::{self, Agent};
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs::{self, DirBuilder, File};
 use std::io::BufRead;
@@ -83,18 +84,16 @@ fn next(dir: &Path) -> Result<Option<(String, String)>> {
 
 /// Runs one task a client sent; the reply carries the turn's verdict, report rows and answer, or why there is none.
 async fn answer(agent: &mut Agent, task: &str) -> Value {
+    let refused = |why: String| json!(agent::failed(None, &anyhow::anyhow!(why)));
     match task.trim() {
         "/stop" => json!({"stopped": true, "status": "stopped server", "exit": 0}),
-        "" => agent::failed(&Value::Null, &anyhow::anyhow!("the task is empty")),
+        "" => refused("the task is empty".into()),
         task if crate::COMMANDS.contains(&task.split_whitespace().next().unwrap_or_default()) => {
-            agent::failed(&Value::Null, &anyhow::anyhow!("{task} is a REPL command; low --send takes tasks and /stop"))
+            refused(format!("{task} is a REPL command; low --send takes tasks and /stop"))
         }
         task => match crate::unknown(task) {
-            Some(why) => agent::failed(&Value::Null, &anyhow::anyhow!(why)),
-            None => match agent.run(task).await {
-                Ok(_) => agent.last().clone(),
-                Err(e) => agent::failed(agent.last(), &e),
-            },
+            Some(why) => refused(why),
+            None => json!(agent.task(task).await),
         },
     }
 }
@@ -166,21 +165,21 @@ pub async fn send(home: &Path, root: &Path, id: Option<&str>, task: &str, json: 
         println!("{reply}");
         return Ok(reply);
     }
-    if let Some(error) = reply["error"].as_str() {
-        eprintln!("error: {error}");
-        return Ok(reply);
-    }
     if reply["stopped"] == true {
         eprintln!("[the server stopped]");
         return Ok(reply);
     }
-    if let Some(answer) = reply["answer"].as_str().filter(|a| !a.trim().is_empty()) {
+    let outcome = agent::Outcome::deserialize(&reply).context("the server wrote a result low cannot read")?;
+    if let Some(error) = &outcome.error {
+        eprintln!("error: {error}");
+        return Ok(reply);
+    }
+    let Some(turn) = &outcome.turn else { return Ok(reply) };
+    if let Some(answer) = turn.answer.as_deref().filter(|a| !a.trim().is_empty()) {
         let mut markdown = crate::render::Markdown::default();
         markdown.push(answer);
         markdown.finish();
     }
-    let rows: Vec<(String, String)> = serde_json::from_value(reply["rows"].clone()).unwrap_or_default();
-    let rows: Vec<(&str, String)> = rows.iter().map(|(label, value)| (label.as_str(), value.clone())).collect();
-    crate::ui::report(&rows, reply["verdict"].as_str().unwrap_or("?"), reply["good"] == true);
+    crate::ui::report(&turn.rows, &turn.verdict, turn.good);
     Ok(reply)
 }

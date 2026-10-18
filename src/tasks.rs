@@ -5,7 +5,7 @@
 //! its line, or by its text if those edits moved it, so identical tasks each get their own mark. Its first line names
 //! the session, so the next run continues it. Text above the first task goes to the model with the first task of a run,
 //! and a task that a turn limit cut off while it was still changing files gets up to two more turns.
-use crate::agent::{self, Agent};
+use crate::agent::{Agent, Outcome};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -90,22 +90,17 @@ fn update(file: &Path, line: usize, text: &str, mark: char, result: &str, id: &s
 }
 
 /// One line for a task's result.
-fn summary(result: &Value) -> String {
-    if let Some(error) = result["error"].as_str() {
+fn summary(result: &Outcome) -> String {
+    if let Some(error) = &result.error {
         return format!("error: {}", error.lines().next().unwrap_or_default());
     }
-    if let Some(question) = result["question"].as_str() {
+    let Some(turn) = &result.turn else { return "?".into() };
+    if let Some(question) = &turn.question {
         return format!("question: {}", question.replace('\n', " "));
     }
-    let secs = result["ms"].as_u64().unwrap_or(0) / 1000;
-    let mut line = format!(
-        "{} · {} requests · {}:{:02}",
-        result["verdict"].as_str().unwrap_or("?"),
-        result["requests"],
-        secs / 60,
-        secs % 60
-    );
-    let changes: Vec<&str> = result["changes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let secs = turn.ms / 1000;
+    let mut line = format!("{} · {} requests · {}:{:02}", turn.verdict, turn.requests, secs / 60, secs % 60);
+    let changes = &turn.changes;
     if !changes.is_empty() {
         line += &format!(" · {}", changes[..changes.len().min(SHOWN)].join(", "));
     }
@@ -131,7 +126,7 @@ pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
     let read =
         |file: &Path| std::fs::read_to_string(file).with_context(|| format!("could not read {}", file.display()));
     let mut context = Some(preamble(&read(file)?)).filter(|p| !p.is_empty());
-    let (mut last, mut again) = (String::new(), 0);
+    let (mut last, mut again, mut exit) = (String::new(), 0, 0);
     loop {
         let text = read(file)?;
         let Some(next) = tasks(&text).into_iter().find(|t| !matches!(t.mark, 'x' | 'X')) else { break };
@@ -143,6 +138,7 @@ pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
                 let why = format!("task on line {} waits for an answer: add `  - answer: …` under it", next.line + 1);
                 done.push(json!({"task": next.text, "status": "question", "exit": 4, "waiting": why}));
                 eprintln!("{why}");
+                exit = 4;
                 break;
             }
             ('?', false) => next.answers.join("\n"),
@@ -151,28 +147,26 @@ pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
                 None => next.text.clone(),
             },
         };
-        let result = match agent.run(&prompt).await {
-            Ok(_) => agent.last().clone(),
-            Err(e) => agent::failed(agent.last(), &e),
-        };
-        let mark = match result["status"].as_str() {
-            Some("done") => 'x',
-            Some("question") => '?',
+        let result = agent.task(&prompt).await;
+        let mark = match result.status.as_str() {
+            "done" => 'x',
+            "question" => '?',
             _ => '!',
         };
         update(file, next.line, &next.text, mark, &summary(&result), &id)?;
         // A task cut off by a turn limit that was still changing files continues in a fresh turn of the same session.
-        let progressed = result["changes"].as_array().is_some_and(|c| !c.is_empty());
-        let limited = result["status"] == "stopped" && result["limit"].is_string();
+        let turn = result.turn.as_ref();
+        let progressed = turn.is_some_and(|t| !t.changes.is_empty());
+        let limited = result.status == "stopped" && turn.is_some_and(|t| t.limit.is_some());
         let more = mark != 'x' && limited && progressed && again < AGAIN;
         let stop = mark != 'x' && !more;
         again += usize::from(more);
+        exit = result.exit;
         done.push(json!({"task": next.text, "result": result}));
         if stop {
             break;
         }
     }
-    let exit = done.last().map_or(0, |t| t["result"]["exit"].as_i64().or(t["exit"].as_i64()).unwrap_or(0));
     let left = tasks(&std::fs::read_to_string(file)?).iter().filter(|t| !matches!(t.mark, 'x' | 'X')).count();
     eprintln!("[tasks: {} run, {left} left in {}]", done.len(), file.display());
     Ok(json!({"session": agent.path(), "id": id, "tasks": done, "left": left, "exit": exit}))

@@ -7,8 +7,8 @@ mod redact;
 mod render;
 mod serve;
 mod session;
-mod tasks;
 mod stats;
+mod tasks;
 mod ui;
 mod worker;
 
@@ -70,8 +70,14 @@ impl Cli {
             && self.protect.is_empty();
         let refused = [
             (self.send && self.task.is_none(), "--send needs a task: low --send \"<task>\""),
-            (self.send && !send, "--send takes only a task (and --session or --json); the server's session decides the rest"),
-            (self.json && self.task.is_none() && self.tasks.is_none(), "--json needs a task or --tasks; the REPL has no JSON"),
+            (
+                self.send && !send,
+                "--send takes only a task (and --session or --json); the server's session decides the rest",
+            ),
+            (
+                self.json && self.task.is_none() && self.tasks.is_none(),
+                "--json needs a task or --tasks; the REPL has no JSON",
+            ),
             (self.json && self.serve, "--serve prints a log; use --json with --send instead"),
             (self.tasks.is_some() && (self.task.is_some() || self.serve), "--tasks takes its tasks from the file only"),
         ];
@@ -157,7 +163,7 @@ async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     if let Err(e) = start().await {
         if std::env::args().any(|a| a == "--json") {
-            println!("{}", agent::failed(&serde_json::Value::Null, &e));
+            println!("{}", agent::failed(None, &e));
         } else {
             eprintln!("error: {}", agent::error_text(&e));
         }
@@ -191,10 +197,14 @@ async fn start() -> Result<()> {
         ui::record("note", text, serde_json::Value::Null);
     };
     if !repo_dir {
-        warn("not a git repository: low runs without undo here, so whatever it changes stays changed (git init adds undo)");
+        warn(
+            "not a git repository: low runs without undo here, so whatever it changes stays changed (git init adds undo)",
+        );
     }
     if !cli.yolo && worker::read_only(&root) {
-        warn("this is your home directory or above it: low can read files here but not change them; cd into a folder to let it edit");
+        warn(
+            "this is your home directory or above it: low can read files here but not change them; cd into a folder to let it edit",
+        );
     }
     if repo.model.is_some() || repo.base_url.is_some() || !repo.models.is_empty() {
         warn(
@@ -248,17 +258,14 @@ async fn start() -> Result<()> {
         std::process::exit(exit_code(&result));
     }
     if let Some(task) = cli.task {
-        let result = match agent.run(&task).await {
-            Ok(_) => agent.last().clone(),
-            Err(e) => agent::failed(agent.last(), &e),
-        };
+        let result = agent.task(&task).await;
         drop((quiet, agent));
-        match result["error"].as_str() {
+        match &result.error {
             _ if cli.json => println!("{result}"),
             Some(error) => eprintln!("error: {error}"),
             None => {}
         }
-        std::process::exit(exit_code(&result));
+        std::process::exit(result.exit as i32);
     }
     let mut editor = rustyline::DefaultEditor::new()?;
     loop {
@@ -350,7 +357,7 @@ async fn pick(agent: &mut agent::Agent, editor: &mut rustyline::DefaultEditor, f
     agent.switch(&provider, &model)
 }
 
-/// A task result's exit status (agent::outcome), an error's when it has none.
+/// The exit status a --tasks or --send result gives (agent::outcome), an error's when it has none.
 fn exit_code(result: &serde_json::Value) -> i32 {
     result["exit"].as_i64().unwrap_or(agent::ERROR) as i32
 }
@@ -374,7 +381,9 @@ fn unknown(line: &str) -> Option<String> {
 /// Stops on a setting low no longer reads, or on a compact_at it cannot use.
 fn check_config(user: &Config) -> Result<()> {
     if !user.protect.is_empty() {
-        bail!("~/.config/low/config.toml sets protect; it names paths of one repository, so it goes in that repository's low.toml");
+        bail!(
+            "~/.config/low/config.toml sets protect; it names paths of one repository, so it goes in that repository's low.toml"
+        );
     }
     if user.base_url.is_some() {
         let model = user.model.as_deref().unwrap_or("model-id");
