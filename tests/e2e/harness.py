@@ -62,11 +62,11 @@ class Env:
         env = {k: v for k, v in os.environ.items() if k in ('PATH', 'TERM', 'TMPDIR', 'USER', 'LANG')}
         return {**env, 'HOME': self.home, **(extra or {})}
 
-    def low(self, *args, timeout=300, env=None):
-        """Run low in the repo. Returns its exit code, output, the last stdout line parsed as JSON (--json's result)
-        and the requests the mock saw during this run."""
+    def low(self, *args, timeout=300, env=None, cwd=None):
+        """Run low in the repo, or in `cwd`. Returns its exit code, output, the last stdout line parsed as JSON
+        (--json's result) and the requests the mock saw during this run."""
         before = len(self.entries())
-        p = subprocess.run([LOW, *args], cwd=self.repo, env=self.env(env), capture_output=True, text=True,
+        p = subprocess.run([LOW, *args], cwd=cwd or self.repo, env=self.env(env), capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, timeout=timeout)
         try:
             result = json.loads(p.stdout.strip().splitlines()[-1])

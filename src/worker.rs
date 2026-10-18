@@ -303,17 +303,17 @@ pub fn sandboxed(root: &Path, yolo: bool, program: &str, args: &[&str]) -> Comma
     cmd
 }
 
-/// The secret paths in the home directory, which the sandbox hides from the worker and the check. The sandbox matches
+/// The secret paths in the home directories, which the sandbox hides from the worker and the check. The sandbox matches
 /// resolved paths, so each one also brings its real path and the targets of links inside it (a dotfiles repo's ~/.ssh
 /// or ~/.aws/credentials). They are found once per process, since that walks each folder three levels deep.
 fn secrets() -> &'static [PathBuf] {
     static FOUND: OnceLock<Vec<PathBuf>> = OnceLock::new();
     FOUND.get_or_init(|| {
-        let home = home();
+        let homes = homes();
         let mut paths = vec![];
-        for path in SECRETS.split(',').map(|s| home.join(s.trim())) {
-            resolved(&path, &home, &mut paths);
-            linked(&path, &home, 3, &mut paths);
+        for path in homes.iter().flat_map(|home| SECRETS.split(',').map(|s| home.join(s.trim()))) {
+            resolved(&path, &homes, &mut paths);
+            linked(&path, &homes, 3, &mut paths);
             paths.push(path);
         }
         paths
@@ -326,27 +326,65 @@ pub fn home() -> PathBuf {
     home.canonicalize().unwrap_or(home)
 }
 
-/// Adds where `path` really is, if that differs and is a file or directory other than the home directory or one above
+/// The home directories the sandbox guards: $HOME's and the account's, which differ when HOME names another folder,
+/// such as the scratch HOME a test or another tool runs low with.
+fn homes() -> Vec<PathBuf> {
+    let mut homes: Vec<PathBuf> =
+        [home()].into_iter().chain(account_home()).filter(|h| !h.as_os_str().is_empty()).collect();
+    homes.dedup();
+    homes
+}
+
+/// The account's home directory from the user database, resolved.
+fn account_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let uid = rustix::process::getuid().as_raw();
+    let mut buf = vec![0; 4096];
+    loop {
+        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut found = std::ptr::null_mut();
+        // SAFETY: getpwuid_r writes the entry into `entry` and its strings into `buf`, both alive and sized as passed,
+        // and points `found` at `entry` only when it found the account.
+        let status = unsafe { libc::getpwuid_r(uid, entry.as_mut_ptr(), buf.as_mut_ptr(), buf.len(), &mut found) };
+        if status == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if status != 0 || found.is_null() {
+            return None;
+        }
+        // SAFETY: `found` points at the entry getpwuid_r filled, whose pw_dir is null or a C string inside `buf`.
+        let dir = unsafe { (*found).pw_dir };
+        if dir.is_null() {
+            return None;
+        }
+        // SAFETY: as above, a NUL-terminated string in `buf`, which outlives this borrow.
+        let dir = PathBuf::from(std::ffi::OsStr::from_bytes(unsafe { std::ffi::CStr::from_ptr(dir) }.to_bytes()));
+        return Some(dir.canonicalize().unwrap_or(dir));
+    }
+}
+
+/// Adds where `path` really is, if that differs and is a file or directory other than a home directory or one above
 /// it: a history file linked to /dev/null must not take /dev/null from the worker.
-fn resolved(path: &Path, home: &Path, out: &mut Vec<PathBuf>) {
+fn resolved(path: &Path, homes: &[PathBuf], out: &mut Vec<PathBuf>) {
     if let Ok(real) = path.canonicalize()
         && real != path
         && real.metadata().is_ok_and(|m| m.is_file() || m.is_dir())
-        && !home.starts_with(&real)
+        && !homes.iter().any(|home| home.starts_with(&real))
     {
         out.push(real);
     }
 }
 
 /// Adds the targets of the links in `dir`, down to `depth` levels of real directories.
-fn linked(dir: &Path, home: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+fn linked(dir: &Path, homes: &[PathBuf], depth: usize, out: &mut Vec<PathBuf>) {
     if depth == 0 || !dir.is_dir() {
         return;
     }
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         match entry.file_type() {
-            Ok(kind) if kind.is_symlink() => resolved(&entry.path(), home, out),
-            Ok(kind) if kind.is_dir() => linked(&entry.path(), home, depth - 1, out),
+            Ok(kind) if kind.is_symlink() => resolved(&entry.path(), homes, out),
+            Ok(kind) if kind.is_dir() => linked(&entry.path(), homes, depth - 1, out),
             _ => {}
         }
     }
@@ -394,11 +432,10 @@ fn nested(root: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Whether the sandbox keeps `root` read-only: the home directory or a folder above it, where writes could reach shell
+/// Whether the sandbox keeps `root` read-only: a home directory or a folder above it, where writes could reach shell
 /// startup files and launch agents that later run outside the sandbox.
 pub fn read_only(root: &Path) -> bool {
-    let home = home();
-    !home.as_os_str().is_empty() && home.starts_with(root)
+    homes().iter().any(|home| home.starts_with(root))
 }
 
 fn writable(root: &Path) -> Vec<PathBuf> {
@@ -439,6 +476,16 @@ mod tests {
             reply = worker.resume(true, "[check passed: true]").await.unwrap();
         }
         reply
+    }
+
+    /// The account's home stays guarded whatever HOME names: read-only along with the folders above it, and its
+    /// secret paths hidden. Paths only; nothing in the home directory is read.
+    #[test]
+    fn account_home_guarded() {
+        let Some(home) = super::account_home() else { return };
+        assert!(super::read_only(&home) && super::read_only(std::path::Path::new("/")));
+        assert!(!super::read_only(&home.join("projects")));
+        assert!(super::secret(&home.join(".ssh/config")) && !super::secret(&home.join("projects")));
     }
 
     /// Drives the worker.py this build embeds through its helpers: low's own check runs no other code of it, and the
