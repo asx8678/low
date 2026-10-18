@@ -13,6 +13,7 @@ include = ["/src/**/*", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md",
 
 [dependencies]
 anyhow = "1.0.104"
+httpdate = "1.0.3"
 lexopt = "0.3.2"
 libc = "0.2.190"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }

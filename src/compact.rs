@@ -4,8 +4,6 @@ use std::collections::BTreeMap;
 
 const MAX_BYTES: usize = 32 * 1024;
 const EXCHANGE: usize = 3968;
-/// Reasoning a reply replays: its head (the plan) and tail (the decision).
-const REPLAY: usize = 16 * 1024;
 
 pub fn newest_task(entries: &[Value]) -> Option<usize> {
     (1..entries.len()).rev().find(|&i| entries[i]["role"] == "user" && entries[i]["meta"]["host"].is_null())
@@ -15,20 +13,15 @@ pub fn baked(u: usize) -> String {
     format!("[Latest task when this summary was written, entry #{u}]")
 }
 
-/// An entry as the model sees it: no meta, and reasoning cut to its head and tail. It follows from the entry alone, so
-/// every request and every resume sends the same bytes for it and the prompt prefix stays cached. Earlier tasks keep
-/// their reasoning too, until a compaction summarizes them: dropping it at a new task broke the cache from the first
-/// earlier reply on (DeepSeek on OpenCode Go reused 34% of the prompt instead of 99%).
+/// An entry as the model sees it: no meta, and the reasoning whole, as DeepSeek asks for a request with tools. It
+/// follows from the entry alone, so every request and every resume sends the same bytes for it, and they are the bytes
+/// the provider streamed, so the prompt prefix stays cached through the reply. Earlier tasks keep their reasoning too,
+/// until a compaction summarizes them: dropping it at a new task broke the cache from the first earlier reply on
+/// (DeepSeek on OpenCode Go reused 34% of the prompt instead of 99%).
 pub fn wire(entry: &Value) -> Value {
     let mut message = entry.clone();
     if let Some(fields) = message.as_object_mut() {
         fields.remove("meta");
-        if let Some(Value::String(r)) = fields.get_mut("reasoning_content")
-            && r.len() > REPLAY
-        {
-            let (start, end) = (clip(r, REPLAY / 4), tail(r, REPLAY * 3 / 4));
-            *r = format!("{start}\n[… {} bytes of reasoning omitted]\n{end}", r.len() - start.len() - end.len());
-        }
     }
     message
 }

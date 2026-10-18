@@ -43,6 +43,8 @@ const EXHAUSTED: &[&str] =
 /// try may reach one that takes it; low tries once more.
 const CACHE_KEY: &str = "prompt_cache_key";
 const REJECTED: &[&str] = &["invalid", "authentication", "permission", "not_found", "insufficient_quota"];
+/// Finish reasons DeepSeek gives a reply its servers broke off: a lost stream, retried, not an answer.
+const BROKEN_OFF: &[&str] = &["insufficient_system_resource", "aborted"];
 /// Stream chunk fields low reads itself or that carry nothing; the rest (id, model, provider, …) go in the log.
 const CHUNK: &[&str] = &["choices", "object", "created", "usage", "error", "obfuscation"];
 const HEADERS: &[&str] = &["request-id", "cf-ray", "server", "via", "retry-after", "server-timing"];
@@ -189,7 +191,6 @@ pub struct Llm {
     params: Value,
     session: Option<String>,
     field: Cell<&'static str>,
-    marked: Cell<bool>,
     /// The provider refused stream_options, so requests go without it and the usage is estimated.
     plain: Cell<bool>,
 }
@@ -205,7 +206,7 @@ impl Llm {
             base: base_url.trim_end_matches('/').into(),
             key: key
                 .map(String::from)
-                .or_else(|| std::env::var("LOW_API_KEY").ok())
+                .or_else(crate::worker::api_key)
                 .or_else(|| std::fs::read_to_string(key_file()).ok())
                 .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty()),
@@ -213,7 +214,6 @@ impl Llm {
             params: params(header),
             session: session_id(base_url, header),
             field: Cell::new(FIELDS[0]),
-            marked: Default::default(),
             plain: Default::default(),
         }
     }
@@ -358,9 +358,12 @@ impl Llm {
         let mut idle = tokio::time::Instant::now() + IDLE;
         'read: while !eof {
             match tokio::time::timeout_at(idle.min(cap), response.chunk()).await {
+                // Any bytes count as life, keep-alive comments too: DeepSeek sends those for up to 10 minutes while a
+                // request waits for inference. The whole reply stays capped by TOTAL.
                 Ok(Ok(Some(chunk))) => {
                     got += chunk.len();
                     lines.push(&chunk);
+                    idle = tokio::time::Instant::now() + IDLE;
                 }
                 Ok(Ok(None)) => {
                     eof = true;
@@ -396,9 +399,7 @@ impl Llm {
                         served[key.as_str()] = value.clone();
                     }
                 }
-                if reply.take(&event) {
-                    idle = tokio::time::Instant::now() + IDLE;
-                }
+                reply.take(&event);
                 std::io::stdout().flush()?;
             }
             if lines.partial() > LINE_MAX {
@@ -420,20 +421,15 @@ impl Llm {
             reply.shown.cut();
             return Err(e);
         }
-        if reply.finished {
-            self.marked.set(true);
-        }
-        let accepted = !reply.finished
-            && broken.is_none()
-            && !self.marked.get()
-            && !(reply.text.is_empty() && reply.calls.is_empty())
-            && reply.calls.complete();
-        if accepted {
-            reply.reason = "eof".into();
-        }
-        if !reply.finished && !accepted {
+        // A reply is whole only when the provider says so, with a finish reason or [DONE]: a connection that just
+        // closes may have cut it mid-sentence.
+        let broken_off = reply.reason.as_str().filter(|r| BROKEN_OFF.contains(r));
+        if !reply.finished || broken_off.is_some() {
             reply.shown.cut();
-            let why = broken.unwrap_or_else(|| "the stream ended before the model finished".into());
+            let why = match broken_off {
+                Some(reason) => format!("the provider broke off the reply ({reason})"),
+                None => broken.unwrap_or_else(|| "the stream ended before the model finished".into()),
+            };
             let mut lost = Lost::new(&reply.thinking, reply.began);
             lost.text = reply.text.chars().count() + reply.calls.size();
             lost.stalled = stalled;
@@ -492,7 +488,7 @@ impl Llm {
             if attempt == 5 {
                 bail!("giving up after {attempt} attempts: {detail}")
             }
-            let wait = wait.unwrap_or(2 << attempt).clamp(1, 60);
+            let wait = wait.unwrap_or(2 << attempt).clamp(1, 300);
             let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             let extra = json!({"status": problem, "attempt": attempt, "wait_s": wait});
             crate::ui::event("retry", &format!("{problem}; retrying"), extra);
@@ -533,8 +529,13 @@ fn refused(error: &Value) -> bool {
     code.is_some_and(|c| (400..500).contains(&c) && c != 408 && c != 429) || REJECTED.iter().any(|r| named.contains(r))
 }
 
+/// How long Retry-After asks to wait, in seconds: it gives either the seconds or the date to retry at.
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    headers.get("retry-after")?.to_str().ok()?.trim().parse().ok()
+    let value = headers.get("retry-after")?.to_str().ok()?.trim();
+    value.parse().ok().or_else(|| {
+        let at = httpdate::parse_http_date(value).ok()?;
+        Some(at.duration_since(std::time::SystemTime::now()).map_or(0, |wait| wait.as_secs() + 1))
+    })
 }
 
 /// The response body as lines, each handed over once it ends; every data line is one event. A line still arriving
@@ -595,8 +596,8 @@ struct Reply {
 }
 
 impl Reply {
-    /// Takes in one event and shows what it adds; true when it carried anything, so the stream is not idle.
-    fn take(&mut self, event: &Value) -> bool {
+    /// Takes in one event and shows what it adds.
+    fn take(&mut self, event: &Value) {
         if event["usage"].is_object() {
             self.usage = event["usage"].clone();
         }
@@ -638,7 +639,6 @@ impl Reply {
                 crate::ui::writing(self.calls.lines + self.calls.list.len());
             }
         }
-        why.is_some() || field.is_some() || tools.is_some() || !content.is_empty()
     }
 
     /// The finished reply as the session logs it, with its usage, timing and how it was served in meta.
@@ -768,11 +768,6 @@ impl Calls {
 
     fn is_empty(&self) -> bool {
         self.list.is_empty()
-    }
-
-    /// Whether every call's arguments are whole JSON.
-    fn complete(&self) -> bool {
-        self.list.iter().all(|c| serde_json::from_str::<Value>(&c[2]).is_ok())
     }
 
     /// The bytes of arguments received.

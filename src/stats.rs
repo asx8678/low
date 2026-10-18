@@ -63,7 +63,7 @@ pub fn totals(entries: &[Value]) -> Value {
         }
     }
     let get = |key: &str| n.get(key).copied().unwrap_or(0);
-    let lost: u64 = ["overthought", "interrupted"].iter().filter_map(|k| events.get(*k)).sum();
+    let lost: u64 = events.get("interrupted").copied().unwrap_or(0);
     let tps =
         (get("decode_ms") > 0).then(|| (get("decoded") as f64 * 10_000.0 / get("decode_ms") as f64).round() / 10.0);
     json!({

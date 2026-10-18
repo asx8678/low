@@ -8,6 +8,7 @@ PROTECTED = [os.path.realpath(d) for d in json.loads(os.environ.pop("LOW_PROTECT
 LOCKED = [os.path.realpath(d) for d in json.loads(os.environ.pop("LOW_LOCKED", "[]"))]
 HALF = 16000
 LIMIT = 8 << 20
+OUT_CAP = 64 << 20  # what a run's own printing may put on disk; past it, output is dropped
 RUN_CAP = 570
 IGNORABLE = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r(?!\n)")
@@ -22,6 +23,29 @@ _checked = None
 _said = 0  # bytes this run printed through edit, write and check, the output the model can predict
 _groups = set()
 _deadline = time.monotonic() + RUN_CAP
+_running = _dropped = _executing = False
+_flow = threading.Lock()  # held while a run's output is switched, so the watch never switches the wrong run's
+
+
+def _overrun(signum, frame):
+    # Code that never returns, a pure-Python loop say, ends here, before the host's timeout kills the worker and its
+    # variables; sh() commands meet their own deadline first.
+    if _executing:
+        raise TimeoutError(f"the run went past its {RUN_CAP} s limit")
+
+
+def _host(message):
+    # The run's clock stops while the host answers (a check can take far longer than a run), and starts over after it,
+    # as the host's own timeout does.
+    global _deadline
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    _outbox.write(json.dumps(message) + "\n")
+    _outbox.flush()
+    answer = json.loads(_inbox.readline() or "{}")
+    _deadline = time.monotonic() + RUN_CAP
+    if _executing:
+        signal.setitimer(signal.ITIMER_REAL, RUN_CAP + 5)
+    return answer
 
 
 def _children(pid):
@@ -43,12 +67,22 @@ def _kill():
     for group in groups - {0, 1, os.getpgrp()}:
         with contextlib.suppress(OSError):
             os.killpg(group, signal.SIGKILL)
-    os.killpg(0, signal.SIGKILL)
+    # low starts the worker as the leader of its own group; started any other way, the group is whoever started it.
+    if os.getpgrp() == os.getpid():
+        os.killpg(0, signal.SIGKILL)
+    os.kill(os.getpid(), signal.SIGKILL)
 
 
 def _watch(parent):
+    global _dropped
     while os.getppid() == parent:
-        time.sleep(1)
+        time.sleep(0.25)
+        # Code that prints without end would fill the disk with its capture: past OUT_CAP its output goes nowhere.
+        with _flow:
+            if _running and not _dropped and os.fstat(1).st_size > OUT_CAP:
+                os.dup2(_null, 1)
+                os.dup2(_null, 2)
+                _dropped = True
     _kill()
 
 
@@ -242,29 +276,70 @@ def write(path, content):
     _change("write", path, make)
 
 
+def _cleans_ignored(cmd):
+    # git clean -x or -X, not a dry run: it deletes the files git ignores, which no undo restores.
+    lexer = shlex.shlex(str(cmd), posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        words = list(lexer)
+    except ValueError:
+        return False
+    first = True  # where a command starts: the beginning, after an operator, after VAR=value
+    for i, word in enumerate(words):
+        if word.strip("();<>|&") == "":
+            first = True
+            continue
+        if first and "=" in word and not word.startswith("-"):
+            continue
+        rest = []
+        for w in words[i + 1:]:
+            if w.strip("();<>|&") == "":
+                break
+            rest.append(w)
+        if first and os.path.basename(word) == "git" and "clean" in rest:
+            flags = [w for w in rest[rest.index("clean") + 1:] if w.startswith("-") and not w.startswith("--")]
+            if any(set(f) & {"x", "X"} for f in flags) and not any("n" in f for f in flags) and "--dry-run" not in rest:
+                return True
+        first = False
+    return False
+
+
 def sh(cmd, timeout=120):
     entry = [str(cmd), None, []]
     _report.setdefault("cmds", []).append(entry)
+    if _cleans_ignored(cmd):
+        entry[1] = "refused"
+        listed = subprocess.run(["git", "ls-files", "-o", "-i", "--exclude-standard", "--directory"], cwd=ROOT,
+                                capture_output=True, text=True).stdout.split()
+        some = ", ".join(listed[:5]) + (f" and {len(listed) - 5} more" if len(listed) > 5 else "")
+        return (f"[refused: git clean -x or -X deletes the files git ignores ({some or 'none now'}), and no undo restores "
+                "them; delete the ones you mean by name]")
     out, code = _exec(cmd, timeout)
     entry[1:] = [code, [_rel(w) for w in str(cmd).split() if os.path.isfile(os.path.join(ROOT, w))]]
     return out.rstrip("\n") + (f"\n[exit {code}]" if code else "")
 
 
 def show(path, start=1, end=None):
-    with open(os.path.join(ROOT, path), encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
-    _report.setdefault("reads", []).append(_rel(path))
-    asked, start, end = end, max(start, 1), min(end or len(lines), len(lines))
+    full = os.path.join(ROOT, path)
+    with open(full, "rb") as f:
+        _report.setdefault("reads", []).append(_rel(path))
+        if b"\0" in f.read(8192):
+            print(f"[{_rel(path)}: binary, {os.fstat(f.fileno()).st_size} bytes]")
+            return
+    asked, start = end, max(start, 1)
     sys.stdout.flush()
-    room, rows = 2 * HALF - os.fstat(1).st_size - 2000, []
-    for n in range(start, end + 1):
-        room -= len(lines[n - 1]) + len(str(n)) + 3
-        if room < 0 and rows:
-            break
-        rows.append(f"{n}: {lines[n - 1]}")
-    stop = start + len(rows) - 1
+    room, rows, total = 2 * HALF - os.fstat(1).st_size - 2000, [], 0
+    # Line by line, so a huge file is counted, not held.
+    with open(full, encoding="utf-8", errors="replace") as f:
+        for total, line in enumerate(f, 1):
+            if start <= total and (not asked or total <= asked) and room >= 0:
+                line = line[:-1] if line.endswith("\n") else line
+                room -= len(line) + len(str(total)) + 3
+                if room >= 0 or not rows:
+                    rows.append(f"{total}: {line}")
+    end, stop = min(asked or total, total), start + len(rows) - 1
     rest = f"; show({_rel(path)!r}, {stop + 1}{f', {asked}' if asked else ''}) continues" if stop < end else ""
-    print(f"[{_rel(path)}: lines {start}-{stop} of {len(lines)}{rest}]")
+    print(f"[{_rel(path)}: lines {start}-{stop} of {total}{rest}]")
     print("\n".join(rows))
 
 
@@ -278,12 +353,9 @@ def check():
         _say("[no check configured: check() ran nothing]")
         return True
     ran = len(_report.get("cmds", []))
-    _outbox.write(json.dumps({"needs_check": True, "actions": _report.get("actions", []), "cmds": _report.get("cmds", [])}) + "\n")
-    _outbox.flush()
-    answer = json.loads(_inbox.readline() or "{}")
+    answer = _host({"needs_check": True, "actions": _report.get("actions", []), "cmds": _report.get("cmds", [])})
     ok = answer.get("ok") is True
-    global _checked, _deadline
-    _deadline = time.monotonic() + RUN_CAP
+    global _checked
     _checked = _tree() if ok else None
     _report["check"] = ok
     _report.setdefault("actions", []).append({"tool": "check", "ok": ok, "cmds": ran})
@@ -329,9 +401,7 @@ def ask(question):
 def _web(request):
     # The sandbox has no network: the host makes the request and sends back the response, or why it failed.
     _report.setdefault("web", []).append(request)
-    _outbox.write(json.dumps({"needs_check": True, "web": request}) + "\n")
-    _outbox.flush()
-    answer = json.loads(_inbox.readline() or "{}")
+    answer = _host({"needs_check": True, "web": request})
     if answer.get("ok") is not True:
         raise RuntimeError(answer.get("out") or "the web request failed")
     return json.loads(answer["out"])
@@ -369,6 +439,7 @@ class _Helpers:
 sh.sh = sys.modules["sh"] = sh
 sys.meta_path.append(_Helpers())
 signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.signal(signal.SIGALRM, _overrun)
 _outbox.write(json.dumps({"ready": True, "python": sys.version.split()[0]}) + "\n")
 _outbox.flush()
 for n, request in enumerate(_inbox, 1):
@@ -380,8 +451,10 @@ for n, request in enumerate(_inbox, 1):
     os.chdir(ROOT)
     G.update(TOOLS)
     capture = tempfile.TemporaryFile()
-    os.dup2(capture.fileno(), 1)
-    os.dup2(capture.fileno(), 2)
+    with _flow:
+        os.dup2(capture.fileno(), 1)
+        os.dup2(capture.fileno(), 2)
+        _running, _dropped = True, False
     sys.stdout = sys.stderr = open(1, "w", encoding="utf-8", errors="replace", buffering=1, closefd=False)
     failed = False
     signal.signal(signal.SIGINT, signal.default_int_handler)
@@ -391,12 +464,19 @@ for n, request in enumerate(_inbox, 1):
         linecache.cache[name] = (len(code), None, code.splitlines(True), name)
         tree = ast.parse(code, name)
         tail = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
-        exec(compile(tree, name, "exec"), G)
-        if tail:
-            value = eval(compile(ast.Expression(tail.value), name, "eval"), G)
-            sys.stdout.flush()
-            if value is not None and not os.fstat(1).st_size:
-                print(value)
+        # The alarm only while the model's code runs: past it, an exception would land in the worker's own.
+        signal.signal(signal.SIGALRM, _overrun)
+        _executing = True
+        signal.setitimer(signal.ITIMER_REAL, RUN_CAP + 5)
+        try:
+            exec(compile(tree, name, "exec"), G)
+            value = eval(compile(ast.Expression(tail.value), name, "eval"), G) if tail else None
+        finally:
+            _executing = False
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        sys.stdout.flush()
+        if value is not None and not os.fstat(1).st_size:
+            print(value)
     except BaseException as e:
         failed = True
         tb = traceback.extract_tb(e.__traceback__)
@@ -423,10 +503,14 @@ for n, request in enumerate(_inbox, 1):
         print("[check no longer applies: files changed after it passed; run check() again]")
     sys.stdout.flush()
     if "finish" in _report:
-        _report["own"] = os.fstat(1).st_size - _said
-    os.dup2(_null, 1)
-    os.dup2(_null, 2)
+        _report["own"] = os.fstat(capture.fileno()).st_size - _said
+    with _flow:
+        _running = False
+        os.dup2(_null, 1)
+        os.dup2(_null, 2)
     text = ANSI.sub("", _read(capture).decode("utf-8", "replace"))
+    if _dropped:
+        text += f"\n[the run printed more than {OUT_CAP >> 20} MB; the rest was dropped]"
     capture.close()
     _report["chars"] = len(text)
     if len(text) > 2 * HALF:

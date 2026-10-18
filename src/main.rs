@@ -30,7 +30,8 @@ Options:
       --session <ID>   Resume this session of this repo (its id, as in [session ...])
   -m, --model <MODEL>  Model for a new session; with --resume it switches the session to it (so does /model)
       --effort <LEVEL> How hard the model thinks: low, medium, high, xhigh or max, sent as reasoning_effort (DeepSeek runs
-                       medium and xhigh as high); like -m it sets a new session and switches a resumed one (so does /effort)
+                       medium and xhigh as high); like -m it sets a new session and switches a resumed one (so does /effort);
+                       DeepSeek caches per level, so a switch sends the context uncached once
       --yolo           No sandbox: network on, writes anywhere (env vars stay filtered; env = [...] in ~/.config/low/config.toml passes more)
       --serve          After the task, keep the session and take the next tasks from low --send, keeping the provider's prompt cache warm in between (from a script, start it without a task)
       --send           Give the task to the low --serve running in this repo and print its result, with the same exit status; /stop ends that server
@@ -168,6 +169,10 @@ fn load(path: &Path) -> Result<Config> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // First of all: on macOS low starts over here without the secrets in its environment.
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let env = load(&providers::config_dir(&home).join("config.toml")).map(|c| c.env).unwrap_or_default();
+    worker::scrub(&env);
     ui::guard();
     // reqwest brings no crypto of its own: every client, the agent's and /providers', uses ring.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -437,8 +442,10 @@ fn check_config(user: &Config) -> Result<()> {
         if let Some(value) = profile.get("fallback").filter(|v| v.as_str().is_none_or(|f| !f.contains(':'))) {
             bail!("{at} sets fallback = {value}; it takes \"provider:model\", e.g. \"opencode:deepseek-v4.1-flash\"");
         }
-        if let Some(value) = profile.get("turn_budget").filter(|v| v.as_u64().is_none_or(|n| n < 1)) {
-            bail!("{at} sets turn_budget = {value}; it takes a whole number of compact_at units, at least 1");
+        for key in ["turn_budget", "session_budget"] {
+            if let Some(value) = profile.get(key).filter(|v| v.as_u64().is_none_or(|n| n < 1)) {
+                bail!("{at} sets {key} = {value}; it takes a whole number of compact_at units, at least 1");
+            }
         }
     }
     Ok(())

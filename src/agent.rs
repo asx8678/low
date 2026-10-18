@@ -10,12 +10,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, Read};
-use tokio::io::AsyncReadExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 
 const COMPACT_AT: u64 = 100_000;
 /// Seconds an idle --serve session waits before re-sending its prompt to keep it cached; keep_warm in a model's
@@ -32,6 +32,8 @@ const CHECK_TIMEOUT: Duration = Duration::from_mins(30);
 const CHECK_OUT: u64 = 1 << 20;
 /// A turn's budget in compact_at units (turn_budget in a model's profile), counting cached input at a quarter.
 const TURN_BUDGET: u64 = 60;
+/// Runs in a row with the same code and the same result that end a turn: the model is stuck.
+const REPEATS: usize = 5;
 /// How long a session log stays a candidate for another low working in this repository.
 const DAY: Duration = Duration::from_secs(86_400);
 /// Margin around a run's recorded start and end when matching file times to it.
@@ -276,7 +278,7 @@ impl Agent {
         let header = self.session.header();
         let (model, system) = (self.model().to_string(), header["system"].as_str().unwrap_or_default().to_string());
         let mut profile = header["params"].as_object().cloned().unwrap_or_default();
-        for key in ["compact_at", "keep_warm", "turn_budget", "fallback"] {
+        for key in ["compact_at", "keep_warm", "turn_budget", "session_budget", "fallback"] {
             if !header[key].is_null() {
                 profile.insert(key.into(), header[key].clone());
             }
@@ -287,7 +289,9 @@ impl Agent {
         let provider = self.provider.clone();
         self.session.switch(&provider, &model, &system, profile)?;
         (self.provider, self.llm) = connect(&self.config.providers, &self.session)?;
-        ui::note(&format!("reasoning effort {effort} for {model}"));
+        let replied = self.session.entries.iter().any(|e| e["role"] == "assistant");
+        let uncached = if replied { "; DeepSeek caches per level, so its next request is uncached" } else { "" };
+        ui::note(&format!("reasoning effort {effort} for {model}{uncached}"));
         Ok(())
     }
 
@@ -376,6 +380,9 @@ impl Agent {
         let why = "low's change detection (a private git index, not your staging area) could not snapshot the tree";
         let start = self.tree().await.context(why)?;
         let snapshot_ms = ui::ms(clock);
+        // So the undo the report prints outlives git gc.
+        let (root, tree) = (self.root.clone(), start.clone());
+        tokio::task::spawn_blocking(move || crate::git::keep(&root, &tree)).await?;
         self.session
             .push(json!({"role": "user", "content": task, "meta": {"snapshot": start, "snapshot_ms": snapshot_ms}}))?;
         // The push first writes what the snapshot logged, so the turn begins at the task itself.
@@ -388,21 +395,28 @@ impl Agent {
         let mut state = TurnState::default();
         let budget = self.session.header()["turn_budget"].as_u64().unwrap_or(TURN_BUDGET);
         let ceiling = self.compact_at * budget;
+        let rule = "cached input counts a quarter";
         let mut limit = format!("stopped after {MAX_REQUESTS} model requests in one turn");
         for _ in 0..MAX_REQUESTS {
             if state.spent >= ceiling {
-                let rule = "cached input counts a quarter";
                 limit =
                     format!("stopped after {} in one turn ({budget} × compact_at; {rule})", ui::tokens(state.spent));
                 break;
             }
-            if self.upcoming() >= self.compact_at {
+            if let Some(total) = self.over_budget() {
+                let spent = ui::tokens(self.spent());
+                limit = format!("stopped: the session has spent {spent} (session_budget {total} × compact_at; {rule})");
+                break;
+            }
+            // Twice what the last compaction left, too: a compact_at that the summary and the kept tail fill on their
+            // own would compact before every task, each time a cache miss.
+            if self.upcoming() >= self.compact_at.max(2 * self.compacted()) {
                 self.compact()?;
             }
             let Some(message) = self.request(&mut state).await? else { continue };
             let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
             self.session.push(message)?;
-            let (finished, asked) = self.act(began, &calls).await?;
+            let (finished, asked) = self.act(&mut state, began, &calls).await?;
             // The model waits for an answer, which comes as the next task: no nudges or check gate before it.
             if let Some(question) = asked {
                 self.reply(&question, "ask()")?;
@@ -410,6 +424,10 @@ impl Agent {
                 let changed = self.changed(&start, began).await;
                 self.current = None;
                 return self.report(Some(changed), false, false, began, clock).await;
+            }
+            if finished.is_none() && state.repeats >= REPEATS {
+                limit = format!("stopped: the model ran the same code to the same result {REPEATS} times in a row");
+                break;
             }
             if let Some(report) = finished {
                 self.reply(&report, "finish()")?;
@@ -474,13 +492,8 @@ impl Agent {
             usage["prompt_tokens"] = self.sent().into();
             usage["estimated"] = true.into();
         }
+        state.spent += weighted(&message["meta"]);
         let usage = &message["meta"]["usage"];
-        let attempts = message["meta"]["timing"]["attempts"].as_u64().unwrap_or(1).max(1);
-        // The budget follows what a request costs: cached input is billed at a fraction of fresh input, so a long,
-        // well-cached session isn't stopped for re-sending its own context.
-        let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
-        let cached = ui::cached(usage).unwrap_or(0).min(prompt);
-        state.spent += (prompt - cached + cached / 4) * attempts + usage["completion_tokens"].as_u64().unwrap_or(0);
         ui::usage(usage);
         self.cache_miss(usage);
         let calls = message["tool_calls"].as_array().is_some_and(|c| !c.is_empty());
@@ -518,7 +531,12 @@ impl Agent {
 
     /// Runs a reply's tool calls in order and logs each result. Returns the report a finish() ends the turn with, if
     /// low takes it, and the question an ask() ends it with.
-    async fn act(&mut self, began: usize, calls: &[Value]) -> Result<(Option<String>, Option<String>)> {
+    async fn act(
+        &mut self,
+        state: &mut TurnState,
+        began: usize,
+        calls: &[Value],
+    ) -> Result<(Option<String>, Option<String>)> {
         let (mut finished, mut asked) = (None, None);
         for (i, call) in calls.iter().enumerate() {
             self.pending = Some(call["id"].clone());
@@ -533,6 +551,7 @@ impl Agent {
                     }
                 }
             }
+            state.ran(call["function"]["arguments"].as_str().unwrap_or_default(), &content);
             self.session.push(json!({"role": "tool", "tool_call_id": call["id"], "content": content, "meta": meta}))?;
             self.pending = None;
         }
@@ -557,10 +576,13 @@ impl Agent {
     async fn gates(&mut self, state: &mut TurnState, start: &str, began: usize) -> Result<Option<(bool, bool)>> {
         let changed = self.changed(start, began).await;
         // A turn that changed files without edit() or write() most likely left output from running code behind. With
-        // another low in this tree its files can land inside our runs' windows too, so it is not asked about then.
+        // another low in this tree its files can land inside our runs' windows too, so it is not asked about then. A
+        // deleted file is no leftover: deleting is what a shell command is for here.
         if changed && !state.strayed && !self.session.entries[began..].iter().any(|e| edited(&e["meta"])) {
             state.strayed = true;
-            let paths: Vec<String> = self.own_diff(began).await?.1.lines().filter_map(changed_path).collect();
+            let own = self.own_diff(began).await?.1;
+            let paths: Vec<String> =
+                own.lines().filter(|l| !l.ends_with(" (deleted)")).filter_map(changed_path).collect();
             if !paths.is_empty() && !self.shared() {
                 state.stalled = false;
                 ui::event("nudge", "files changed outside edit()/write(): asking the model about them", Value::Null);
@@ -701,6 +723,30 @@ impl Agent {
 
     fn sent(&self) -> u64 {
         serde_json::to_string(&self.session.messages()).map_or(0, |m| m.len() as u64) / 4
+    }
+
+    /// The request's size right after the session's last compaction, by bytes: the system prompt, the summary and the
+    /// entries it kept. From the log, so a resumed session waits as long.
+    fn compacted(&self) -> u64 {
+        let entries = &self.session.entries;
+        let Some(at) = entries.iter().rposition(|e| e["compact"].is_object()) else { return 0 };
+        let keep = entries[at]["compact"]["keep"].as_u64().unwrap_or(0) as usize;
+        let summary = entries[at]["compact"]["summary"].as_str().map_or(0, str::len);
+        let system = self.session.header()["system"].as_str().map_or(0, str::len);
+        let kept = entries.get(keep..at).into_iter().flatten().filter(|e| e["role"].is_string());
+        let kept: usize = kept.map(|e| compact::wire(e).to_string().len()).sum();
+        ((system + summary + kept) / 4) as u64
+    }
+
+    /// The session's budget (session_budget, in compact_at units) once its replies have spent it: no turn goes on then.
+    pub fn over_budget(&self) -> Option<u64> {
+        let total = self.session.header()["session_budget"].as_u64()?;
+        (self.spent() >= self.compact_at * total).then_some(total)
+    }
+
+    /// What the session's replies have spent, weighed as a turn's budget weighs them.
+    fn spent(&self) -> u64 {
+        self.session.entries.iter().filter(|e| e["role"] == "assistant").map(|e| weighted(&e["meta"])).sum()
     }
 
     /// Logs a request that found less than half of the previous request's prompt in the provider's cache, with the cause
@@ -876,8 +922,11 @@ impl Agent {
         };
         // The results' URLs are what a later fetch() may get, in this run or after a resume.
         let found = serde_json::from_str::<Value>(&out).ok().filter(|_| ok && tool == "search");
-        let urls: Vec<&str> =
-            found.iter().flat_map(|f| f["results"].as_array().into_iter().flatten()).filter_map(|r| r["url"].as_str()).collect();
+        let urls: Vec<&str> = found
+            .iter()
+            .flat_map(|f| f["results"].as_array().into_iter().flatten())
+            .filter_map(|r| r["url"].as_str())
+            .collect();
         ui::record("web", &what, json!({"request": body, "ok": ok, "bytes": out.len(), "urls": urls}));
         (ok, out)
     }
@@ -1035,7 +1084,10 @@ impl Agent {
         let paths: Vec<String> = changes.iter().filter_map(|l| changed_path(l)).collect();
         let repos = if self.yolo { vec![] } else { repos(&self.root, &paths) };
         if !repos.is_empty() {
-            let text = format!("git repositories made inside the tree, which the sandbox cannot contain: {}", repos.join(", "));
+            let text = format!(
+                "git repositories made inside the tree, which the sandbox cannot contain: {}",
+                repos.join(", ")
+            );
             rows.push(("repos", text));
         }
         let totals = crate::stats::totals(turn);
@@ -1113,7 +1165,8 @@ impl Agent {
     /// lists them itself and says no undo brings them back.
     async fn ignored(&self, began: usize, changes: &[String]) -> Vec<String> {
         let listed: Vec<String> = changes.iter().filter_map(|line| changed_path(line)).collect();
-        let actions = self.session.entries[began..].iter().flat_map(|e| e["meta"]["actions"].as_array().into_iter().flatten());
+        let actions =
+            self.session.entries[began..].iter().flat_map(|e| e["meta"]["actions"].as_array().into_iter().flatten());
         let mut paths: Vec<String> = actions
             .filter(|a| a["ok"] == true)
             .filter_map(|a| a["path"].as_str())
@@ -1294,7 +1347,8 @@ async fn grouped(mut cmd: tokio::process::Command) -> Result<(bool, String)> {
                 _ => open = false,
             },
             _ = tick.tick() => {
-                let seen = worker::descendants(pid);
+                // ps blocks for tens of milliseconds: off the runtime's one thread, so the display and Ctrl-C keep up.
+                let seen = tokio::task::spawn_blocking(move || worker::descendants(pid)).await.unwrap_or_default();
                 for g in seen {
                     if !group.0.contains(&g) {
                         group.0.push(g);
@@ -1462,6 +1516,36 @@ struct TurnState {
     failed_over: bool,
     /// Tokens spent, cached input counting a quarter.
     spent: u64,
+    /// The last run's code and result, hashed, and how many runs in a row had the same.
+    last_run: u64,
+    repeats: usize,
+}
+
+impl TurnState {
+    /// Counts a run of `code` that gave `out`. A traceback names its run (<run 7>), so the number doesn't count.
+    fn ran(&mut self, code: &str, out: &str) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        code.hash(&mut hasher);
+        let mut parts = out.split("<run ");
+        parts.next().hash(&mut hasher);
+        for part in parts {
+            part.trim_start_matches(|c: char| c.is_ascii_digit()).hash(&mut hasher);
+        }
+        let run = hasher.finish();
+        self.repeats = if self.repeats > 0 && run == self.last_run { self.repeats + 1 } else { 1 };
+        self.last_run = run;
+    }
+}
+
+/// What a reply counts against a budget: cached input is billed at a fraction of fresh input, so a long, well-cached
+/// session isn't stopped for re-sending its own context.
+fn weighted(meta: &Value) -> u64 {
+    let usage = &meta["usage"];
+    let attempts = meta["timing"]["attempts"].as_u64().unwrap_or(1).max(1);
+    let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+    let cached = ui::cached(usage).unwrap_or(0).min(prompt);
+    (prompt - cached + cached / 4) * attempts + usage["completion_tokens"].as_u64().unwrap_or(0)
 }
 
 /// An error as low shows and logs it: the whole chain, without control characters or secrets.

@@ -10,6 +10,10 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 static GIT_GUARD: OnceLock<(String, Vec<String>)> = OnceLock::new();
 /// One git at a time on low's index: a snapshot abandoned by Ctrl-C keeps running on the blocking pool.
 static INDEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// The ref that keeps the snapshots turns start from, so git gc can't take the trees the undo commands name.
+const KEPT: &str = "refs/low/snapshots";
+/// How long a snapshot stays kept: past it, the snapshot and the untracked files' contents it holds are garbage again.
+const KEEP_FOR: u64 = 14 * 86_400;
 
 pub fn guard_git(root: &Path) {
     let out = std::process::Command::new("git")
@@ -112,6 +116,54 @@ fn snapshot_with(root: &Path, index: &Path) -> Result<String> {
     }
     let tree = git(root, Some(index), &["write-tree"])?.trim().to_string();
     Ok(if args.len() > base { format!("{tree} {:016x}", hasher.finish()) } else { tree })
+}
+
+/// Keeps a turn's starting snapshot reachable from refs/low/snapshots for KEEP_FOR: the ref's one commit holds each kept
+/// snapshot as a folder named by when it was taken, so `git log --all` shows one commit, not one per turn. A snapshot
+/// already kept stays as it is; one whose update another low races past isn't kept, as before.
+pub fn keep(root: &Path, snapshot: &str) {
+    let Some(tree) = snapshot.split(' ').next().filter(|t| !t.is_empty()) else { return };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let tip = git(root, None, &["rev-parse", "-q", "--verify", &format!("{KEPT}^{{commit}}")]).ok();
+    let tip = tip.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let listed = tip.as_ref().and_then(|t| git(root, None, &["ls-tree", t]).ok()).unwrap_or_default();
+    // ls-tree lines: "040000 tree <id>\t<seconds>-<id>".
+    let young = |line: &&str| {
+        let taken = line.split_once('\t').and_then(|(_, name)| name.split('-').next()?.parse::<u64>().ok());
+        taken.is_some_and(|t| now.saturating_sub(t) < KEEP_FOR)
+    };
+    let mut entries: Vec<&str> = listed.lines().filter(young).collect();
+    if entries.iter().any(|l| l.split_once('\t').is_some_and(|(meta, _)| meta.ends_with(tree))) {
+        return;
+    }
+    let new = format!("040000 tree {tree}\t{now}-{tree}");
+    entries.push(&new);
+    let made = std::process::Command::new("git")
+        .args(["mktree"])
+        .current_dir(root)
+        .process_group(0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().map_or(Ok(()), |mut stdin| stdin.write_all((entries.join("\n") + "\n").as_bytes()))?;
+            child.wait_with_output()
+        });
+    let Some(kept) =
+        made.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    else {
+        return;
+    };
+    let args = ["-c", "user.name=low", "-c", "user.email=low@localhost", "commit-tree", "--no-gpg-sign", &kept];
+    let Ok(commit) = git(root, None, &[&args[..], &["-m", "low: snapshots that undo commands restore"]].concat())
+    else {
+        return;
+    };
+    // Against the tip read above, so a race loses this snapshot rather than another low's; and no reflog, which would
+    // keep old commits, and the snapshots they hold, past KEEP_FOR.
+    let update = ["-c", "core.logAllRefUpdates=false", "update-ref", KEPT, commit.trim(), tip.as_deref().unwrap_or("")];
+    let _ = git(root, None, &update);
 }
 
 pub fn changes(root: &Path, snapshot: Option<(&str, &Path)>, since: std::time::SystemTime) -> String {

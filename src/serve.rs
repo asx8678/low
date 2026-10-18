@@ -14,6 +14,9 @@ use std::time::Duration;
 
 /// How often the server looks for a task, and a client for its result.
 const POLL: Duration = Duration::from_millis(250);
+/// How long after the last task the server keeps the prompt cache warm: past it, a warm request is spent on a session
+/// that may never get another task.
+const WARM_FOR: Duration = Duration::from_secs(3600);
 
 /// The inbox folder, removed when the server stops (one that is killed leaves it; the next client clears it).
 struct Inbox(PathBuf);
@@ -37,7 +40,7 @@ pub async fn serve(agent: &mut Agent, first: Option<String>) -> Result<()> {
         eprintln!("error: {}", agent::error_text(&e));
     }
     let every = agent.keep_warm();
-    let mut idle = tokio::time::Instant::now();
+    let (mut idle, mut last, mut warming) = (tokio::time::Instant::now(), tokio::time::Instant::now(), true);
     let mut poll = tokio::time::interval(POLL);
     loop {
         tokio::select! {
@@ -59,8 +62,13 @@ pub async fn serve(agent: &mut Agent, first: Option<String>) -> Result<()> {
                 }
                 return Ok(());
             }
-            idle = tokio::time::Instant::now();
-        } else if every.is_some_and(|every| idle.elapsed() >= every) {
+            (idle, last, warming) = (tokio::time::Instant::now(), tokio::time::Instant::now(), true);
+        } else if warming && every.is_some_and(|every| idle.elapsed() >= every) {
+            if last.elapsed() >= WARM_FOR {
+                crate::ui::note("no task for an hour: the prompt cache is no longer kept warm until the next one");
+                warming = false;
+                continue;
+            }
             if let Err(e) = agent.warm().await {
                 crate::ui::note(&format!("could not keep the prompt cache warm: {}", agent::error_text(&e)));
             }

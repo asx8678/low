@@ -1,2 +1,2 @@
-check = "cargo build -q && cargo clippy -q --all-targets -- -D warnings && cargo test -q"
+check = "cargo fmt --check && cargo build -q && cargo clippy -q --all-targets -- -D warnings && cargo test -q"
 fmt = '''sh -c 'case "$1" in *.rs) exec rustfmt --edition 2024 "$1" ;; esac' fmt'''

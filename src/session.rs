@@ -40,6 +40,7 @@ impl Session {
     ) -> Result<Self> {
         let dir = home.join(".low/sessions");
         DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+        sweep(&dir);
         let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let path = dir.join(format!("{secs}-{}.jsonl", std::process::id()));
         let file = OpenOptions::new().create_new(true).append(true).mode(0o600).open(&path)?;
@@ -72,6 +73,7 @@ impl Session {
     /// The newest session of this repository, or the one `id` names (its id, or its log's path).
     pub fn resume(home: &Path, root: &Path, context: Map<String, Value>, id: Option<&str>) -> Result<Self> {
         let id = id.map(|id| Path::new(id).file_stem().and_then(|s| s.to_str()).unwrap_or(id));
+        sweep(&home.join(".low/sessions"));
         let mut paths: Vec<PathBuf> = fs::read_dir(home.join(".low/sessions"))
             .into_iter()
             .flatten()
@@ -230,6 +232,17 @@ impl Drop for Session {
     }
 }
 
+/// Removes the change-detection indexes no running low holds: a low that was killed leaves its own behind. A session's
+/// log stays locked while a low has it open, a --serve included, however long it has been idle.
+fn sweep(dir: &Path) {
+    let indexes = fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path());
+    for index in indexes.filter(|p| p.extension().is_some_and(|e| e == "index")) {
+        if !crate::serve::locked(&index.with_extension("jsonl")) {
+            let _ = fs::remove_file(index);
+        }
+    }
+}
+
 fn stamp(entry: &mut Value, at: u64) {
     let fields = if entry["role"].is_string() { &mut entry["meta"] } else { entry };
     if fields.get("at").is_none() {
@@ -240,6 +253,7 @@ fn stamp(entry: &mut Value, at: u64) {
 fn settings(provider: &str, model: &str, system: &str, mut params: Map<String, Value>) -> Value {
     let (compact_at, keep_warm) = (params.remove("compact_at"), params.remove("keep_warm"));
     let (turn_budget, fallback) = (params.remove("turn_budget"), params.remove("fallback"));
+    let session_budget = params.remove("session_budget");
     // temperature = false in a model's profile sends none, for models that refuse the field.
     if params.get("temperature") == Some(&Value::Bool(false)) {
         params.remove("temperature");
@@ -247,7 +261,7 @@ fn settings(provider: &str, model: &str, system: &str, mut params: Map<String, V
         params.entry("temperature").or_insert(crate::llm::TEMPERATURE.into());
     }
     json!({"provider": provider, "model": model, "params": params, "compact_at": compact_at, "keep_warm": keep_warm,
-           "turn_budget": turn_budget, "fallback": fallback, "system": system})
+           "turn_budget": turn_budget, "session_budget": session_budget, "fallback": fallback, "system": system})
 }
 
 fn answer_missing(out: &mut Vec<Value>, open: &mut Vec<Value>) {

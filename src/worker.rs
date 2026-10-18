@@ -35,10 +35,77 @@ const ENV: &str = "PATH HOME USER LOGNAME SHELL LANG LC_* TERM TMPDIR TZ PWD CAR
                    GOPATH GOROOT GOFLAGS VIRTUAL_ENV CONDA_PREFIX PYENV_ROOT NVM_DIR JAVA_HOME MIX_HOME HEX_HOME ERL_* \
                    ELIXIR_* DEVELOPER_DIR SDKROOT";
 
+/// What low itself reads besides the worker's variables: color, its HTTP client's proxies and certificates, git's own
+/// settings and the XDG folders.
+const OWN_ENV: &str = "NO_COLOR COLUMNS LINES RUST_BACKTRACE XDG_* GIT_* HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
+                       http_proxy https_proxy all_proxy no_proxy SSL_CERT_FILE SSL_CERT_DIR";
+/// Set in the environment low starts over with: the descriptor of the pipe that holds LOW_API_KEY, or "-".
+const SCRUBBED: &str = "LOW_SCRUBBED";
+
 static EXTRA_ENV: OnceLock<Vec<String>> = OnceLock::new();
+static API_KEY: OnceLock<Option<String>> = OnceLock::new();
 
 pub fn allow_env(names: Vec<String>) {
     let _ = EXTRA_ENV.set(names);
+}
+
+/// Whether a variable's name is on a list, where an entry ending in * is a prefix.
+fn listed(list: &[&str], name: &str) -> bool {
+    list.iter().any(|p| p.strip_suffix('*').map_or(*p == name, |prefix| name.starts_with(prefix)))
+}
+
+/// On macOS code running as the user can read the environment any of the user's processes started with, sandboxed or
+/// not (sysctl KERN_PROCARGS2), unless the process is one of Apple's binaries, and no sandbox-exec rule stops it. The
+/// model's code could find every secret exported in the shell that started low. So low starts over once, before
+/// anything else, with only the variables it and the worker use (`extra` is config.toml's env), and LOW_API_KEY comes
+/// along through an inherited pipe. Other processes stay readable: a Claude Code that started low, for one. On Linux
+/// bwrap's --unshare-all gives the sandbox its own process namespace and /proc, so no process outside it is visible.
+pub fn scrub(extra: &[String]) {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
+    if let Ok(fd) = std::env::var(SCRUBBED) {
+        let key = fd.parse::<i32>().ok().filter(|&fd| fd > 2).map(|fd| {
+            // SAFETY: the read end of the pipe this process opened before it started over and left open for this, so
+            // nothing else here owns it; reading it to the end and closing it is all that happens to it.
+            let mut pipe = unsafe { std::fs::File::from_raw_fd(fd) };
+            let mut key = String::new();
+            let _ = pipe.read_to_string(&mut key);
+            key
+        });
+        let _ = API_KEY.set(key.filter(|k| !k.is_empty()));
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let restart = || -> std::io::Result<std::io::Error> {
+        let mut args = std::env::args_os();
+        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        cmd.arg0(args.next().unwrap_or_default()).args(args).env_clear();
+        let kept: Vec<&str> =
+            ENV.split_whitespace().chain(OWN_ENV.split_whitespace()).chain(extra.iter().map(String::as_str)).collect();
+        cmd.envs(std::env::vars_os().filter(|(name, _)| name.to_str().is_some_and(|name| listed(&kept, name))));
+        let (mut fd, mut pipe) = ("-".to_string(), None);
+        if let Some(key) = std::env::var("LOW_API_KEY").ok().filter(|k| !k.is_empty()) {
+            let (reader, mut writer) = std::io::pipe()?;
+            writer.write_all(key.as_bytes())?;
+            drop(writer);
+            rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::empty())?;
+            fd = reader.as_raw_fd().to_string();
+            pipe = Some(reader);
+        }
+        let failed = cmd.env(SCRUBBED, fd).exec();
+        drop(pipe);
+        Ok(failed)
+    };
+    let e = restart().unwrap_or_else(|e| e);
+    eprintln!("low: could not start over without your environment's secrets ({e}); the model's code can read them");
+}
+
+/// The API key from LOW_API_KEY, which a low that started over has from its pipe.
+pub fn api_key() -> Option<String> {
+    API_KEY.get().cloned().flatten().or_else(|| std::env::var("LOW_API_KEY").ok())
 }
 
 static LOCKED: OnceLock<Vec<PathBuf>> = OnceLock::new();
@@ -225,8 +292,7 @@ pub fn sandboxed(root: &Path, yolo: bool, program: &str, args: &[&str]) -> Comma
     let _ = std::fs::create_dir_all(&cache);
     let extra = EXTRA_ENV.get().into_iter().flatten().map(String::as_str);
     let allowed: Vec<&str> = ENV.split_whitespace().chain(extra).collect();
-    let allowed =
-        |name: &str| allowed.iter().any(|p| p.strip_suffix('*').map_or(*p == name, |prefix| name.starts_with(prefix)));
+    let allowed = |name: &str| listed(&allowed, name);
     cmd.args(args)
         .current_dir(root)
         .env_clear()
@@ -341,10 +407,15 @@ fn writable(root: &Path) -> Vec<PathBuf> {
     dirs.filter_map(|d| d.canonicalize().ok()).collect()
 }
 
-/// The worker's interpreter: the newest python3.N on PATH, else python3, which on macOS is the system's 3.9.
+/// The worker's interpreter: an active virtualenv's, so run() imports what the project installed there; else the newest
+/// python3.N on PATH, else python3, which on macOS is the system's 3.9.
 fn python() -> String {
+    let venv = std::env::var_os("VIRTUAL_ENV").map(|dir| PathBuf::from(dir).join("bin"));
     let path = std::env::var_os("PATH").unwrap_or_default();
-    newest_python(std::env::split_paths(&path)).map_or_else(|| "python3".into(), |p| p.to_string_lossy().into_owned())
+    let found = venv
+        .and_then(|bin| newest_python(std::iter::once(bin)))
+        .or_else(|| newest_python(std::env::split_paths(&path)));
+    found.map_or_else(|| "python3".into(), |p| p.to_string_lossy().into_owned())
 }
 
 /// The highest runnable python3.N in these directories; on a tie the earliest directory wins, as PATH would pick.

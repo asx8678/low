@@ -54,7 +54,7 @@ low --send --json "next task"
 low --send /stop                     # ends the server
 ```
 
-While it waits, the server re-sends the conversation every `keep_warm` seconds (default 600) so the next task's prompt stays cached. Start the server without a task when scripting: a task given to `--serve` itself has no completion signal. `--send --session ID` targets one server when several run.
+While it waits, the server re-sends the conversation every `keep_warm` seconds (default 600) so the next task's prompt stays cached, and stops an hour after the last task. Start the server without a task when scripting: a task given to `--serve` itself has no completion signal. `--send --session ID` targets one server when several run. `--send` waits as long as the task runs: like a one-shot task, run a long one with `run_in_background`. Killing `--send`, or a `timeout` around it, stops only the waiting: the server finishes the task, and the session log has its turn.
 
 ## Task lists
 
@@ -73,7 +73,7 @@ low marks each line `[x]` done, `[!]` not verified or `[?]` asked a question, wr
 
 ## Choosing the model
 
-`-m provider:model` picks the provider when several list the same id, e.g. `low -m opendesign:deepseek-v4.1-flash --json "…"`; plain `-m model` takes the first provider that lists it. Providers live in `~/.config/low/providers.toml`. `--effort low|medium|high|xhigh|max` sets how hard the model thinks (DeepSeek runs medium and xhigh as high); with `--session` or `--resume` it switches the session.
+`-m provider:model` picks the provider when several list the same id, e.g. `low -m opendesign:deepseek-v4.1-flash --json "…"`; plain `-m model` takes the first provider that lists it. Providers live in `~/.config/low/providers.toml`. `--effort low|medium|high|xhigh|max` sets how hard the model thinks (DeepSeek runs medium and xhigh as high); with `--session` or `--resume` it switches the session, and since DeepSeek caches the prompt per level, the next request pays for the whole context uncached. Keep one effort per session.
 
 ## Web search
 

@@ -36,7 +36,7 @@ cost      3 requests · 2 runs · 4.9k tok in · 266 tok out · 0:10
 - **Code mode.** The model writes a program instead of making many small tool calls: fewer round trips, fewer tokens.
 - **Sandboxed by default.** No network, writes only inside the repo and temp dirs, and your SSH keys, cloud credentials and shell history are out of reach.
 - **Verified.** low runs your project's check on the final tree, and every turn ends with a verdict.
-- **Reversible.** Inside a git repository, low never commits: git is the undo, and every turn report prints the exact restore command. A file git ignores, such as `.env`, is listed as changed but can't be restored that way, and the report says so.
+- **Reversible.** Inside a git repository, low never commits to your branches: git is the undo, and every turn report prints the exact restore command. The snapshots those commands restore stay under `refs/low/snapshots` for 14 days, so `git gc` can't remove them; `git update-ref -d refs/low/snapshots` drops them sooner. A file git ignores, such as `.env`, is listed as changed but can't be restored that way, and the report says so. For the same reason `sh()` refuses `git clean -x` and `-X`, which delete every ignored file.
 - **Low entropy.** A short system prompt, deterministic harness decisions, rule-based context compaction, and no hidden LLM calls.
 - **Any OpenAI-compatible model.** Point it at any `/chat/completions` endpoint.
 
@@ -52,7 +52,7 @@ cargo install low
 |---|---|
 | macOS or Linux | the sandbox is `sandbox-exec` on macOS and [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) on Linux |
 | `git` | inside a repository, low tracks what it changes and prints an undo; elsewhere it runs without undo |
-| Python 3 | the worker runs on the newest `python3.N` on your `PATH` |
+| Python 3 | the worker runs on the active virtualenv's Python, or else the newest `python3.N` on your `PATH` |
 
 ## Quick start
 
@@ -91,10 +91,10 @@ low "the median of an even-length list is wrong; fix it"
 | `low --tasks <file>` | works through the open tasks of a markdown checklist (`- [ ] task`) in one session, marking each `[x]` done, `[!]` not verified or `[?]` asked a question, with its result under it; an `  - answer: …` line under a `[?]` task is sent next; text above the first task goes with the first task of each run; the model can read the checklist but not change it; a task cut off by a turn limit while it was still changing files gets up to 2 more turns; otherwise stops at the first task not done |
 | `low --json "<task>"` | shows nothing while the task runs and prints its result as one JSON object (session, verdict, status, exit, answer, changes, check, tokens) |
 | `low -m <model>` | picks the model for a new session; with `--resume`, switches the session to it. `provider:model` picks the provider too, for an id several providers list |
-| `low --effort <level>` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `reasoning_effort`; like `-m`, it sets a new session and switches a resumed one. DeepSeek runs `medium` and `xhigh` as `high` |
+| `low --effort <level>` | how hard the model thinks: `low`, `medium`, `high`, `xhigh` or `max`, sent as `reasoning_effort`; like `-m`, it sets a new session and switches a resumed one. DeepSeek runs `medium` and `xhigh` as `high`, and caches the prompt per level, so a switch mid-session sends the whole context uncached once |
 | `low --yolo` | turns the sandbox off: network on, writes anywhere (environment variables stay filtered) |
 | `low --serve ["<task>"]` | keeps the session open after the task and takes the next ones from `low --send`; while it waits, it re-sends the prompt so the provider keeps it cached (`keep_warm`) |
-| `low --send "<task>"` | gives the task to the `low --serve` running in this repository and prints its result, with the same exit status as `low "<task>"`; `low --send /stop` ends the server |
+| `low --send "<task>"` | gives the task to the `low --serve` running in this repository and prints its result, with the same exit status as `low "<task>"`; it waits as long as the task runs, and a `timeout` around it stops only the waiting; `low --send /stop` ends the server |
 
 In the REPL:
 
@@ -126,8 +126,9 @@ search = "deepseek"                  # the provider whose key search() and fetch
 temperature = 0.0                    # temperature = false sends none, for a model that refuses it
 reasoning_effort = "low"             # the default effort; --effort and /effort change it per session
 compact_at = 200000                  # compact the context at this many prompt tokens
-keep_warm = 600                      # low --serve: re-send the prompt after this many idle seconds (default 600, 0: never)
+keep_warm = 600                      # low --serve: re-send the prompt after this many idle seconds, for an hour after the last task (default 600, 0: never)
 turn_budget = 60                     # stop a turn after this many compact_at of tokens (cached input counts a quarter; default 60)
+session_budget = 500                 # stop the session's turns once it has spent this many compact_at (e.g. a long --tasks run; default none)
 fallback = "zro:zro/deepseek-v4.1-flash"  # when this provider is out of credit or quota (402), go on with this one
 ```
 
@@ -162,7 +163,7 @@ Every turn ends with one of four verdicts:
 - **Network:** off. On macOS only localhost is reachable; on Linux, only servers started inside the sandbox. `search()` and `fetch()`, when set up, send their query or URL out through low (above).
 - **Writes:** only the repository and temp directories. `.git` and the hooks directory are off limits. A git repository the model makes inside the tree is reported, since your git would run hooks and config from there outside the sandbox; `git config --global safe.bareRepository explicit` makes git refuse one laid out as a bare repository.
 - **Reads:** credentials and private data in your home directory are hidden: `~/.ssh` and `~/.gnupg`; cloud, Kubernetes and Docker configs; package-registry and database credentials (`.npmrc`, `.pypirc`, `.pgpass`, `.my.cnf`, …); keychains and keyrings; shell and REPL histories; the profiles of Chrome, Firefox, Safari, Brave, Edge, Chromium and Arc; other coding agents' keys; and low's own config.
-- **Environment:** only an allowlist of variables is passed in, plus your `env = [...]`.
+- **Environment:** only an allowlist of variables is passed in, plus your `env = [...]`. On macOS any process of yours can read the environment another one started with, so low restarts itself at launch with only those variables and hands `LOW_API_KEY` to the new process through a pipe. Other processes stay readable, so a shell or agent that starts low with secrets in its own environment still exposes them to the model's code. On Linux the sandbox has its own process namespace, so the model's code sees no process outside it.
 - **Redaction:** secrets that appear in output, such as API keys, tokens and private keys, are redacted before the model or the session log sees them.
 
 **Outside a git repository** low still runs, but it can't undo: the turn report lists what `edit` and `write` changed and says so. In your home directory, or above it, low can read files but not change them, because writes there could reach shell startup files and launch agents outside the sandbox.
