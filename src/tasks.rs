@@ -1,9 +1,10 @@
 //! `low --tasks FILE` works through a markdown checklist in one session. A task is a line `- [ ] text` at the start of a
 //! line; low marks it `[x]` when done, `[!]` when not verified and `[?]` when the model asked a question, and puts its
 //! result under it as `  - low: …`. An `  - answer: …` line under a `[?]` task is sent as the next turn, then marked
-//! `answered:`. The file is read again before each write, so edits made while low runs stay. Its first line names the
-//! session, so the next run continues it. Text above the first task goes to the model with the first task of a run, and a
-//! task that a turn limit cut off while it was still changing files gets up to two more turns.
+//! `answered:`. The file is read again before each write, so edits made while low runs stay; a task is found again by
+//! its line, or by its text if those edits moved it, so identical tasks each get their own mark. Its first line names
+//! the session, so the next run continues it. Text above the first task goes to the model with the first task of a run,
+//! and a task that a turn limit cut off while it was still changing files gets up to two more turns.
 use crate::agent::{self, Agent};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -50,15 +51,25 @@ pub fn session(home: &Path, file: &Path) -> Option<String> {
     home.join(format!(".low/sessions/{id}.jsonl")).exists().then_some(id)
 }
 
-/// Rewrites the task with this text: its mark, its `low:` line, and its answers marked used.
-fn update(file: &Path, text: &str, mark: char, result: &str, id: &str) -> Result<()> {
+/// Rewrites the task that was on `line` with this text: its mark, its `low:` line, and its answers marked used. Edits
+/// made meanwhile can move it, so it is the line with this text nearest to `line`, an open one first: found by its text
+/// alone, the first of two identical tasks was marked again and again while the second ran forever.
+fn update(file: &Path, line: usize, text: &str, mark: char, result: &str, id: &str) -> Result<()> {
     let old = std::fs::read_to_string(file)?;
     let mut lines: Vec<String> = old.lines().map(String::from).collect();
-    if lines.first().is_some_and(|l| l.starts_with(SESSION)) {
+    // `line` counts the session line, which goes on top here if it isn't there yet.
+    let line = if lines.first().is_some_and(|l| l.starts_with(SESSION)) {
         lines.remove(0);
-    }
+        line
+    } else {
+        line + 1
+    };
     lines.insert(0, format!("{SESSION}{id} -->"));
-    if let Some(at) = lines.iter().position(|l| task(l).is_some_and(|(_, t)| t == text)) {
+    let nearest = |open: bool| {
+        let this = |l: &&String| task(l).is_some_and(|(m, t)| t == text && !(open && matches!(m, 'x' | 'X')));
+        lines.iter().enumerate().filter(|(_, l)| this(l)).min_by_key(|(i, _)| i.abs_diff(line)).map(|(i, _)| i)
+    };
+    if let Some(at) = nearest(true).or_else(|| nearest(false)) {
         lines[at] = format!("- [{mark}] {text}");
         let mut end = at + 1;
         while end < lines.len() && lines[end].starts_with(char::is_whitespace) {
@@ -149,7 +160,7 @@ pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
             Some("question") => '?',
             _ => '!',
         };
-        update(file, &next.text, mark, &summary(&result), &id)?;
+        update(file, next.line, &next.text, mark, &summary(&result), &id)?;
         // A task cut off by a turn limit that was still changing files continues in a fresh turn of the same session.
         let progressed = result["changes"].as_array().is_some_and(|c| !c.is_empty());
         let limited = result["status"] == "stopped" && result["limit"].is_string();
