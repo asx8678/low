@@ -17,10 +17,10 @@ const CACHES: &str =
 const SECRETS: &str = ".low, .config/low, .ssh, .gnupg, .aws, .azure, .kube, .docker, .netrc, .pi, .config/gh, \
                        .config/gcloud, .config/op, .password-store, .git-credentials, .config/git/credentials, \
                        .npmrc, .pypirc, .cargo/credentials, .cargo/credentials.toml, .vault-token, .claude, \
-                       .claude.json, .codex, .zsh_history, .zsh_sessions, .bash_history, .python_history, \
-                       .node_repl_history, Library/Keychains, Library/Cookies, Library/Application Support/Google, \
-                       Library/Application Support/Firefox, .terraform.d, .m2/settings.xml, .gradle/gradle.properties, \
-                       .oci, .subversion/auth, .config/helm";
+                       .claude.json, .codex, .local/share/opencode/auth.json, .zsh_history, .zsh_sessions, \
+                       .bash_history, .python_history, .node_repl_history, Library/Keychains, Library/Cookies, \
+                       Library/Application Support/Google, Library/Application Support/Firefox, .terraform.d, \
+                       .m2/settings.xml, .gradle/gradle.properties, .oci, .subversion/auth, .config/helm";
 const ENV: &str = "PATH HOME USER LOGNAME SHELL LANG LC_* TERM TMPDIR TZ PWD CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN \
                    GOPATH GOROOT GOFLAGS VIRTUAL_ENV CONDA_PREFIX PYENV_ROOT NVM_DIR JAVA_HOME MIX_HOME HEX_HOME ERL_* \
                    ELIXIR_* DEVELOPER_DIR SDKROOT";

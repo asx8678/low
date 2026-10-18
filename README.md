@@ -157,7 +157,7 @@ Every turn ends with one of four verdicts:
 **The sandbox:**
 - **Network:** off. On macOS only localhost is reachable; on Linux, only servers started inside the sandbox.
 - **Writes:** only the repository and temp directories. `.git` and the hooks directory are off limits.
-- **Reads:** credentials and private data in your home directory are hidden, including `~/.ssh`, cloud and Kubernetes configs, keychains, shell histories, browser data and low's own config.
+- **Reads:** credentials and private data in your home directory are hidden, including `~/.ssh`, cloud and Kubernetes configs, keychains, shell histories, browser data, other coding agents' keys and low's own config.
 - **Environment:** only an allowlist of variables is passed in, plus your `env = [...]`.
 - **Redaction:** secrets that appear in output, such as API keys, tokens and private keys, are redacted before the model or the session log sees them.
 
