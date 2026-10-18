@@ -99,6 +99,8 @@ fn summary(result: &Value) -> String {
 /// Runs the open tasks in order and stops at the first that is not done; the result lists each task's.
 pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
     let id = agent.path().file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    // low rewrites the checklist after each task; the next turn need not hear about it.
+    agent.quiet(file);
     let mut done = vec![];
     loop {
         let text = std::fs::read_to_string(file).with_context(|| format!("could not read {}", file.display()))?;

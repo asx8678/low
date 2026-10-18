@@ -8,7 +8,7 @@ use crate::{Config, compact, ui};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -29,6 +29,10 @@ const RESTARTS: usize = 2;
 const CHECK_TIMEOUT: Duration = Duration::from_mins(30);
 const CHECK_OUT: u64 = 1 << 20;
 const TURN_BUDGET: u64 = 60;
+/// How long a session log stays a candidate for another low working in this repository.
+const DAY: Duration = Duration::from_secs(86_400);
+/// Margin around a run's recorded start and end when matching file times to it.
+const SLACK_MS: u64 = 250;
 const GATE: &str = "The project check failed on the current tree. Fix what fails, run check(), then finish again. \
                     If it cannot pass, say why in one line. The check output ended with:";
 const RETRY: &str = "Send one run() now with the next step, or a shorter answer.";
@@ -73,6 +77,8 @@ pub struct Agent {
     last: Value,
     /// The question an ask() ended the turn with, for its report.
     question: Option<String>,
+    /// A file low itself rewrites between turns (a --tasks checklist), relative to the root: not news to the model.
+    quiet: Option<String>,
 }
 
 impl Agent {
@@ -140,6 +146,7 @@ impl Agent {
             repo,
             last: Value::Null,
             question: None,
+            quiet: None,
         };
         agent.record()?;
         Ok(agent)
@@ -458,12 +465,12 @@ impl Agent {
                 continue;
             }
             let changed = self.changed(&start, began).await;
-            // A turn that changed files without edit() or write() most likely left output from running code behind.
+            // A turn that changed files without edit() or write() most likely left output from running code behind. With
+            // another low in this tree its files can land inside our runs' windows too, so it is not asked about then.
             if changed && !strayed && !self.session.entries[began..].iter().any(|e| edited(&e["meta"])) {
                 strayed = true;
-                let since = std::time::SystemTime::now() - clock.elapsed();
-                let paths: Vec<String> = self.diff(began, since).await?.lines().filter_map(changed_path).collect();
-                if !paths.is_empty() {
+                let paths: Vec<String> = self.own_diff(began).await?.1.lines().filter_map(changed_path).collect();
+                if !paths.is_empty() && !self.shared() {
                     stalled = false;
                     ui::event(
                         "nudge",
@@ -534,6 +541,7 @@ impl Agent {
         let fields: Vec<&str> = out.split('\0').filter(|f| !f.is_empty()).collect();
         let files: Vec<String> = fields
             .chunks(2)
+            .filter(|pair| pair.get(1).is_none_or(|path| self.quiet.as_deref() != Some(*path)))
             .filter_map(|pair| match pair {
                 ["A", path] => Some(format!("{path} (new)")),
                 ["D", path] => Some(format!("{path} (deleted)")),
@@ -548,8 +556,45 @@ impl Agent {
             .then(|| format!("Files changed since your last turn, outside this conversation: {shown}{more}"))
     }
 
+    /// Names a file low itself rewrites between turns, such as a --tasks checklist, so the turns don't report it.
+    pub fn quiet(&mut self, file: &Path) {
+        let file = file.canonicalize().unwrap_or_else(|_| self.root.join(file));
+        self.quiet = file.strip_prefix(&self.root).ok().map(|p| p.to_string_lossy().into_owned());
+    }
+
+    /// Whether this turn changed files: an edit() or write(), or a change its own code made. Changes another writer in
+    /// the same tree made meanwhile (the user's editor, another low) don't count.
     async fn changed(&self, start: &str, began: usize) -> bool {
-        self.session.entries[began..].iter().any(|e| edited(&e["meta"])) || self.moved(start).await
+        self.session.entries[began..].iter().any(|e| edited(&e["meta"]))
+            || self.moved(start).await && self.own_diff(began).await.is_ok_and(|(_, own)| own != "none")
+    }
+
+    /// What changed since the turn's snapshot, and the part of it this turn made, as `changes()` lists them.
+    async fn own_diff(&self, began: usize) -> Result<(String, String)> {
+        let at = self.session.entries[began]["meta"]["at"].as_u64().unwrap_or(0);
+        let all = self.diff(began, std::time::UNIX_EPOCH + Duration::from_millis(at)).await?;
+        let own = attributed(&self.root, &self.session.entries[began..], &all);
+        Ok((all, own))
+    }
+
+    /// Whether another low holds a session of this repository right now, so the tree has other writers.
+    fn shared(&self) -> bool {
+        let Some(dir) = self.session.path.parent() else { return false };
+        let root = self.root.to_string_lossy();
+        let recent =
+            |p: &Path| p.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|a| a < DAY));
+        let here = |p: &Path| {
+            let mut line = String::new();
+            let read = std::fs::File::open(p).map(std::io::BufReader::new).and_then(|mut f| f.read_line(&mut line));
+            read.is_ok() && serde_json::from_str::<Value>(&line).is_ok_and(|h| h["cwd"] == *root)
+        };
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| *p != self.session.path && p.extension().is_some_and(|e| e == "jsonl"))
+            .any(|p| recent(&p) && here(&p) && crate::serve::locked(&p))
     }
 
     fn sent(&self) -> u64 {
@@ -799,11 +844,15 @@ impl Agent {
         self.session.flush()?;
         // The next turn compares its starting tree with this one to tell the model what moved in between.
         let tree = if self.repo { self.tree().await.ok() } else { None };
-        let changes = if self.repo {
-            self.diff(began, std::time::SystemTime::now() - clock.elapsed()).await?
+        let (all, changes) = if self.repo {
+            self.own_diff(began).await?
         } else {
-            own_changes(&self.session.entries[began..])
+            let own = own_changes(&self.session.entries[began..]);
+            (own.clone(), own)
         };
+        let count = |list: &str| list.lines().filter(|l| *l != "none").count();
+        // Files another writer changed during the turn: neither this turn's to report nor its to undo.
+        let elsewhere = count(&all) - count(&changes);
         let first = &self.session.entries[began];
         let snapshot = first["meta"]["snapshot"].as_str().and_then(|s| s.split(' ').next());
         let changed = changed.unwrap_or(changes != "none");
@@ -848,6 +897,9 @@ impl Agent {
             rows.push(("inputs", format!("check inputs changed: {}", inputs.join(", "))));
         }
         rows.push(("changes", changes.clone()));
+        if elsewhere > 0 {
+            rows.push(("elsewhere", format!("{elsewhere} more changed by another writer in this tree, left out")));
+        }
         if !outside.is_empty() {
             let text = format!("not through low's edit()/write(), maybe outside low: {}", outside.join(", "));
             rows.push(("outside", text));
@@ -868,7 +920,8 @@ impl Agent {
                 tokio::task::spawn_blocking(move || git(&root, None, &args)).await?.unwrap_or_default()
             };
             let modified: Vec<&str> = known.split('\0').filter(|p| !p.is_empty()).collect();
-            let undo = match (outside.is_empty(), modified.is_empty()) {
+            // Restoring the whole tree would also undo what other writers did meanwhile.
+            let undo = match (outside.is_empty() && elsewhere == 0, modified.is_empty()) {
                 (true, _) => format!("git restore --source={short} --worktree -- .  (new files stay)"),
                 (false, false) => format!(
                     "git restore --source={short} --worktree -- {}  (low's edit()/write() paths; new files stay)",
@@ -900,11 +953,11 @@ impl Agent {
             "session": self.session.path, "id": self.session.header()["id"], "status": status, "exit": exit,
             "verdict": verdict, "good": good, "answer": answer, "question": question, "criteria": state.accepted,
             "plan": state.plan,
-            "check": check, "changes": changes, "undo": undo, "requests": requests,
+            "check": check, "changes": changes, "elsewhere": elsewhere, "undo": undo, "requests": requests,
             "tokens": {"prompt": prompt, "cached": cached, "out": out}, "cost": totals["cost"], "ms": ms, "rows": rows,
         });
         self.session.push(json!({"report": {
-            "verdict": verdict, "tree": tree, "changed": changed, "checked": checked, "stopped": stopped, "check_inputs": inputs, "outside": outside, "criteria": state.accepted,
+            "verdict": verdict, "tree": tree, "changed": changed, "checked": checked, "stopped": stopped, "check_inputs": inputs, "outside": outside, "elsewhere": elsewhere, "criteria": state.accepted,
             "plan_steps": steps, "plan_done": done, "changes": changes, "requests": requests, "runs": runs,
             "prompt": prompt, "cached": cached, "out": out, "ms": ms,
         }}))?;
@@ -1110,6 +1163,39 @@ fn context(root: &Path, config: &Config, yolo: bool) -> serde_json::Map<String, 
 
 /// What edit() and write() changed in a turn, listed as changes() lists it: outside a git repository that is all low
 /// can see.
+/// The lines of `changes` (as `changes()` writes them) that this turn made: paths it wrote with edit() or write(), and
+/// files that last changed while one of its runs or checks was executing (for a deleted file, its folder). The rest
+/// came from another writer in the same tree, such as the user's editor or another low.
+fn attributed(root: &Path, turn: &[Value], changes: &str) -> String {
+    let actions = turn.iter().flat_map(|e| e["meta"]["actions"].as_array().into_iter().flatten());
+    let own: HashSet<&str> = actions.filter(|a| a["ok"] == true).filter_map(|a| a["path"].as_str()).collect();
+    // A run's result is logged as it ends, with its duration; a check from the gate is logged the same way.
+    let windows: Vec<(u64, u64)> = turn
+        .iter()
+        .filter_map(|e| {
+            let (at, ms) =
+                if e["role"] == "tool" { (&e["meta"]["at"], &e["meta"]["ms"]) } else { (&e["at"], &e["check"]["ms"]) };
+            let (at, ms) = (at.as_u64()?, ms.as_u64()?);
+            Some((at.saturating_sub(ms + SLACK_MS), at + SLACK_MS))
+        })
+        .collect();
+    let during = |path: &Path| {
+        let time = path.symlink_metadata().and_then(|m| m.modified()).ok();
+        let ms = time.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
+        ms.is_some_and(|ms| windows.iter().any(|&(from, to)| (from..=to).contains(&ms)))
+    };
+    let lines: Vec<&str> = changes
+        .lines()
+        .filter(|line| {
+            let Some(path) = changed_path(line) else { return false };
+            let full = root.join(&path);
+            own.contains(path.as_str())
+                || if full.symlink_metadata().is_ok() { during(&full) } else { full.parent().is_some_and(during) }
+        })
+        .collect();
+    if lines.is_empty() { "none".into() } else { lines.join("\n") }
+}
+
 fn own_changes(turn: &[Value]) -> String {
     let mut files: BTreeMap<&str, (u64, u64, bool)> = BTreeMap::new();
     for action in turn.iter().flat_map(|e| e["meta"]["actions"].as_array().into_iter().flatten()) {

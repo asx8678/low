@@ -100,7 +100,7 @@ async fn answer(agent: &mut Agent, task: &str) -> Value {
 }
 
 /// Whether a low process holds the session's lock, as a server does while it runs.
-fn locked(session: &Path) -> bool {
+pub fn locked(session: &Path) -> bool {
     File::options().append(true).open(session).is_ok_and(|f| f.try_lock().is_err())
 }
 
