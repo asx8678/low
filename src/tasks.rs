@@ -136,10 +136,7 @@ pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
             }
             ('?', false) => next.answers.join("\n"),
             _ => match context.take() {
-                Some(context) => {
-                    let name = file.file_name().map_or_else(|| file.display().to_string(), |n| n.display().to_string());
-                    format!("{}\n\nFrom {name}, above its tasks:\n{context}", next.text)
-                }
+                Some(context) => format!("{}\n\nWritten above this task and the ones after it:\n{context}", next.text),
                 None => next.text.clone(),
             },
         };

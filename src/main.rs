@@ -226,7 +226,8 @@ async fn start() -> Result<()> {
         providers,
     };
     worker::allow_env(config.env.clone());
-    let protect = repo.protect.iter().map(PathBuf::from).chain(cli.protect);
+    // A --tasks checklist is low's to mark: the model reads it but doesn't change it.
+    let protect = repo.protect.iter().map(PathBuf::from).chain(cli.protect).chain(cli.tasks.clone());
     worker::protect(protect.map(|p| root.join(&p).canonicalize().unwrap_or_else(|_| root.join(p))).collect());
     let mut agent = agent::Agent::new(&root, &home, config, resume, id.as_deref(), cli.yolo, repo_dir)?;
     if let Some(model) = picked {
