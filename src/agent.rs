@@ -470,6 +470,7 @@ impl Agent {
                 self.session.push(json!({"role": "assistant", "content": question, "meta": {"via": "ask()"}}))?;
                 self.question = Some(question);
                 let changed = self.changed(&start, began).await;
+                self.current = None;
                 return self.report(Some(changed), false, false, began, clock).await;
             }
             if let Some(report) = finished {
