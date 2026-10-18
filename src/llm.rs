@@ -36,6 +36,9 @@ const WINDOW: &[&str] = &[
     "tokens allowed (",
 ];
 const QUOTA: &str = "insufficient_quota";
+/// Error words for a provider that is out of credit or quota for this key, as opposed to briefly rate-limited.
+const EXHAUSTED: &[&str] =
+    &[QUOTA, "key_quota_exceeded", "insufficient_balance", "insufficient balance", "spend limit"];
 /// OpenCode Go's gateway adds a prompt_cache_key field to requests, and some upstreams refuse it with a 400. Another
 /// try may reach one that takes it; low tries once more.
 const CACHE_KEY: &str = "prompt_cache_key";
@@ -43,6 +46,11 @@ const REJECTED: &[&str] = &["invalid", "authentication", "permission", "not_foun
 /// Stream chunk fields low reads itself or that carry nothing; the rest (id, model, provider, …) go in the log.
 const CHUNK: &[&str] = &["choices", "object", "created", "usage", "error", "obfuscation"];
 const HEADERS: &[&str] = &["request-id", "cf-ray", "server", "via", "retry-after", "server-timing"];
+
+/// The provider refused for want of credit or quota on this key: retrying won't help, another provider might.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Exhausted(String);
 
 /// The provider refused the request as too long; `window` is the context size its error states, if any.
 #[derive(Debug, thiserror::Error)]
@@ -435,7 +443,10 @@ impl Llm {
                     if status == 413 || !retryable && overflow(&text) {
                         return Err(ContextOverflow::new(format!("{status}: {text}")).into());
                     }
-                    if !retryable || text.to_lowercase().contains(QUOTA) {
+                    if status == 402 || EXHAUSTED.iter().any(|e| text.to_lowercase().contains(e)) {
+                        return Err(Exhausted(format!("{status}: {text}")).into());
+                    }
+                    if !retryable {
                         bail!("{status}: {text}")
                     }
                     (status.as_u16().to_string(), format!("{status}: {text}"), after)

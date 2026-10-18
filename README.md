@@ -123,6 +123,7 @@ temperature = 0.0
 compact_at = 200000                  # compact the context at this many prompt tokens
 keep_warm = 600                      # low --serve: re-send the prompt after this many idle seconds (default 600, 0: never)
 turn_budget = 60                     # stop a turn after this many compact_at of tokens (cached input counts a quarter; default 60)
+fallback = "zro:zro/deepseek-v4.1-flash"  # when this provider is out of credit or quota (402), go on with this one
 ```
 
 ## How it works

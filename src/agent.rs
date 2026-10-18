@@ -344,6 +344,7 @@ impl Agent {
             self.session.push(json!({"role": "user", "content": format!("[{moved}]"), "meta": {"host": true}}))?;
         }
         let (mut nudged, mut overflowed, mut retries, mut stalled, mut strayed) = (false, false, 0, false, false);
+        let mut failed_over = false;
         let budget = self.session.header()["turn_budget"].as_u64().unwrap_or(TURN_BUDGET);
         let ceiling = self.compact_at * budget;
         let mut spent = 0;
@@ -377,6 +378,14 @@ impl Agent {
                         system / 1024,
                         agents.min(AGENTS_MAX) / 1024
                     );
+                }
+                // Out of credit or quota on this provider: once a turn, go on with the model profile's fallback.
+                Err(e) if e.is::<llm::Exhausted>() && !failed_over && self.fallback().is_some() => {
+                    failed_over = true;
+                    let (provider, model) = self.fallback().unwrap_or_default();
+                    ui::event("failover", &format!("{e:#}; going on with {provider}:{model}"), Value::Null);
+                    self.switch(&provider, &model)?;
+                    continue;
                 }
                 Err(e) if retries < 2 && llm::lost(&e).is_some_and(|l| !l.stalled) => {
                     (spent, retries) = (spent + self.sent(), retries + 1);
@@ -563,6 +572,13 @@ impl Agent {
         let shown = files.iter().take(20).cloned().collect::<Vec<_>>().join(", ");
         (!files.is_empty())
             .then(|| format!("Files changed since your last turn, outside this conversation: {shown}{more}"))
+    }
+
+    /// The model profile's `fallback = "provider:model"`, when it names a configured provider other than the current one.
+    fn fallback(&self) -> Option<(String, String)> {
+        let (provider, model) = self.session.header()["fallback"].as_str()?.split_once(':')?;
+        let other = provider != self.provider || model != self.session.header()["model"];
+        (other && self.config.providers.contains_key(provider)).then(|| (provider.to_string(), model.to_string()))
     }
 
     /// Names a file low itself rewrites between turns, such as a --tasks checklist, so the turns don't report it.
