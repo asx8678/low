@@ -127,7 +127,8 @@ temperature = 0.0                    # temperature = false sends none, for a mod
 reasoning_effort = "low"             # the default effort; --effort, /effort and /models change it per session
 compact_at = 200000                  # compact the context at this many prompt tokens
 keep_warm = 600                      # low --serve: re-send the prompt after this many idle seconds, for an hour after the last task (default 600, 0: never)
-turn_budget = 60                     # stop a turn after this many compact_at of tokens (cached input counts a quarter; default 60)
+turn_budget = 60                     # stop a turn after this many compact_at of tokens (cached input counts a quarter; default 60);
+                                     # the model is told at three quarters, and asked for a handoff at the stop
 session_budget = 500                 # stop the session's turns once it has spent this many compact_at (e.g. a long --tasks run; default none)
 fallback = "zro:zro/deepseek-v4.1-flash"  # when this provider is out of credit or quota (402), go on with this one
 ```
@@ -167,6 +168,8 @@ Every turn ends with one of four verdicts:
 - **Redaction:** secrets that appear in output, such as API keys, tokens, private keys, URL passwords and AWS secret keys, are redacted before the model or the session log sees them. It matches known shapes, so a secret that is encoded, split or has no recognizable prefix passes through: redaction is a safety net, and the sandbox is what keeps your home directory's secrets out of reach.
 
 **Outside a git repository** low still runs, but it can't undo: the turn report lists what `edit` and `write` changed and says so. In your home directory, or above it, low can read files but not change them (your account's home counts even when `HOME` names another folder), because writes there could reach shell startup files and launch agents outside the sandbox.
+
+**Turn limits:** a turn stops at its token budget (`turn_budget`) or after 200 requests. Once it has used three quarters of either, the model is told about how many requests it has left and asked to spend them on the change rather than on reading; it is not asked to stop early, so a `--tasks` task cut off while it is still changing files keeps its extra turns. At the stop, low asks the model once more, running no code, where the work stands: what changed, what is left and the next step. That reply is the turn's answer, and the next turn starts from it. The session's budget (`session_budget`) caps spending, so it stops without asking.
 
 **Sessions** are JSONL files in `~/.low/sessions`. When the context reaches `compact_at`, low compacts it without an LLM call: it keeps the task, the latest messages and a summary rebuilt from the log.
 

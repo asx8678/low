@@ -18,18 +18,22 @@ check('second task does not repeat it', 'Rules' not in second, second)
 
 TASKS = '- [ ] build the thing\n- [ ] then this\n'
 e = Env([{'code': "write('a.txt', 'a\\n')", **BIG}, {'code': "write('b.txt', 'b\\n')", **BIG},
-         {'code': "write('c.txt', 'c\\n')", **BIG}, {'content': 'built'}, {'content': 'this done'}],
+         {'code': "write('c.txt', 'c\\n')", **BIG}, {'content': 'handoff: a, b and c written'}, {'content': 'built'},
+         {'content': 'this done'}],
         profile=PROFILE, files={'TASKS.md': TASKS})
 r = e.low('--json', '--tasks', 'TASKS.md')
 tasks = [t.get('task') for t in r['result'].get('tasks', [])]
 check('a limited task that changed files runs again', tasks.count('build the thing') == 2, tasks)
+first = r['result'].get('tasks', [{}])[0].get('result', {})
+check('the limited turn hands off first', first.get('answer') == 'handoff: a, b and c written', first)
 check('and every task is done', r['result'].get('left') == 0 and r['code'] == 0, r['result'])
 check('the checklist marks both done', e.read('TASKS.md').count('- [x]') == 2, e.read('TASKS.md'))
 
-e = Env([{'code': 'print(1)', **BIG}, {'code': 'print(2)', **BIG}, {'code': 'print(3)', **BIG}, {'content': 'never'}],
-        profile=PROFILE, files={'TASKS.md': TASKS})
+e = Env([{'code': 'print(1)', **BIG}, {'code': 'print(2)', **BIG}, {'code': 'print(3)', **BIG}, {'content': 'handoff'},
+         {'content': 'never'}], profile=PROFILE, files={'TASKS.md': TASKS})
 r = e.low('--json', '--tasks', 'TASKS.md')
-check('a no-progress task stops after one turn', len(r['result'].get('tasks', [])) == 1 and r['code'] == 5, r['result'])
+check('a no-progress task stops after one turn', len(r['result'].get('tasks', [])) == 1 and r['code'] == 5
+      and len(r['requests']) == 4, r['result'])
 
 e = Env([{'code': "for i in range(12): write(f'f{i}.txt', 'x\\n')"}, {'content': 'twelve'}],
         files={'TASKS.md': '- [ ] make twelve\n'})
