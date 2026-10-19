@@ -5,7 +5,8 @@ long."""
 import datetime, json
 from harness import Env, check, done
 
-LONG = 'Thinking it through. ' * 1000  # 21 KB, past the 16 KB the old build clipped to
+# 21 KB, past the 16 KB the old build clipped to, and varied: a loop would be cut off.
+LONG = ''.join(f'Step {i}: {i * 7919 % 10007} is checked against {i * 104729 % 1009}. ' for i in range(550))
 script = [
     {'reasoning': 'Let me look at calc.py first. 思考 🤔', 'content': 'Looking.', 'code': 'show("calc.py")'},
     {'reasoning': LONG, 'code': 'accept("add(2, 3) == 5")\nedit("calc.py", "return a - b", "return a + b")\nimport calc\n'
@@ -33,7 +34,7 @@ for k, (a, b) in enumerate(zip(raws, raws[1:])):
         broken.append((k, k + 1, 'tools or parameters changed'))
 check(f'each of {len(raws)} requests starts the next one', len(raws) == 7 and not broken, broken or len(raws))
 echoed = [m.get('reasoning_content', '') for m in raws[2]['messages'] if m['role'] == 'assistant']
-check('a 21 KB reasoning goes back whole', LONG in echoed, [len(x) for x in echoed])
+check('a 21 KB reasoning goes back whole', len(LONG) > 20000 and LONG in echoed, [len(x) for x in echoed])
 ids = {x['headers'].get('x-session-affinity') for x in e.entries()}
 check('every request carries the session id in x-session-affinity', ids == {e.log()[0]['id']}, ids)
 today = f'\n\n[Today is {datetime.date.today().isoformat()}]'

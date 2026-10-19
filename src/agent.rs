@@ -57,6 +57,7 @@ const HANDOFF: &str = "This turn has reached its limit, so low runs no more code
                        run(): what you changed and how far you verified it, what is left to do, and the next step, so \
                        the next turn can pick up from here.";
 const NOT_RUN: &str = "not run: this turn had reached its limit";
+const LOOPED: &str = "stopped: the model's reasoning kept repeating itself, the third unusable reply in a row";
 /// The files a repository gives the model its instructions in, the first that can be read going in the system prompt:
 /// CLAUDE.md is what Claude Code reads, for a repository that has no AGENTS.md.
 const INSTRUCTIONS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
@@ -550,7 +551,13 @@ impl Agent {
                 ui::record("note", &done, Value::Null);
             }
             let before = state.spent;
-            let Some(message) = self.request(&mut state).await? else { continue };
+            let Some(message) = self.request(&mut state).await? else {
+                if state.stalled {
+                    (limit, handoff) = (LOOPED.into(), false);
+                    break;
+                }
+                continue;
+            };
             let cost = state.spent - before;
             let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
             self.session.push(message)?;
@@ -591,13 +598,16 @@ impl Agent {
     }
 
     /// Asks the model for its next reply. What can be retried is handled here: a context overflow (compact and ask
-    /// again), a provider out of credit (go on with the profile's fallback, once a turn), a lost stream, and an empty
-    /// or cut-off reply (ask again, twice in a row at most). None when the turn asks again; otherwise the reply, counted
-    /// against the turn's budget.
+    /// again), a provider out of credit (go on with the profile's fallback, once a turn), a lost stream, reasoning cut
+    /// off in a loop, and an empty or cut-off reply (ask again, twice in a row at most). None when the turn asks again,
+    /// or when a third loop in a row stalls it; otherwise the reply, counted against the turn's budget.
     async fn request(&mut self, state: &mut TurnState) -> Result<Option<Value>> {
         let result = self.llm.complete(self.session.messages(), &tools()).await;
         if let Some(lost) = result.as_ref().err().and_then(llm::lost) {
             self.discard("the provider cut the stream", &lost.thinking);
+        }
+        if let Some(llm::Looping(lost)) = result.as_ref().err().and_then(|e| e.downcast_ref()) {
+            self.discard("the reasoning kept repeating itself", &lost.thinking);
         }
         let mut message = match result {
             Err(e) if e.is::<llm::ContextOverflow>() && !state.overflowed => {
@@ -628,6 +638,29 @@ impl Agent {
             Err(e) if state.retries < 2 && llm::lost(&e).is_some_and(|l| !l.stalled) => {
                 (state.spent, state.retries) = (state.spent + self.sent(), state.retries + 1);
                 self.retry("was lost: the provider cut the stream")?;
+                return Ok(None);
+            }
+            // Its usage never came, so the event carries an estimate for /cost: what was sent, cached as far as the last
+            // request went, and the reasoning's bytes / 4 out. Like an empty reply it is dropped and the model asked
+            // to act.
+            Err(ref e) if let Some(llm::Looping(lost)) = e.downcast_ref() => {
+                let (sent, out) = (self.sent(), lost.thinking.len() as u64 / 4);
+                let cached = self.session.last_prompt_tokens().min(sent);
+                let usage = json!({"prompt_tokens": sent, "prompt_tokens_details": {"cached_tokens": cached},
+                                   "completion_tokens": out, "estimated": true});
+                state.spent += weighted(&json!({"usage": usage}));
+                ui::usage(&usage);
+                state.stalled = state.retries >= 2;
+                let then = if state.stalled { "" } else { "; asking it to act" };
+                let kb = lost.thinking.len() / 1024;
+                let text = format!("{e}; cut it off at {kb} KB (~{}){then}", ui::tokens(out));
+                let mut extra = lost.extra();
+                extra["meta"] = json!({"usage": usage});
+                ui::event("loop", &text, extra);
+                if !state.stalled {
+                    state.retries += 1;
+                    self.retry("was cut off: its reasoning kept repeating itself")?;
+                }
                 return Ok(None);
             }
             result => result?,
@@ -1995,7 +2028,7 @@ struct TurnState {
     nudged: bool,
     /// The last request overflowed the context window, and the context was compacted for it.
     overflowed: bool,
-    /// Unusable replies in a row: lost, empty or cut off.
+    /// Unusable replies in a row: lost, looping, empty or cut off.
     retries: usize,
     /// A reply was still unusable after its retries.
     stalled: bool,

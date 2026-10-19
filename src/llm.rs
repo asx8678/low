@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,15 @@ const CACHE_KEY: &str = "prompt_cache_key";
 const REJECTED: &[&str] = &["invalid", "authentication", "permission", "not_found", "insufficient_quota"];
 /// Finish reasons DeepSeek gives a reply its servers broke off: a lost stream, retried, not an answer.
 const BROKEN_OFF: &[&str] = &["insufficient_system_resource", "aborted"];
+/// Reasoning that goes round in a loop is stopped: from LOOP_WINDOW bytes on, every LOOP_STEP bytes, the share of
+/// distinct SHINGLE-byte runs in its last LOOP_WINDOW bytes is measured, and under LOOP_SHARE the reply is cut. A loop
+/// keeps about one period's worth distinct. In the session logs (2026-10-19), 31 replies from DeepSeek V4.1 Flash went
+/// on to its 64k-token output limit, six minutes each; the one whose reasoning was kept would have been cut at 41 KB of
+/// its 199 KB, while of over a thousand other stored replies of 16 KB or more the least varied kept 40%.
+const LOOP_WINDOW: usize = 16 << 10;
+const LOOP_STEP: usize = 2 << 10;
+const SHINGLE: usize = 32;
+const LOOP_SHARE: f64 = 0.2;
 /// Stream chunk fields low reads itself or that carry nothing; the rest (id, model, provider, …) go in the log.
 const CHUNK: &[&str] = &["choices", "object", "created", "usage", "error", "obfuscation"];
 const HEADERS: &[&str] = &["request-id", "cf-ray", "server", "via", "retry-after", "server-timing"];
@@ -98,6 +107,12 @@ pub fn lost(e: &anyhow::Error) -> Option<&Lost> {
 #[error("stream interrupted: {0}")]
 pub struct Interrupted(String, Lost);
 
+/// The reply's reasoning went round in a loop, so low cut it off: left alone it runs on to the output limit. Not lost,
+/// so not sent again as it was: the same request would likely loop the same way.
+#[derive(Debug, thiserror::Error)]
+#[error("the model's reasoning kept repeating itself")]
+pub struct Looping(pub Lost);
+
 pub fn params(header: &Value) -> Value {
     match &header["params"] {
         Value::Object(params) => params.clone().into(),
@@ -120,6 +135,15 @@ fn session_id(base_url: &str, header: &Value) -> Option<String> {
 fn overflow(text: &str) -> bool {
     let lower = text.to_lowercase();
     OVERFLOW.iter().any(|m| lower.contains(m))
+}
+
+/// Whether reasoning is going round in a loop: under LOOP_SHARE of the SHINGLE-byte runs in its last LOOP_WINDOW bytes
+/// are distinct.
+fn looping(text: &str) -> bool {
+    let Some(window) = text.as_bytes().last_chunk::<LOOP_WINDOW>() else { return false };
+    let runs = window.windows(SHINGLE);
+    let all = runs.len();
+    (runs.collect::<HashSet<_>>().len() as f64) < all as f64 * LOOP_SHARE
 }
 
 fn window(error: &str) -> Option<u64> {
@@ -419,6 +443,9 @@ impl Llm {
                 }
                 reply.take(&event);
                 std::io::stdout().flush()?;
+                if reply.looping {
+                    break 'read;
+                }
             }
             if lines.partial() > LINE_MAX {
                 rejected = true;
@@ -427,6 +454,14 @@ impl Llm {
             }
         }
         (served["bytes"], served["events"]) = (got.into(), reply.events.into());
+        // Dropping the response on return closes the connection, which is all a provider is told.
+        if reply.looping {
+            reply.shown.cut();
+            let mut lost = Lost::new(&reply.thinking, reply.began);
+            lost.text = reply.text.chars().count() + reply.calls.size();
+            lost.response = served;
+            return Err(Looping(lost).into());
+        }
         let failed: Option<anyhow::Error> = match broken.as_deref() {
             Some(problem) if overflow(problem) => Some(ContextOverflow::new(problem.into()).into()),
             Some(problem) if rejected => Some(anyhow!("{problem}")),
@@ -613,6 +648,9 @@ struct Reply {
     began: Option<Instant>,
     spoke: Option<Instant>,
     shown: Shown,
+    /// The reasoning's length when it was last checked for a loop, and whether it was looping.
+    checked: usize,
+    looping: bool,
 }
 
 impl Reply {
@@ -637,6 +675,10 @@ impl Reply {
         if !reasoning.is_empty() {
             self.via = self.via.or(field);
             self.thinking += reasoning;
+            if self.thinking.len() >= self.checked + LOOP_STEP {
+                self.checked = self.thinking.len();
+                self.looping = looping(&self.thinking);
+            }
             let began = *self.began.get_or_insert_with(Instant::now);
             self.first.get_or_insert(began);
             if self.text.is_empty() {
@@ -868,5 +910,37 @@ mod tests {
         assert_eq!(super::retry_after(&headers), Some(7));
         headers.insert("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
         assert_eq!(super::retry_after(&headers), Some(0));
+    }
+
+    /// Reasoning that says a paragraph over and over, or a line that grows by a zero each time (the loop the logs
+    /// kept), is a loop once it fills the window; varied text, code, and a loop shorter than the window are not.
+    #[test]
+    fn loops_caught() {
+        let varied: String = (0..600)
+            .map(|i| format!("Step {i}: {} is checked against {}. ", i * 7919 % 10007, i * 104729 % 1009))
+            .collect();
+        assert!(varied.len() > super::LOOP_WINDOW && !super::looping(&varied));
+        assert!(!super::looping(include_str!("agent.rs")));
+        let paragraph = "Need maybe check the changeset for the raw string; it should be invalid. Good.\n";
+        assert!(super::looping(&(varied.clone() + &paragraph.repeat(250))));
+        assert!(!super::looping(&(varied + &paragraph.repeat(100))));
+        assert!(!super::looping(&paragraph.repeat(150)));
+        let zeros: String = (1..200)
+            .map(|k| format!("`asset_revision_id` raw string \"550e...{}\" -> invalid. Good.\n", "0".repeat(k)))
+            .collect();
+        assert!(super::looping(&zeros));
+    }
+
+    /// The reasoning is checked as it streams in: a loop is caught within a window and a step of it.
+    #[test]
+    fn a_looping_reply_stops() {
+        let (mut reply, mut sent) = (super::Reply::default(), 0);
+        let line = "Wait, let me check the import order once more before I write the file.\n";
+        while !reply.looping {
+            reply.take(&json!({"choices": [{"delta": {"reasoning_content": line}}]}));
+            sent += line.len();
+            assert!(sent <= super::LOOP_WINDOW + super::LOOP_STEP + line.len(), "not caught by {sent} bytes");
+        }
+        assert!(sent >= super::LOOP_WINDOW && reply.thinking.len() == sent);
     }
 }
