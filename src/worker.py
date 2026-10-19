@@ -255,7 +255,10 @@ def _change(tool, path, make, fmt=True):
             raise ValueError(f"{path} is outside the repo")
         if IGNORABLE.search(rel):
             raise ValueError(f"{path!r} has invisible or bidi characters in its name; low will not change it")
-        parts = (rel + os.sep + os.path.relpath(real, ROOT)).split(os.sep)
+        # Through a symlink, the file that changes is the one it points to: the action names that, as git's diff does,
+        # so the turn's report and undo() go by the same path. The run's output keeps the name the model gave.
+        changed = os.path.relpath(real, ROOT)
+        parts = (rel + os.sep + changed).split(os.sep)
         if any(d == real or real.startswith(d + os.sep) for d in LOCKED):
             raise ValueError(f"{path} is protected (protect in low.toml, or --protect); low will not change it")
         if any(d == real or real.startswith(d + os.sep) for d in PROTECTED) or any(
@@ -267,15 +270,15 @@ def _change(tool, path, make, fmt=True):
         before, written, *notes = make(os.path.join(ROOT, rel), rel)
         notes = notes[0] if notes else []
         delta = [l[0] for l in difflib.unified_diff(before.splitlines(), written.splitlines(), lineterm="")][2:]
-        action = {"tool": tool, "path": rel, "ok": True, "added": delta.count("+"), "removed": delta.count("-")}
+        action = {"tool": tool, "path": changed, "ok": True, "added": delta.count("+"), "removed": delta.count("-")}
         if tool == "write" and st:
             action["replaced"] = True
         if notes:
             action["reindented"] = len(notes)
         _report.setdefault("actions", []).append(action)
-        _turn.setdefault("touched", set()).add(rel)
+        _turn.setdefault("touched", set()).add(changed)
         if tool == "write" and not st:
-            _turn.setdefault("created", set()).add(rel)
+            _turn.setdefault("created", set()).add(changed)
     except Exception as e:
         _report.setdefault("actions", []).append({"tool": tool, "path": rel, "ok": False, "error": str(e)})
         raise
@@ -526,19 +529,17 @@ def undo(*paths):
     tree = str(_state.get("snapshot") or "").split(" ")[0]
     if not tree:
         raise ValueError("undo() needs the snapshot low takes when a turn begins, and it takes none outside a git repository")
-    # edit() and write() go through a symlink under the link's name, and the snapshot holds the link as the path it
-    # points to: put back through the link, that path would replace the file. So each path, and each that write()
-    # created, counts where it really is, whatever name the turn (or low's log, after a restart) has for it.
+    # A path given may name a symlink, and the snapshot holds a link as the path it points to: put back through the
+    # link, that path would replace the file. So it counts where it really is, as edit() and write() record changes.
     real = lambda path: os.path.relpath(os.path.realpath(os.path.join(ROOT, path)), ROOT)  # noqa: E731
-    created = {real(path) for path in _turn.get("created", ())}
-    paths = paths or sorted(_turn.get("touched", ()))
+    paths = [real(path) for path in paths] or sorted(_turn.get("touched", ()))
     if not paths:
         _say("[undo: edit() and write() changed nothing this turn]")
-    for rel in dict.fromkeys(map(real, paths)):
+    for rel in dict.fromkeys(paths):
         p = _Popen(["git", "cat-file", "blob", f"{tree}:{rel}"], cwd=ROOT, stdout=subprocess.PIPE,
                    stderr=subprocess.DEVNULL)
         blob = p.communicate()[0]
-        if p.returncode and rel not in created:
+        if p.returncode and rel not in _turn.get("created", ()):
             raise ValueError(f"{rel} was not in the snapshot taken when this turn began, and write() did not create it")
         if p.returncode and not os.path.lexists(os.path.join(ROOT, rel)):
             continue  # created by write() and removed already

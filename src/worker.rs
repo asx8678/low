@@ -929,8 +929,8 @@ mod tests {
             reply["out"].as_str().is_some_and(|out| out.contains("takes none outside a git repository")),
             "{reply}"
         );
-        // Through a link to a file or a folder, edit() and write() change what it points to, and undo() puts that back,
-        // not the link's own path, in this worker or one that restarted with low's log naming the links.
+        // Through a link to a file or a folder, edit() and write() change what it points to and log that file, as git
+        // lists it; undo() puts it back, not the link's own path, given the links' names or after a restart.
         std::fs::create_dir_all(dir.join("pkg")).unwrap();
         std::fs::write(dir.join("pkg/m.py"), "m = 1\n").unwrap();
         std::os::unix::fs::symlink("b.py", dir.join("link.py")).unwrap();
@@ -941,7 +941,7 @@ mod tests {
             "edit('link.py', 'x = 1', 'x = 9')\nedit('lib/m.py', 'm = 1', 'm = 2')\nwrite('lib/n.py', 'n = 1\\n')";
         let (edited, undone) = (
             "edit link.py: ok\nedit lib/m.py: ok\nwrite lib/n.py: ok\n",
-            "undo pkg/m.py: ok\nundo pkg/n.py: removed\nundo b.py: ok\n",
+            "undo b.py: ok\nundo pkg/m.py: ok\nundo pkg/n.py: removed\n",
         );
         let restored = || {
             let b = std::fs::read_to_string(dir.join("b.py")).unwrap();
@@ -950,15 +950,18 @@ mod tests {
             b.contains("x = 1") && link.as_os_str() == "b.py" && m == "m = 1\n" && !dir.join("pkg/n.py").exists()
         };
         let state = json!({"turn": 9, "snapshot": tree});
-        assert_eq!(run_with(&mut worker, linked, &state).await["out"], edited);
-        assert_eq!(run_with(&mut worker, "undo()", &state).await["out"], undone);
+        let reply = run_with(&mut worker, linked, &state).await;
+        let paths: Vec<&str> = reply["actions"].as_array().unwrap().iter().filter_map(|a| a["path"].as_str()).collect();
+        assert_eq!((reply["out"].as_str().unwrap(), paths), (edited, vec!["b.py", "pkg/m.py", "pkg/n.py"]));
+        let reply = run_with(&mut worker, "undo('link.py', 'lib/m.py', 'lib/n.py', 'b.py')", &state).await;
+        assert_eq!(reply["out"], undone);
         assert!(restored());
         let state = json!({"turn": 10, "snapshot": tree});
         assert_eq!(run_with(&mut worker, linked, &state).await["out"], edited);
         drop(worker);
         let mut worker = super::Worker::start(&dir, true, Some("true"), None).unwrap();
-        let logged = json!({"turn": 10, "snapshot": tree, "touched": ["lib/m.py", "lib/n.py", "link.py"],
-                            "created": ["lib/n.py"]});
+        let logged = json!({"turn": 10, "snapshot": tree, "touched": ["b.py", "pkg/m.py", "pkg/n.py"],
+                            "created": ["pkg/n.py"]});
         assert_eq!(run_with(&mut worker, "undo()", &logged).await["out"], undone);
         assert!(restored());
         drop(worker);
