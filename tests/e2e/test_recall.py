@@ -1,6 +1,6 @@
 """recall(n) after a compaction: the summary says the entries it replaced open with recall(n), and recall() prints one
 as it was, from the session log the sandbox hides: the run's code, its result and the reasoning behind it. Entries the
-context still holds, and ones that don't exist, are refused."""
+context still holds, and ones that don't exist (a negative too), are refused."""
 import re
 from harness import Env, check, done
 
@@ -20,6 +20,7 @@ for n in range(1, 400):
 print("found", found, "refused", refused)
 print(first)
 recall(100000)
+recall(-1)
 '''
 tasks = [('task01 alpha', 'print("TOKEN-ALPHA")\nprint("' + FILLER + '")')]
 tasks += [(f'task{k:02} step', f'print("{k}")\nprint("{FILLER}")') for k in range(2, 9)]
@@ -41,6 +42,7 @@ check('it prints the run whole, numbered as show() numbers lines: code, result, 
       re.search(whole, out, re.S) and out.splitlines()[1].startswith('[#'), out)
 check('what the context still holds is refused, and so is an entry that does not exist',
       'refused 0' not in out and '[#100000: no such entry' in out, out[-400:])
+check('a negative entry is refused too, not taken for a check() request', '[#-1: no such entry' in out, out[-400:])
 reads = next(x['meta'].get('reads') for x in reversed(e.log()) if x.get('role') == 'tool')
 check('the run lists what it recalled by #n, not a temporary file',
       reads and all(r.startswith('#') for r in reads), reads)

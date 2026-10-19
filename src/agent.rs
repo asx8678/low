@@ -1222,9 +1222,10 @@ impl Agent {
                     reply = self.worker()?.resume(true, &out).await?;
                     continue;
                 }
-                // The sandbox hides the session log, so low reads the entry the run asks for.
-                if let Some(n) = reply["recall"].as_u64() {
-                    let n = usize::try_from(n).unwrap_or(usize::MAX);
+                // The sandbox hides the session log, so low reads the entry the run asks for. A number that names no
+                // entry, such as -1, is refused as #0 is, never taken for a check() request.
+                if !reply["recall"].is_null() {
+                    let n = reply["recall"].as_u64().and_then(|n| usize::try_from(n).ok()).unwrap_or(0);
                     let (ok, out) = match crate::compact::recall(&self.session.entries, self.session.keep(), n) {
                         Ok(text) => (true, text),
                         Err(why) => (false, why),
