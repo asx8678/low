@@ -2,7 +2,7 @@ use crate::git::{changes, git, guard_git, snapshot};
 use crate::llm::{self, Llm};
 use crate::providers::Providers;
 use crate::redact::redact;
-use crate::session::Session;
+use crate::session::{Session, prompt_tokens};
 use crate::worker::{self, Worker};
 use crate::{Config, compact, ui};
 use anyhow::{Context, Result};
@@ -49,6 +49,34 @@ const STRAY_END: &str = "Delete the ones that are scratch output from running co
 const PLANTED: &str = "This turn made a git repository inside the tree:";
 const PLANTED_END: &str = "The user's git would run hooks and config from there, outside the sandbox. Delete it if it is \
                            scratch, or say in your final message why it belongs, then finish again.";
+/// A second look's instructions, after the turn's own system prompt, which the provider still has cached. The e2e mock
+/// (tests/e2e/mock.py) tells a second look's requests by its opening words.
+const LOOK: &str = "You are taking a second look at a turn low just finished: another conversation did the task below, \
+                    and you check its final report against the code. You get the task, its criteria, what its runs \
+                    edited and ran, its diff and its report, not that conversation. Nothing here changes files: edit() \
+                    and write() refuse, the repository is read-only, and check(), search() and fetch() are off.\n\n\
+                    Pick the 3 to 5 claims in the report that matter most and are likeliest to be wrong: what the change \
+                    does, a case it handles, something it leaves unchanged, a command said to pass. Check each by \
+                    reading the code with show(), open(), re and sh(\"git grep ...\"), in as few runs as you can; don't \
+                    build, test or run the project.\n\n\
+                    Then end with finish(), which is always taken here, and one line per claim:\n\
+                    held: <claim> — <file:line that shows it>\n\
+                    contradicted: <claim> — <file:line, and what is there instead>\n\
+                    uncertain: <claim> — <why reading can't settle it>\n\
+                    Call a claim contradicted only when the code shows it false. A command said to pass holds when it \
+                    passed in a run later than the last edit to what it runs, and is uncertain otherwise.";
+/// The requests one second look may make before it settles nothing.
+const LOOK_REQUESTS: usize = 6;
+/// The diff a second look gets; it reads the files for the rest.
+const LOOK_DIFF: usize = 24 * 1024;
+/// The turn's runs a second look is told about: the last ones.
+const LOOK_RUNS: usize = 30;
+/// What a second look's check(), search() and fetch() get.
+const LOOK_OFF: &str = "not available in a second look: read the code instead";
+const REFUTED: &str = "A second look at your report, by a reader that had only the task, the criteria, the diff and the \
+                       report, found claims the code contradicts:";
+const REFUTED_END: &str = "Fix the code or correct the report, then finish again. If the reader is wrong, say why in one \
+                           line.";
 /// DeepSeek's own tool-call markup, which leaks into a run()'s code at times: what follows it is no Python.
 const MARKUP: &[&str] = &["<｜end▁of▁thinking｜>", "｜DSML｜"];
 const HELPERS: &[&str] =
@@ -121,6 +149,8 @@ pub struct Agent {
     last: Option<Outcome>,
     /// The question an ask() ended the turn with, for its report.
     question: Option<String>,
+    /// What the turn's second look made of its report's claims, for its report.
+    claims: Option<Claims>,
     /// A file low itself rewrites between turns (a --tasks checklist), relative to the root: not news to the model.
     quiet: Option<String>,
     /// The limit that stopped the current turn, for its result: a --tasks run continues such a task.
@@ -192,6 +222,7 @@ impl Agent {
             repo,
             last: None,
             question: None,
+            claims: None,
             quiet: None,
             limit: None,
         };
@@ -426,7 +457,7 @@ impl Agent {
     }
 
     async fn turn(&mut self, task: &str) -> Result<bool> {
-        (self.pending, self.restarts, self.broken, self.passed) = (None, 0, None, None);
+        (self.pending, self.restarts, self.broken, self.passed, self.claims) = (None, 0, None, None, None);
         self.session.flush()?;
         let clock = Instant::now();
         let why = "low's change detection (a private git index, not your staging area) could not snapshot the tree";
@@ -682,7 +713,131 @@ impl Agent {
             }
             checked = ok;
         }
+        // Nothing has run the report's claims, so a second look reads the code for them. What it finds contradicted goes
+        // back to the model once, and the answer gets a second look of its own.
+        if changed && !checked && !state.stalled {
+            self.claims = self.look(state, start, began).await?;
+            let refuted = self.claims.as_ref().filter(|c| !c.contradicted.is_empty() && !state.refuted);
+            if let Some(lines) = refuted.map(|c| c.contradicted.iter().map(|c| format!("- {c}")).collect::<Vec<_>>()) {
+                (state.refuted, state.stalled) = (true, false);
+                let text = "the second look found claims the code contradicts: asking the model about them";
+                ui::event("nudge", text, Value::Null);
+                self.host(format!("{REFUTED}\n{}\n{REFUTED_END}", lines.join("\n")))?;
+                return Ok(None);
+            }
+        }
         Ok(Some((changed, checked)))
+    }
+
+    /// A second look at the report of a turn that changed files with no check passing. The same model, in a conversation
+    /// of its own that starts with the turn's system prompt and the brief but has none of the turn's messages, checks
+    /// the report's riskiest claims by reading the code in a worker that can't change files. Its requests are logged as
+    /// aside events: the turn's cost and /cost count them, the turn's conversation never sees them. None when it settled
+    /// nothing: no report, an error, or no verdict within LOOK_REQUESTS.
+    async fn look(&mut self, state: &mut TurnState, start: &str, began: usize) -> Result<Option<Claims>> {
+        let turn = &self.session.entries[began..];
+        let report = turn.iter().rev().find(|e| e["role"] == "assistant").and_then(|e| e["content"].as_str());
+        let Some(report) = report.filter(|r| !r.trim().is_empty()).map(String::from) else { return Ok(None) };
+        let brief = self.brief(start, began, &report).await;
+        ui::show(
+            "second look: checking the report's claims against the code, in a conversation that can't change files",
+        );
+        let mut messages = vec![
+            json!({"role": "system", "content": self.session.header()["system"]}),
+            json!({"role": "user", "content": format!("{LOOK}\n\n{brief}")}),
+        ];
+        let mut worker = None;
+        for n in 1..=LOOK_REQUESTS {
+            let mut message = match self.llm.complete(messages.clone(), &tools()).await {
+                Ok(message) => message,
+                Err(e) => {
+                    let text = format!("second look: stopped by an error, so it settled nothing: {}", error_text(&e));
+                    ui::event("claims", &text, Value::Null);
+                    return Ok(None);
+                }
+            };
+            state.spent += weighted(&message["meta"]);
+            ui::usage(&message["meta"]["usage"]);
+            messages.push(compact::wire(&message));
+            let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
+            let mut verdict = calls.is_empty().then(|| message["content"].as_str().unwrap_or_default().to_string());
+            let mut runs = vec![];
+            for call in &calls {
+                let args = call["function"]["arguments"].as_str().unwrap_or_default();
+                let args: Value = serde_json::from_str(args).unwrap_or_default();
+                let (out, meta) = match args["code"].as_str() {
+                    Some(code) => look_run(&mut worker, &self.root, self.yolo, code).await,
+                    None => ("error: the only tool is run(code)".into(), json!({"error": true})),
+                };
+                verdict = meta["finish"].as_str().map(String::from).or(verdict);
+                runs.push(json!({"code": args["code"], "out": out}));
+                messages.push(json!({"role": "tool", "tool_call_id": call["id"], "content": out}));
+            }
+            // Logged without a role, so the turn's conversation never carries it.
+            if let Some(fields) = message.as_object_mut() {
+                fields.remove("role");
+            }
+            (message["meta"]["aside"], message["runs"]) = (true.into(), runs.into());
+            ui::record("aside", &format!("second look, request {n}"), message);
+            if let Some(verdict) = verdict {
+                let claims = Claims::of(&verdict);
+                let text =
+                    claims.as_ref().map_or("its answer named no claims, so it settled nothing".into(), Claims::summary);
+                ui::event("claims", &format!("second look: {text}"), json!({"claims": claims}));
+                return Ok(claims);
+            }
+        }
+        let text = format!("second look: no verdict in {LOOK_REQUESTS} requests, so it settled nothing");
+        ui::event("claims", &text, Value::Null);
+        Ok(None)
+    }
+
+    /// What a second look gets: the task with the user's steers, the criteria, what each of the turn's runs edited and
+    /// ran, the diff of the turn's own files (redacted, at most LOOK_DIFF bytes; outside git, their names) and the report.
+    async fn brief(&self, start: &str, began: usize, report: &str) -> String {
+        let turn = &self.session.entries[began..];
+        let text = |e: &Value| e["content"].as_str().unwrap_or_default().to_string();
+        let mut task = text(&turn[0]);
+        for steer in turn.iter().filter(|e| e["meta"]["steer"] == true) {
+            task += &format!("\n\n[Steered by the user]\n{}", text(steer));
+        }
+        let criteria = self.session.state().accepted.unwrap_or_else(|| "none set".into());
+        let runs = turn.iter().filter(|e| e["role"] == "tool").enumerate();
+        let runs: Vec<String> =
+            runs.filter_map(|(n, e)| Some(format!("run {}: {}", n + 1, did(&e["meta"])?))).collect();
+        let runs = if runs.is_empty() { "-".into() } else { runs[runs.len().saturating_sub(LOOK_RUNS)..].join("\n") };
+        let diff = match self.patch(start, began).await {
+            Ok(diff) if diff.len() > LOOK_DIFF => {
+                let (kb, cut) = (diff.len().div_ceil(1024), diff.floor_char_boundary(LOOK_DIFF));
+                format!("{}\n[cut at {} KB of {kb} KB: read the files for the rest]", &diff[..cut], LOOK_DIFF / 1024)
+            }
+            Ok(diff) if !diff.trim().is_empty() => diff,
+            _ => format!("[no diff to show: read these files]\n{}", own_changes(turn)),
+        };
+        format!(
+            "## Task\n{task}\n\n## Criteria\n{criteria}\n\n## What the turn's runs did\n\
+                 (In each run: its edits, then its shell commands, then its check()s; the order within a run is not \
+                 recorded.)\n{runs}\n\n## Diff\n{diff}\n\n\
+                 ## Report\n{report}"
+        )
+    }
+
+    /// The turn's own changes as a patch from its snapshot to the tree now, redacted; empty outside git.
+    async fn patch(&self, start: &str, began: usize) -> Result<String> {
+        if !self.repo {
+            return Ok(String::new());
+        }
+        let paths: Vec<String> = self.own_diff(began).await?.1.lines().filter_map(changed_path).collect();
+        let now = self.tree().await?;
+        let (Some(from), Some(to)) = (start.split(' ').next(), now.split(' ').next()) else { return Ok(String::new()) };
+        if paths.is_empty() {
+            return Ok(String::new());
+        }
+        let args = ["--literal-pathspecs", "diff-tree", "-p", "--no-color", "--no-ext-diff", from, to, "--"];
+        let args: Vec<String> = args.into_iter().map(String::from).chain(paths).collect();
+        let root = self.root.clone();
+        let patch = tokio::task::spawn_blocking(move || git(&root, None, &args)).await??;
+        Ok(redact(&patch).0)
     }
 
     /// Tells the model something from low, and waits for its reply.
@@ -817,8 +972,8 @@ impl Agent {
     /// when low knows it: a compaction, a model switch, or a new task.
     fn cache_miss(&self, usage: &Value) {
         let entries = &self.session.entries;
-        let Some(prev) = entries.iter().rposition(|e| e["meta"]["usage"]["prompt_tokens"].is_u64()) else { return };
-        let expected = entries[prev]["meta"]["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+        let Some(prev) = entries.iter().rposition(|e| prompt_tokens(e).is_some()) else { return };
+        let expected = prompt_tokens(&entries[prev]).unwrap_or(0);
         let Some(cached) = ui::cached(usage).filter(|&c| expected >= 1024 && c * 2 < expected) else { return };
         let since = &entries[prev + 1..];
         let cause = if since.iter().any(|e| e["compact"].is_object()) {
@@ -839,11 +994,11 @@ impl Agent {
     fn upcoming(&self) -> u64 {
         let entries = &self.session.entries;
         let compacted = self.session.compaction().map_or(0, |i| i + 1);
-        let counted = (compacted..entries.len()).rev().find(|&i| entries[i]["meta"]["usage"]["prompt_tokens"].is_u64());
-        let Some(i) = counted else { return self.sent() };
+        let counted = (compacted..entries.len()).rev().find_map(|i| Some((i, prompt_tokens(&entries[i])?)));
+        let Some((i, prompt)) = counted else { return self.sent() };
         let added = (i..entries.len()).filter(|&j| entries[j]["role"].is_string());
         let added: u64 = added.map(|j| compact::wire(&entries[j]).to_string().len() as u64).sum();
-        entries[i]["meta"]["usage"]["prompt_tokens"].as_u64().unwrap_or(0) + added / 4
+        prompt + added / 4
     }
 
     fn overflow(&mut self, window: Option<u64>) -> Result<()> {
@@ -1163,6 +1318,7 @@ impl Agent {
         let (mine, outside): (Vec<String>, Vec<String>) = paths.partition(|p| own.contains(&p.as_str()));
         let inputs: Vec<String> = changes.iter().filter_map(|l| changed_path(l)).filter(|p| self.checks(p)).collect();
         let question = self.question.take();
+        let claims = self.claims.take();
         let configured = self.config.check.is_some();
         let (check, verdict) = verdict(changed, checked, configured, !inputs.is_empty(), question.is_some());
         let checked = checked && inputs.is_empty();
@@ -1178,6 +1334,11 @@ impl Agent {
         rows.push(("check", check.into()));
         if !inputs.is_empty() {
             rows.push(("inputs", format!("check inputs changed: {}", inputs.join(", "))));
+        }
+        if let Some(claims) = &claims {
+            let refuted = claims.contradicted.iter().map(|c| format!("contradicted: {c}")).collect::<Vec<_>>();
+            let refuted = if refuted.is_empty() { String::new() } else { format!("\n{}", capped(&refuted, "\n")) };
+            rows.push(("claims", format!("{}, by a second look at the diff{refuted}", claims.summary())));
         }
         rows.push(("changes", if changes.is_empty() { "none".into() } else { capped(&changes, "\n") }));
         if elsewhere > 0 {
@@ -1232,6 +1393,7 @@ impl Agent {
             criteria: state.accepted.clone(),
             plan: state.plan,
             check: check.into(),
+            claims: claims.clone(),
             changes: changes.clone(),
             repos,
             elsewhere,
@@ -1251,6 +1413,7 @@ impl Agent {
             checked,
             stopped,
             check_inputs: inputs,
+            claims,
             outside,
             elsewhere,
             criteria: state.accepted,
@@ -1339,6 +1502,15 @@ impl Agent {
             "{} requests · in {} (cached {}) · out {}",
             t["requests"], tokens["prompt"], tokens["cached"], tokens["out"]
         );
+        let asides: Vec<Value> = self.session.entries.iter().filter(|e| e["meta"]["aside"] == true).cloned().collect();
+        if !asides.is_empty() {
+            let a = crate::stats::totals(&asides);
+            let tokens = &a["tokens"];
+            println!(
+                "of which {} for second looks at claims · in {} (cached {}) · out {}",
+                a["requests"], tokens["prompt"], tokens["cached"], tokens["out"]
+            );
+        }
         println!(
             "{} runs · {} rejected before acting (syntax, unknown name, wrong arguments)",
             t["runs"], t["rejected"]
@@ -1547,6 +1719,8 @@ pub struct TurnReport {
     pub criteria: Option<String>,
     pub plan: Value,
     pub check: String,
+    /// What a second look made of the report's claims, in a turn that changed files with no check passing.
+    pub claims: Option<Claims>,
     pub changes: Vec<String>,
     /// Git repositories the turn made inside the tree, which git would run code from outside the sandbox.
     pub repos: Vec<String>,
@@ -1578,6 +1752,7 @@ pub struct Report {
     pub checked: bool,
     pub stopped: bool,
     pub check_inputs: Vec<String>,
+    pub claims: Option<Claims>,
     pub outside: Vec<String>,
     pub elsewhere: usize,
     pub criteria: Option<String>,
@@ -1596,6 +1771,48 @@ impl Report {
     /// The report a session log entry holds, if it is a report line.
     pub fn of(entry: &Value) -> Option<Self> {
         Self::deserialize(entry.get("report")?).ok()
+    }
+}
+
+/// What a second look made of a report's claims: the line it gave each claim it checked, by verdict.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Claims {
+    pub held: Vec<String>,
+    pub contradicted: Vec<String>,
+    pub uncertain: Vec<String>,
+}
+
+impl Claims {
+    /// The verdict lines in a second look's answer (`held: …`, `contradicted: …`, `uncertain: …`, bulleted, numbered or
+    /// bold), or None when it has none.
+    fn of(answer: &str) -> Option<Self> {
+        let mut claims = Self::default();
+        for line in answer.lines() {
+            let line =
+                line.trim_start_matches(|c: char| c.is_whitespace() || c.is_ascii_digit() || "-*•.)`".contains(c));
+            let Some((verdict, claim)) = line.split_once(':') else { continue };
+            let claim = claim.trim_start_matches(['*', ' ']).trim().to_string();
+            if claim.is_empty() {
+                continue;
+            }
+            match verdict.trim_end_matches(['*', '`']).trim().to_lowercase().as_str() {
+                "held" | "holds" => claims.held.push(claim),
+                "contradicted" | "contradicts" => claims.contradicted.push(claim),
+                "uncertain" => claims.uncertain.push(claim),
+                _ => {}
+            }
+        }
+        let any = !claims.held.is_empty() || !claims.contradicted.is_empty() || !claims.uncertain.is_empty();
+        any.then_some(claims)
+    }
+
+    /// How many claims held, were contradicted or stayed uncertain, leaving out the verdicts no claim got.
+    fn summary(&self) -> String {
+        let counts =
+            [(self.held.len(), "held"), (self.contradicted.len(), "contradicted"), (self.uncertain.len(), "uncertain")];
+        let counts: Vec<String> =
+            counts.iter().filter(|(n, _)| *n > 0).map(|(n, verdict)| format!("{n} {verdict}")).collect();
+        counts.join(", ")
     }
 }
 
@@ -1639,6 +1856,8 @@ struct TurnState {
     strayed: bool,
     /// The model was asked about a git repository it made inside the tree.
     planted: bool,
+    /// The model was asked about claims a second look found the code contradicts.
+    refuted: bool,
     /// The turn went on with the profile's fallback provider.
     failed_over: bool,
     /// Tokens spent, cached input counting a quarter.
@@ -1822,6 +2041,60 @@ fn stale(meta: &Value) -> bool {
     after.iter().any(|a| a["ok"] == true && a["path"].is_string()) || cmds > ran as usize
 }
 
+/// What one of a turn's runs did, for a second look: its edits and writes, its shell commands with their exit status,
+/// and its check()s. None for a run that did none of these.
+fn did(meta: &Value) -> Option<String> {
+    let actions = meta["actions"].as_array().map_or(&[][..], Vec::as_slice);
+    let mut did: Vec<String> = actions
+        .iter()
+        .filter_map(|a| {
+            let failed = if a["ok"] == true { "" } else { " (failed)" };
+            Some(format!("{} {}{failed}", a["tool"].as_str()?, a["path"].as_str()?))
+        })
+        .collect();
+    for cmd in meta["cmds"].as_array().into_iter().flatten() {
+        let line: String = ui::printable(cmd[0].as_str().unwrap_or_default()).trim().chars().take(200).collect();
+        did.push(format!("$ {line} → exit {}", cmd[1]));
+    }
+    for check in actions.iter().filter(|a| a["tool"] == "check") {
+        did.push(format!("check() {}", if check["ok"] == true { "passed" } else { "failed" }));
+    }
+    (!did.is_empty()).then(|| did.join(" · "))
+}
+
+/// Runs a second look's code in its read-only worker, started on first use, and shows it as any run is shown. Its
+/// check(), search() and fetch() are turned down.
+async fn look_run(worker: &mut Option<Worker>, root: &Path, yolo: bool, code: &str) -> (String, Value) {
+    ui::run(code);
+    let clock = Instant::now();
+    let ran = async {
+        let started = match worker.take() {
+            Some(started) => started,
+            None => Worker::reader(root, yolo)?,
+        };
+        let worker = worker.insert(started);
+        let mut reply = worker.run(code, &json!({})).await?;
+        while reply["needs_check"] == true {
+            reply = worker.resume(false, LOOK_OFF).await?;
+        }
+        anyhow::Ok(reply)
+    };
+    match ran.await {
+        Ok(reply) => {
+            let (out, mut meta) = finish(reply);
+            meta["ms"] = ui::ms(clock).into();
+            ui::ran(&meta, &out);
+            (out, meta)
+        }
+        Err(e) => {
+            *worker = None;
+            let out = format!("error: {e:#}; the worker was restarted and its variables are gone");
+            ui::show(&out);
+            (out, json!({"error": true}))
+        }
+    }
+}
+
 fn finish(mut meta: Value) -> (String, Value) {
     let (out, mut hidden) = redact(meta["out"].as_str().unwrap_or_default());
     if let Some(fields) = meta.as_object_mut() {
@@ -1982,6 +2255,30 @@ mod tests {
         for host in super::OPEN {
             assert!(super::WEB.contains(host), "{host} is open but the prompt doesn't name it");
         }
+    }
+
+    /// A second look's verdict lines count however they are marked up, and lines that name no verdict, or no claim,
+    /// don't.
+    #[test]
+    fn claims_of_a_second_look() {
+        let answer = "Checked 3 claims.\n- held: add() adds — calc.py:2\n**Contradicted**: sub() is unchanged — calc.py:5 \
+                      adds now\n2. uncertain: `cargo test` passes — no run after the last edit\nheld:\nnote: none";
+        let claims = super::Claims::of(answer).unwrap();
+        assert_eq!(claims.held, ["add() adds — calc.py:2"]);
+        assert_eq!(claims.contradicted, ["sub() is unchanged — calc.py:5 adds now"]);
+        assert_eq!(claims.uncertain, ["`cargo test` passes — no run after the last edit"]);
+        assert_eq!(claims.summary(), "1 held, 1 contradicted, 1 uncertain");
+        assert!(super::Claims::of("All good: the change is right.").is_none());
+        let held = super::Claims::of("**held:** it builds — Cargo.toml:3").unwrap();
+        assert_eq!((held.summary(), held.held), ("1 held".to_string(), vec!["it builds — Cargo.toml:3".to_string()]));
+    }
+
+    /// The e2e mock tells a second look's requests by LOOK's opening words.
+    #[test]
+    fn mock_knows_a_second_look() {
+        let mock = include_str!("../tests/e2e/mock.py");
+        let words = mock.split("\nLOOK = '").nth(1).and_then(|rest| rest.split('\'').next()).unwrap_or_default();
+        assert!(!words.is_empty() && super::LOOK.starts_with(words), "mock.py's LOOK is {words:?}");
     }
 
     /// Any https URL on an OPEN host is fetchable; one on another host, with credentials or a port, or not https is not.

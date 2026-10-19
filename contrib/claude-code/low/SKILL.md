@@ -32,6 +32,8 @@ stdout is a single JSON object (stderr has a `[session …]` line):
 | 4 | question | low needs an answer; `question` has it | answer it as the next task (below) |
 | 5 | stopped | interrupted or a limit hit | resume with a narrower task |
 
+`claims` is set when the task changed files with no check passing (NO CHECK, or UNVERIFIED with the check still failing): a second look by the same model, which saw only the task, criteria, diff and report and read the code without changing it, lists the claims it checked as `held`, `contradicted` and `uncertain`, one line each with its file:line evidence. Otherwise it is `null`. A contradicted claim was put to low's model once before the task ended, so one left in `claims` is worth checking before you report the task done. `requests` and `tokens` include the second look's.
+
 `changes` marks a file git ignores as `(ignored by git)`: it changed, but the `undo` command can't restore it. `repos` lists git repositories the task made inside the tree, which git would run hooks from outside the sandbox.
 
 A task can outlast the 10-minute limit of a foreground Bash call: run long ones with `run_in_background` and read the JSON when notified. No JSON on stdout means low was killed; the session log still has the turn.

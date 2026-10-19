@@ -64,8 +64,8 @@ class Env:
 
     def low(self, *args, timeout=300, env=None, cwd=None):
         """Run low in the repo, or in `cwd`. Returns its exit code, output, the last stdout line parsed as JSON
-        (--json's result) and the requests the mock saw during this run."""
-        before = len(self.entries())
+        (--json's result), the requests the mock saw during this run and, apart, its second looks' requests."""
+        before, looked = len(self.entries()), len(self.asides())
         p = subprocess.run([LOW, *args], cwd=cwd or self.repo, env=self.env(env), capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, timeout=timeout)
         try:
@@ -73,10 +73,19 @@ class Env:
         except (ValueError, IndexError):
             result = {}
         return {'code': p.returncode, 'out': p.stdout, 'err': p.stderr, 'result': result,
-                'requests': [e['body'] for e in self.entries()[before:]]}
+                'requests': [e['body'] for e in self.entries()[before:]],
+                'asides': [e['body'] for e in self.asides()[looked:]]}
 
     def entries(self):
-        """What the mock recorded of every request: i, at, auth, body (parsed) and raw (the bytes sent)."""
+        """What the mock recorded of every request: i, at, auth, body (parsed) and raw (the bytes sent). A second
+        look's requests are in asides() instead."""
+        return [x for x in self._recorded() if not x.get('aside')]
+
+    def asides(self):
+        """What the mock recorded of the requests of low's second looks at a turn's claims."""
+        return [x for x in self._recorded() if x.get('aside')]
+
+    def _recorded(self):
         return [json.loads(l) for l in open(self.record)] if os.path.exists(self.record) else []
 
     def sessions(self):

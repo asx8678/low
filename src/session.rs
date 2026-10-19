@@ -66,7 +66,7 @@ impl Marks {
         if meta["plan"].is_object() {
             self.state.plan = meta["plan"].clone();
         }
-        if entry["role"] == "assistant" {
+        if entry["role"] == "assistant" || meta["aside"] == true {
             self.spent += crate::agent::weighted(meta);
         }
     }
@@ -215,7 +215,7 @@ impl Session {
     /// The prompt size the provider last reported; 0 once a compaction since then has made it stale.
     pub fn last_prompt_tokens(&self) -> u64 {
         let current = self.entries.iter().rev().take_while(|e| e["compact"].is_null());
-        current.map(|e| &e["meta"]["usage"]["prompt_tokens"]).find_map(Value::as_u64).unwrap_or(0)
+        current.filter_map(prompt_tokens).next().unwrap_or(0)
     }
 
     pub fn messages(&self) -> Vec<Value> {
@@ -299,6 +299,12 @@ fn sweep(dir: &Path) {
             let _ = fs::remove_file(index);
         }
     }
+}
+
+/// The prompt size a request of the conversation reported. The second look's requests (meta.aside) are a conversation of
+/// their own, so they count in the totals but not here.
+pub fn prompt_tokens(entry: &Value) -> Option<u64> {
+    entry["meta"]["usage"]["prompt_tokens"].as_u64().filter(|_| entry["meta"]["aside"] != true)
 }
 
 fn stamp(entry: &mut Value, at: u64) {
