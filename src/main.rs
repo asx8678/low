@@ -290,11 +290,19 @@ async fn start() -> Result<()> {
         std::process::exit(result.exit as i32);
     }
     let mut editor = rustyline::DefaultEditor::new()?;
+    ui::steerable();
     loop {
-        let line = match editor.readline("› ") {
-            Ok(line) => line,
-            Err(ReadlineError::Interrupted) => continue,
-            Err(_) => return Ok(()),
+        // What was sent during the last turn and not taken by it runs first; a line half typed starts the prompt.
+        let line = match ui::queued() {
+            Some(line) => {
+                ui::task(&line);
+                line
+            }
+            None => match editor.readline_with_initial("› ", (&ui::typed(), "")) {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted) => continue,
+                Err(_) => return Ok(()),
+            },
         };
         let line = line.trim();
         if let Some(why) = unknown(line) {

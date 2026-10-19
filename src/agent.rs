@@ -55,7 +55,39 @@ const HELPERS: &[&str] =
     &["sh", "show", "accept", "edit", "write", "check", "plan", "done", "finish", "ask", "search", "fetch"];
 /// The helpers that reach the web, in the prompt only when config.toml's search names a provider.
 const WEB: &str = "search(query, count=10) -> list  # web search: [{title, url, summary, date, site_name}]; site:, \"phrase\", \
-                   after:2025 work\nfetch(url) -> str             # a web page as markdown\n";
+                   after:2025 work; query up to 128 chars, count up to 50\nfetch(url) -> str             # a web page \
+                   as markdown; JSON, code and other text files as their text, less some blank lines; a URL a search() \
+                   returned or the task gives, or any URL on \
+                   registry.npmjs.org, pypi.org, crates.io, docs.rs, api.github.com, raw.githubusercontent.com, \
+                   cdn.jsdelivr.net, data.jsdelivr.com, unpkg.com, cdnjs.cloudflare.com, doc.rust-lang.org, \
+                   docs.python.org, developer.mozilla.org\nsearch([query, ...]), fetch([url, ...]) -> list  # up to \
+                   50 at once, 10 at a time: the answers in order, a RuntimeError in place of each that failed\n";
+/// How many requests in a run's list of searches or fetches go out at once: DeepSeek takes fetches at 25 a second.
+const WEB_AT_ONCE: usize = 10;
+/// The most requests one list may hold.
+const WEB_LIST: usize = 50;
+/// Hosts where fetch() takes any URL, not only one a search() returned: package registries, CDNs and docs that show no
+/// one the URLs asked of them, so a URL a run made up there can't carry what it read to someone who would see it. The
+/// nearest thing is jsDelivr's public hit counts per file, which tell a package's author which of its files was fetched.
+/// Not github.com, whose traffic insights show a repository's owner the paths visited; api.github.com serves the same.
+const OPEN: &[&str] = &[
+    "registry.npmjs.org",
+    "pypi.org",
+    "crates.io",
+    "docs.rs",
+    "api.github.com",
+    "raw.githubusercontent.com",
+    "cdn.jsdelivr.net",
+    "data.jsdelivr.com",
+    "unpkg.com",
+    "cdnjs.cloudflare.com",
+    "doc.rust-lang.org",
+    "docs.python.org",
+    "developer.mozilla.org",
+];
+const REGISTRIES: &str = " Package managers can't reach their registries; fetch() reads them: \
+                          json.loads(fetch(\"https://registry.npmjs.org/three/latest\"))[\"version\"] is three's latest \
+                          version.";
 const SANDBOX: &str = "\n\n## Sandbox\nYour code runs in a sandbox. Writes outside the repo and temp dirs fail, as do \
                        writes into any .git directory and reads of credentials and private data in the home directory \
                        (ssh and cloud keys, shell history, browser data, other tools' configs). Only a fixed set of \
@@ -328,7 +360,7 @@ impl Agent {
 
     pub async fn run(&mut self, task: &str) -> Result<bool> {
         self.last = None;
-        let _bar = ui::Turn::start();
+        let bar = ui::Turn::start();
         let finished = tokio::select! {
             biased;
             _ = tokio::signal::ctrl_c() => None,
@@ -376,8 +408,10 @@ impl Agent {
             }
         }
         ui::event("ctrl_c", "interrupted", Value::Null);
-        self.unfinished(false).await?;
-        Ok(false)
+        let unfinished = self.unfinished(false).await;
+        drop(bar);
+        ui::unsend();
+        unfinished.map(|()| false)
     }
 
     /// Ends a turn that an error or a Ctrl-C cut short with its report. An error before the first request gets none: no
@@ -434,6 +468,12 @@ impl Agent {
                 let spent = ui::tokens(self.spent());
                 limit = format!("stopped: the session has spent {spent} (session_budget {total} × compact_at; {rule})");
                 break;
+            }
+            // What the user sent from the REPL during the turn goes in between requests, where every run has its result.
+            if let Some(steer) = ui::steers() {
+                ui::steered(&steer);
+                state.repeats = 0;
+                self.session.push(json!({"role": "user", "content": steer, "meta": {"steer": true}}))?;
             }
             // Twice what the last compaction left, too: a compact_at that the summary and the kept tail fill on their
             // own would compact before every task, each time a cache miss.
@@ -785,7 +825,7 @@ impl Agent {
             "compaction"
         } else if since.iter().any(|e| e["switch"].is_object()) {
             "model switch"
-        } else if since.iter().any(|e| e["role"] == "user" && e["meta"]["host"].is_null()) {
+        } else if since.iter().any(compact::task) {
             "new task"
         } else {
             "unexplained"
@@ -879,9 +919,9 @@ impl Agent {
         let ran = async {
             let mut reply = self.worker()?.run(code, &state).await?;
             while reply["needs_check"] == true {
-                if reply["web"].is_object() {
-                    let (ok, out) = self.web(&reply["web"]).await;
-                    reply = self.worker()?.resume(ok, &out).await?;
+                if let Some(requests) = reply["web"].as_array().cloned() {
+                    let out = self.web(&requests).await;
+                    reply = self.worker()?.resume(true, &out).await?;
                     continue;
                 }
                 if stale(&reply) {
@@ -919,15 +959,65 @@ impl Agent {
         }
     }
 
-    /// A search() or fetch() from a run, made here since the sandbox has no network: DeepSeek's tools API, with the
-    /// provider that config.toml's search names. The request leaves the machine, so low refuses one whose argument holds
-    /// what looks like a secret, and fetch() only takes a URL that a search() returned or the user wrote: one the run made
-    /// up could carry what it read.
-    async fn web(&mut self, request: &Value) -> (bool, String) {
+    /// A run's search() and fetch() requests, made here since the sandbox has no network: DeepSeek's tools API, with the
+    /// provider that config.toml's search names, WEB_AT_ONCE at a time. The answer is each request's [ok, response or
+    /// why it failed], in the order asked.
+    async fn web(&mut self, requests: &[Value]) -> String {
         let provider = self.config.search.as_ref().and_then(|name| self.config.providers.get(name));
         let Some((base, key)) = provider.map(|p| (p.base_url.clone(), p.api_key.clone())) else {
-            return (false, "web search is not set up: config.toml's search names no provider".into());
+            let off = (false, "web search is not set up: config.toml's search names no provider");
+            return json!(vec![off; requests.len()]).to_string();
         };
+        let _busy = ui::busy(&match requests {
+            [one] => format!("{} on the web", if one["fetch"].is_string() { "fetching" } else { "searching" }),
+            many => format!("{} web requests at once", many.len()),
+        });
+        // A search() earlier in this run is still queued for the log, where fetchable() looks.
+        let _ = self.session.flush();
+        let mut answers = vec![(false, "the request did not finish".to_string()); requests.len()];
+        let mut asked = vec![];
+        for (i, request) in requests.iter().enumerate() {
+            match self.web_request(request, i) {
+                Ok(call) => asked.push((i, call)),
+                Err(refused) => answers[i].1 = refused,
+            }
+        }
+        let (mut asked, mut running) = (asked.into_iter(), tokio::task::JoinSet::new());
+        loop {
+            while running.len() < WEB_AT_ONCE
+                && let Some((i, (tool, body, what))) = asked.next()
+            {
+                let (base, key) = (base.clone(), key.clone());
+                let call = async move { (i, tool, llm::tool(&base, key.as_deref(), tool, &body).await, body, what) };
+                running.spawn(call);
+            }
+            let Some(done) = running.join_next().await else { break };
+            let Ok((i, tool, result, body, what)) = done else { continue };
+            let (ok, out) = match result {
+                Ok(text) => (true, text),
+                Err(e) => (false, format!("{tool} failed: {e:#}")),
+            };
+            // The results' URLs are what a later fetch() may get, in this run or after a resume.
+            let found = serde_json::from_str::<Value>(&out).ok().filter(|_| ok && tool == "search");
+            let urls: Vec<&str> = found
+                .iter()
+                .flat_map(|f| f["results"].as_array().into_iter().flatten())
+                .filter_map(|r| r["url"].as_str())
+                .collect();
+            ui::record("web", &what, json!({"request": body, "ok": ok, "bytes": out.len(), "urls": urls}));
+            answers[i] = (ok, out);
+        }
+        json!(answers).to_string()
+    }
+
+    /// The tools API call a run's request makes, as (tool, body, what the log says), or why low refuses it. The request
+    /// would leave the machine, so low refuses one whose argument holds what looks like a secret, and fetch() only takes
+    /// a URL that a search() returned, that the user wrote, or on an OPEN host: one the run made up for any other host
+    /// could carry what it read to a server whose owner reads it. `i` is its place in the run's list.
+    fn web_request(&self, request: &Value, i: usize) -> Result<(&'static str, Value, String), String> {
+        if i >= WEB_LIST {
+            return Err(format!("only {WEB_LIST} requests go in one list"));
+        }
         let (tool, body, what) = match request["fetch"].as_str() {
             Some(url) => ("fetch", json!({"url": url}), format!("fetch {url}")),
             None => (
@@ -939,35 +1029,25 @@ impl Agent {
         let (what, hidden) = redact(&what);
         if hidden > 0 {
             ui::record("web", &what, json!({"ok": false, "refused": "secret"}));
-            return (false, format!("{tool}() refused: its argument holds what looks like a secret"));
+            return Err(format!("{tool}() refused: its argument holds what looks like a secret"));
         }
-        if let Some(url) = request["fetch"].as_str() {
-            // A search() earlier in this run is still queued for the log.
-            let _ = self.session.flush();
-            if !self.fetchable(url) {
-                ui::record("web", &what, json!({"ok": false, "refused": "url"}));
-                let why = "fetch() takes a URL that a search() in this session returned or that the task gives";
-                return (false, format!("{why}; search() for the page first"));
-            }
+        if let Some(url) = request["fetch"].as_str()
+            && !self.fetchable(url)
+        {
+            ui::record("web", &what, json!({"ok": false, "refused": "url"}));
+            let why = "fetch() takes a URL that a search() in this session returned, that the task gives, or on";
+            let next = "a URL you build for another host stays refused: fetch one from search()'s results";
+            return Err(format!("{why} {}; {next}", OPEN.join(", ")));
         }
-        let result = llm::tool(&base, key.as_deref(), tool, &body).await;
-        let (ok, out) = match result {
-            Ok(text) => (true, text),
-            Err(e) => (false, format!("{tool} failed: {e:#}")),
-        };
-        // The results' URLs are what a later fetch() may get, in this run or after a resume.
-        let found = serde_json::from_str::<Value>(&out).ok().filter(|_| ok && tool == "search");
-        let urls: Vec<&str> = found
-            .iter()
-            .flat_map(|f| f["results"].as_array().into_iter().flatten())
-            .filter_map(|r| r["url"].as_str())
-            .collect();
-        ui::record("web", &what, json!({"request": body, "ok": ok, "bytes": out.len(), "urls": urls}));
-        (ok, out)
+        Ok((tool, body, what))
     }
 
-    /// Whether fetch() may get this URL: a search() in this session returned it, or a task of the user's names it.
+    /// Whether fetch() may get this URL: it is on an OPEN host, a search() in this session returned it, or a task of the
+    /// user's names it.
     fn fetchable(&self, url: &str) -> bool {
+        if open(url) {
+            return true;
+        }
         let url = bare(url);
         self.session.entries.iter().any(|e| {
             let urls = e["urls"].as_array().filter(|_| e["event"] == "web").into_iter().flatten();
@@ -1621,6 +1701,17 @@ fn repos(root: &Path, paths: &[String]) -> Vec<String> {
     found
 }
 
+/// A URL on an OPEN host, over https, with no credentials or port of its own.
+fn open(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.port().is_none()
+            && u.host_str().is_some_and(|host| OPEN.contains(&host))
+    })
+}
+
 /// A URL as fetch() compares it: without its fragment or a trailing slash.
 fn bare(url: &str) -> &str {
     let url = url.split('#').next().unwrap_or(url);
@@ -1772,6 +1863,9 @@ fn system_prompt(root: &Path, yolo: bool, check: Option<&str>, repo: bool, web: 
         prompt += SANDBOX;
         prompt += if cfg!(target_os = "macos") { MACOS } else { LINUX };
         prompt += PERMANENT;
+        if web {
+            prompt += REGISTRIES;
+        }
     }
     if let Some((agents, size)) = repo_text(root, "AGENTS.md", AGENTS_MAX) {
         prompt += "\n\n# Project instructions (AGENTS.md)\n\n";
@@ -1877,4 +1971,35 @@ fn tools() -> Value {
     json!([{"type": "function", "function": {"name": "run",
         "description": "Run Python in the persistent worker; only printed output comes back.",
         "parameters": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}}}])
+}
+
+#[cfg(test)]
+mod tests {
+    /// The prompt names the web helpers in exactly the text WEB removes when search is off, and every OPEN host in it.
+    #[test]
+    fn web_lines_match_the_prompt() {
+        assert_eq!(include_str!("prompt.md").matches(super::WEB).count(), 1);
+        for host in super::OPEN {
+            assert!(super::WEB.contains(host), "{host} is open but the prompt doesn't name it");
+        }
+    }
+
+    /// Any https URL on an OPEN host is fetchable; one on another host, with credentials or a port, or not https is not.
+    #[test]
+    fn open_hosts_only() {
+        assert!(super::open("https://registry.npmjs.org/three/latest"));
+        assert!(super::open("https://API.github.com/repos/mrdoob/three.js/releases/latest"));
+        assert!(super::open("https://cdn.jsdelivr.net:443/npm/three@0.186.1/build/three.module.js"));
+        for url in [
+            "http://registry.npmjs.org/three",
+            "https://registry.npmjs.org.evil.example/three",
+            "https://evil.example/?u=https://registry.npmjs.org/",
+            "https://user:pass@pypi.org/pypi/requests/json",
+            "https://pypi.org:8443/pypi/requests/json",
+            "https://github.com/mrdoob/three.js/releases",
+            "registry.npmjs.org/three",
+        ] {
+            assert!(!super::open(url), "{url}");
+        }
+    }
 }

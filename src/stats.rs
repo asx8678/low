@@ -15,7 +15,7 @@ pub fn totals(entries: &[Value]) -> Value {
         if let Some(report) = crate::agent::Report::of(e) {
             count(&mut verdicts, &report.verdict, 1);
         }
-        count(&mut n, "turns", u64::from(e["role"] == "user" && meta["host"].is_null()));
+        count(&mut n, "turns", u64::from(crate::compact::task(e)));
         count(&mut n, "compactions", u64::from(e["compact"].is_object()));
         if usage.is_object() {
             let out = usage["completion_tokens"].as_u64();

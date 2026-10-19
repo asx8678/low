@@ -12,6 +12,7 @@ OUT_CAP = 64 << 20  # what a run's own printing may put on disk; past it, output
 RUN_CAP = 570
 IGNORABLE = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r(?!\n)")
+ESCAPED = re.compile(r"\\([!-/:-@\[-`{-~])")  # markdown's backslash before ASCII punctuation, as DeepSeek's fetch writes it
 
 _inbox = os.fdopen(os.dup(0), encoding="utf-8")
 _outbox = os.fdopen(os.dup(1), "w", encoding="utf-8")
@@ -448,23 +449,50 @@ def ask(question):
     _report["ask"] = str(question)
 
 
-def _web(request):
-    # The sandbox has no network: the host makes the request and sends back the response, or why it failed.
-    _report.setdefault("web", []).append(request)
-    answer = _host({"needs_check": True, "web": request})
+def _web(requests):
+    # The sandbox has no network: the host makes the requests, several at once, and sends back each one's [ok, response
+    # or why it failed], in order.
+    _report.setdefault("web", []).extend(requests)
+    answer = _host({"needs_check": True, "web": requests})
     if answer.get("ok") is not True:
         raise RuntimeError(answer.get("out") or "the web request failed")
     return json.loads(answer["out"])
 
 
+def _each(arg, request, shape):
+    # One request, or a list of up to 50 made at once: a list gets each answer in its request's place, the RuntimeError
+    # of one that failed included, where one request raises it.
+    many = isinstance(arg, (list, tuple))
+    items = list(arg) if many else [arg]
+    if len(items) > 50:
+        raise ValueError(f"{len(items)} requests in one list; up to 50 go at once, so split it")
+    answers = []
+    for ok, out in _web([request(item) for item in items]) if items else []:
+        try:
+            answers.append(shape(json.loads(out)) if ok else RuntimeError(out or "the web request failed"))
+        except (AttributeError, TypeError, ValueError) as e:
+            answers.append(RuntimeError(f"the tools API sent an answer low can't read: {e}"))
+    if many:
+        return answers
+    if isinstance(answers[0], Exception):
+        raise answers[0]
+    return answers[0]
+
+
 def search(query, count=10):
-    found = _web({"search": str(query), "count": int(count)})
+    count = min(max(int(count), 1), 50)
     keep = ("title", "url", "summary", "date", "site_name")
-    return [{k: r.get(k) for k in keep} for r in found.get("results") or []]
+    return _each(query, lambda q: {"search": str(q), "count": count},
+                 lambda found: [{k: r.get(k) for k in keep} for r in found.get("results") or []])
 
 
 def fetch(url):
-    return _web({"fetch": str(url)}).get("content") or ""
+    # DeepSeek escapes every punctuation mark (\{\"name\"\: ...): undone, a JSON API's body parses and code reads as
+    # written. Only when every backslash is such an escape, so text that came back unescaped stays as it is.
+    def text(found):
+        text = found.get("content") or ""
+        return text if "\\" in ESCAPED.sub("", text) else ESCAPED.sub(r"\1", text)
+    return _each(url, lambda u: {"fetch": str(u)}, text)
 
 
 TOOLS = {"sh": sh, "show": show, "edit": edit, "write": write, "accept": accept, "plan": plan, "done": done, "check": check,

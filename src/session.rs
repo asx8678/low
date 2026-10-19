@@ -33,7 +33,7 @@ struct Marks {
     compact: Option<usize>,
     keep: Option<usize>,
     summary: Option<usize>,
-    /// The newest task: a user message that is not from low.
+    /// The newest task: a user message that is not from low and does not steer a turn.
     task: Option<usize>,
     state: State,
     /// What the replies have spent, weighed as a turn's budget weighs them.
@@ -55,7 +55,7 @@ impl Marks {
         if compact["summary"].is_string() {
             self.summary = Some(i);
         }
-        if i > 0 && entry["role"] == "user" && entry["meta"]["host"].is_null() {
+        if i > 0 && crate::compact::task(entry) {
             self.task = Some(i);
             self.state = State::default();
         }
@@ -202,7 +202,7 @@ impl Session {
         self.marks.compact
     }
 
-    /// The newest task's entry: a user message that is not from low.
+    /// The newest task's entry: a user message that is not from low and does not steer a turn.
     pub fn newest_task(&self) -> Option<usize> {
         self.marks.task
     }
@@ -225,7 +225,8 @@ impl Session {
             let mut content = summary.to_string();
             if let Some(u) = newest.filter(|&u| u < keep && !summary.contains(&crate::compact::baked(u))) {
                 let task = self.entries[u]["content"].as_str().unwrap_or_default();
-                content += &format!("\n\n[Current task, entry #{u}]\n{task}");
+                let steers = crate::compact::steers(&self.entries, u, keep);
+                content += &format!("\n\n[Current task, entry #{u}]\n{task}{steers}");
             }
             out.push(json!({"role": "user", "content": content}));
         }
@@ -244,7 +245,9 @@ impl Session {
             if role == "user"
                 && let Some(prev) = out.last_mut().filter(|m| m["role"] == "user")
             {
-                let label = if entry["meta"]["host"].is_null() {
+                let label = if entry["meta"]["steer"] == true {
+                    format!("[Steered by the user, entry #{i}]\n")
+                } else if entry["meta"]["host"].is_null() {
                     format!("[Next user message, entry #{i}]\n")
                 } else {
                     String::new()
@@ -382,16 +385,23 @@ mod tests {
         assert_eq!((&messages[6]["tool_call_id"], &messages[6]["content"]), (&json!("c"), &json!("ran c")));
         assert_eq!(messages[7]["content"], "tool result missing (interrupted)");
         assert!(messages.iter().all(|m| m.get("meta").is_none()));
-        // A new task drops the last one's criteria and plan.
+        // A new task drops the last one's criteria and plan; a steer keeps them.
         assert_eq!((session.state().accepted, session.newest_task()), (None, Some(7)));
+        session
+            .push(json!({"role": "tool", "tool_call_id": "z", "content": "", "meta": {"accepted": "done"}}))
+            .unwrap();
+        session.push(json!({"role": "user", "content": "use tabs", "meta": {"steer": true}})).unwrap();
+        assert_eq!((session.state().accepted.as_deref(), session.newest_task()), (Some("done"), Some(7)));
         assert_eq!(session.spent(), 3020);
         session.switch("p", "m2", "sys2", Map::new()).unwrap();
-        session.push(json!({"compact": {"keep": 7, "summary": "SUMMARY"}})).unwrap();
-        session.push(json!({"role": "user", "content": "more", "meta": {}})).unwrap();
+        session.push(json!({"compact": {"keep": 10, "summary": "SUMMARY"}})).unwrap();
+        session.push(json!({"role": "user", "content": "more", "meta": {"steer": true}})).unwrap();
         let messages = session.messages();
         assert_eq!((&messages[0]["content"], &messages[1]["role"]), (&json!("sys2"), &json!("user")));
         let joined = messages[1]["content"].as_str().unwrap();
-        assert!(joined.starts_with("SUMMARY") && joined.contains("[Next user message, entry #10]\nmore"), "{joined}");
+        assert!(joined.starts_with("SUMMARY") && joined.contains("[Steered by the user, entry #12]\nmore"), "{joined}");
+        // The task and its steers before the kept tail follow a summary written before them.
+        assert!(joined.contains("[Current task, entry #7]\nsecond task\n\n[Steered by the user, entry #9]\nuse tabs"));
         let live = (messages, session.header().clone(), session.keep(), session.compaction(), session.spent());
         drop(session);
         // A process another test forks meanwhile holds the log's lock until it execs.
@@ -407,7 +417,7 @@ mod tests {
         let resumed =
             (session.messages(), session.header().clone(), session.keep(), session.compaction(), session.spent());
         assert_eq!(live, resumed);
-        assert_eq!((resumed.1["model"].as_str(), resumed.2, resumed.3), (Some("m2"), 7, Some(9)));
+        assert_eq!((resumed.1["model"].as_str(), resumed.2, resumed.3), (Some("m2"), 10, Some(11)));
         drop(session);
         let _ = std::fs::remove_dir_all(&home);
     }

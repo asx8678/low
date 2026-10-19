@@ -1,10 +1,11 @@
+use crate::picker::{self, Key};
 use rustix::process::{Pid, Signal, kill_process_group};
 use rustix::stdio::{stdin, stdout};
-use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
+use rustix::termios::{LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr, tcgetwinsize, tcsetattr};
 use serde_json::Value;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -14,6 +15,8 @@ struct Bar {
     started: Instant,
     activity: String,
     tokens: (u64, u64),
+    /// The row above the bar shows what the user types to steer the turn.
+    steering: bool,
 }
 
 static BAR: Mutex<Option<Bar>> = Mutex::new(None);
@@ -21,9 +24,14 @@ static STEP: AtomicUsize = AtomicUsize::new(0);
 static EVENTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 static TERMIOS: OnceLock<Termios> = OnceLock::new();
 static BARRED: AtomicBool = AtomicBool::new(false);
+/// The steering row is up above the bar.
+static STEERING: AtomicBool = AtomicBool::new(false);
 /// /models' picker is up, with the cursor hidden.
 static PICKING: AtomicBool = AtomicBool::new(false);
 pub static CHECK: AtomicI32 = AtomicI32::new(0);
+/// The REPL reads what is typed while a turn runs; a task from the command line, --tasks or --serve leaves the keys be.
+static STEERABLE: AtomicBool = AtomicBool::new(false);
+static STEER: Mutex<Steer> = Mutex::new(Steer { typing: String::new(), sent: Vec::new() });
 
 static STYLED: LazyLock<bool> =
     LazyLock::new(|| std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none());
@@ -61,41 +69,224 @@ pub fn size() -> Option<(u16, u16)> {
     Some((ws.ws_row, ws.ws_col)).filter(|&(rows, cols)| rows >= 5 && cols >= 20)
 }
 
-pub struct Turn(Option<tokio::task::JoinHandle<()>>);
+pub struct Turn(Option<tokio::task::JoinHandle<()>>, Option<Keys>);
 
 impl Turn {
     pub fn start() -> Self {
         STEP.store(0, Ordering::Relaxed);
         *PLAN.lock().unwrap() = Default::default();
         LIVE.lock().unwrap().intent = None;
-        let Some((rows, cols)) = size().filter(|_| styled()) else { return Turn(None) };
-        reserve(rows);
+        let Some((rows, cols)) = size().filter(|_| styled()) else { return Turn(None, None) };
+        let keys = STEERABLE.load(Ordering::Relaxed).then(Keys::start).flatten();
+        let steering = keys.is_some();
+        reserve(rows, steering);
         let started = Instant::now();
         *BAR.lock().unwrap() =
-            Some(Bar { rows, cols, started, activity: "waiting for the model".into(), tokens: (0, 0) });
+            Some(Bar { rows, cols, started, activity: "waiting for the model".into(), tokens: (0, 0), steering });
         draw();
         BARRED.store(true, Ordering::Relaxed);
-        Turn(Some(tokio::spawn(async {
+        STEERING.store(steering, Ordering::Relaxed);
+        let ticker = tokio::spawn(async {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 resize();
                 draw();
             }
-        })))
+        });
+        Turn(Some(ticker), keys)
     }
 }
 
 impl Drop for Turn {
     fn drop(&mut self) {
+        // The keys stop first, so nothing draws the rows once they are cleared.
+        drop(self.1.take());
         if let Some(ticker) = self.0.take() {
             ticker.abort();
             BARRED.store(false, Ordering::Relaxed);
+            STEERING.store(false, Ordering::Relaxed);
             if let Some(bar) = BAR.lock().unwrap().take() {
-                print!("\x1b7\x1b[{};1H\x1b[2K\x1b[r\x1b8", bar.rows);
+                let above = if bar.steering { format!("\x1b[{};1H\x1b[2K", bar.rows - 1) } else { String::new() };
+                print!("\x1b7{above}\x1b[{};1H\x1b[2K\x1b[r\x1b8", bar.rows);
                 let _ = std::io::stdout().flush();
             }
         }
     }
+}
+
+/// What the user types in the REPL while a turn runs: the line being typed, and the lines sent with Enter that no
+/// request has taken yet.
+struct Steer {
+    typing: String,
+    sent: Vec<String>,
+}
+
+impl Steer {
+    fn key(&mut self, key: Key) {
+        match key {
+            Key::Char(c) => self.typing.push(c),
+            Key::Backspace => drop(self.typing.pop()),
+            Key::Clear => self.typing.clear(),
+            Key::Enter => {
+                let line = std::mem::take(&mut self.typing);
+                if !line.trim().is_empty() {
+                    self.sent.push(line.trim().to_string());
+                }
+            }
+            // Takes back the last line sent, while no request has taken it.
+            Key::Up if self.typing.is_empty() => self.typing = self.sent.pop().unwrap_or_default(),
+            _ => {}
+        }
+    }
+
+    /// The lines sent before the first command, as one message: a command (/cost, /models) waits for the turn to end.
+    fn take(&mut self) -> Option<String> {
+        let lines = self.sent.iter().position(|l| command(l)).unwrap_or(self.sent.len());
+        (lines > 0).then(|| self.sent.drain(..lines).collect::<Vec<_>>().join("\n"))
+    }
+
+    /// The row above the bar: the end of what is being typed, or how to steer.
+    fn row(&self, cols: usize) -> String {
+        let room = cols.saturating_sub(1);
+        if self.typing.is_empty() {
+            let hint = match self.sent.last() {
+                None => "type to steer the model · Enter sends it after the current step".to_string(),
+                Some(line) if command(line) => format!("{} runs when the turn ends", flat(line, room / 2)),
+                Some(line) => format!("queued: {} · sent after the current step", flat(line, room / 2)),
+            };
+            return paint("2", fit(&format!("› {hint}"), room));
+        }
+        let queued = if self.sent.is_empty() { String::new() } else { format!("  {} queued", self.sent.len()) };
+        let typed = printable(&self.typing);
+        let shown = ending(&typed, room.saturating_sub(3 + queued.width()));
+        format!("{} {shown}▏{}", paint("36", "›"), paint("2", &queued))
+    }
+}
+
+/// A line the REPL takes as a command, or as a typo of one: its first word is /name. A path such as /src/main.rs is not.
+fn command(line: &str) -> bool {
+    line.split_whitespace().next().and_then(|word| word.strip_prefix('/')).is_some_and(|name| !name.contains('/'))
+}
+
+/// The longest end of `text` that fits in `cols` terminal columns.
+fn ending(text: &str, cols: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in text.char_indices().rev() {
+        used += c.width().unwrap_or(0);
+        if used > cols {
+            return &text[i + c.len_utf8()..];
+        }
+    }
+    text
+}
+
+/// Reads what is typed during a turn on a thread of its own, with the terminal unbuffered and unechoed but Ctrl-C still
+/// the signal that interrupts the turn. Dropping it stops the thread and puts the terminal back.
+struct Keys {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    saved: Termios,
+}
+
+impl Keys {
+    fn start() -> Option<Self> {
+        if !std::io::stdin().is_terminal() {
+            return None;
+        }
+        let saved = tcgetattr(stdin()).ok()?;
+        let mut quiet = saved.clone();
+        quiet.local_modes.remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::IEXTEN);
+        quiet.special_codes[SpecialCodeIndex::VMIN] = 1;
+        quiet.special_codes[SpecialCodeIndex::VTIME] = 0;
+        tcsetattr(stdin(), OptionalActions::Now, &quiet).ok()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = std::thread::spawn({
+            let stop = stop.clone();
+            move || listen(&stop)
+        });
+        Some(Self { stop, thread: Some(thread), saved })
+    }
+}
+
+impl Drop for Keys {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = tcsetattr(stdin(), OptionalActions::Now, &self.saved);
+    }
+}
+
+fn listen(stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        // Waking now and then notices the turn ended.
+        if !picker::ready(100) {
+            continue;
+        }
+        let mut buf = vec![0; 256];
+        let n = match rustix::io::read(stdin(), &mut buf[..]) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => return,
+        };
+        buf.truncate(n);
+        while picker::incomplete(&buf) && picker::ready(50) {
+            let mut more = [0; 64];
+            match rustix::io::read(stdin(), &mut more[..]) {
+                Ok(n @ 1..) => buf.extend_from_slice(&more[..n]),
+                _ => break,
+            }
+        }
+        let mut steer = STEER.lock().unwrap();
+        for key in picker::keys(&buf) {
+            steer.key(key);
+        }
+        drop(steer);
+        draw();
+    }
+}
+
+/// Lets the REPL's turns read what is typed while they run.
+pub fn steerable() {
+    STEERABLE.store(true, Ordering::Relaxed);
+}
+
+/// What the user sent to steer the turn since the last request, as one message.
+pub fn steers() -> Option<String> {
+    let taken = STEER.lock().unwrap().take();
+    if taken.is_some() {
+        draw();
+    }
+    taken
+}
+
+/// Shows a message the user sent during the turn where the model gets it.
+pub fn steered(text: &str) {
+    settle();
+    println!("{} {}", paint("36", "›"), line(text));
+}
+
+/// What the REPL runs next, before it reads a line: what was sent during the last turn and no request took, the lines
+/// before the first command as one task, or that command.
+pub fn queued() -> Option<String> {
+    let mut steer = STEER.lock().unwrap();
+    steer.take().or_else(|| (!steer.sent.is_empty()).then(|| steer.sent.remove(0)))
+}
+
+/// What was being typed when the turn ended, for the next prompt to start with.
+pub fn typed() -> String {
+    std::mem::take(&mut STEER.lock().unwrap().typing)
+}
+
+/// After a Ctrl-C nothing sent runs on its own: it all goes back to the prompt, to send again or change.
+pub fn unsend() {
+    let mut steer = STEER.lock().unwrap();
+    let typing = std::mem::take(&mut steer.typing);
+    let mut lines = std::mem::take(&mut steer.sent);
+    lines.extend((!typing.is_empty()).then_some(typing));
+    steer.typing = lines.join(" ");
 }
 
 /// Marks the picker as up, so a signal that ends low shows the cursor again.
@@ -116,7 +307,11 @@ pub fn guard() {
 
 extern "C" fn quit(signal: libc::c_int) {
     let group = CHECK.load(Ordering::Relaxed);
-    let reset: &[u8] = if BARRED.load(Ordering::Relaxed) { b"\x1b7\x1b[999;1H\x1b[2K\x1b[r\x1b8\n" } else { b"" };
+    let reset: &[u8] = match (BARRED.load(Ordering::Relaxed), STEERING.load(Ordering::Relaxed)) {
+        (true, true) => b"\x1b7\x1b[999;1H\x1b[2K\x1b[1A\x1b[2K\x1b[r\x1b8\n",
+        (true, false) => b"\x1b7\x1b[999;1H\x1b[2K\x1b[r\x1b8\n",
+        _ => b"",
+    };
     let cursor: &[u8] = if PICKING.load(Ordering::Relaxed) { b"\x1b[?25h\n" } else { b"" };
     // Only async-signal-safe calls from here: each is one system call.
     if group > 1
@@ -132,8 +327,10 @@ extern "C" fn quit(signal: libc::c_int) {
     unsafe { libc::_exit(128 + signal) };
 }
 
-fn reserve(rows: u16) {
-    print!("\n\x1b[1A\x1b7\x1b[1;{}r\x1b8", rows.saturating_sub(1));
+/// Keeps the bottom row for the bar, and the one above it for steering, out of the scrolling output.
+fn reserve(rows: u16, steering: bool) {
+    let n = 1 + u16::from(steering);
+    print!("{}\x1b[{n}A\x1b7\x1b[1;{}r\x1b8", "\n".repeat(n.into()), rows.saturating_sub(n));
 }
 
 fn resize() {
@@ -141,7 +338,7 @@ fn resize() {
     let mut bar = BAR.lock().unwrap();
     if let Some(bar) = bar.as_mut().filter(|b| (b.rows, b.cols) != (rows, cols)) {
         (bar.rows, bar.cols) = (rows, cols);
-        reserve(rows);
+        reserve(rows, bar.steering);
     }
 }
 
@@ -153,7 +350,11 @@ fn draw() {
     let cache = (cached * 100).checked_div(prompt).map(|p| format!(" · {p}% cached")).unwrap_or_default();
     let line = format!(" ▸ {} │ {}{cache} │ {} ", bar.activity, tokens(prompt), minutes(secs));
     let line = fit(&line, bar.cols.saturating_sub(1) as usize);
-    print!("\x1b7\x1b[{};1H\x1b[2K\x1b[7m{line}\x1b[0m\x1b8", bar.rows);
+    let above = match bar.steering {
+        true => format!("\x1b[{};1H\x1b[2K{}", bar.rows - 1, STEER.lock().unwrap().row(bar.cols.into())),
+        false => String::new(),
+    };
+    print!("\x1b7{above}\x1b[{};1H\x1b[2K\x1b[7m{line}\x1b[0m\x1b8", bar.rows);
     let _ = std::io::stdout().flush();
 }
 
@@ -637,4 +838,61 @@ pub fn wrap(text: &str, room: usize) -> Vec<String> {
         out.push(current);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Steer, ending};
+    use crate::picker::{Key, keys};
+    use unicode_width::UnicodeWidthStr;
+
+    fn typed(bytes: &[u8]) -> Steer {
+        let mut steer = Steer { typing: String::new(), sent: vec![] };
+        for key in keys(bytes) {
+            steer.key(key);
+        }
+        steer
+    }
+
+    #[test]
+    fn typing_sends_lines_and_takes_one_back() {
+        let mut steer = typed(b"use tabsx\x7f\r  \r\x15gone\x15/cost\rand tests\rhalf");
+        assert_eq!(
+            (&steer.sent[..], steer.typing.as_str()),
+            (&["use tabs", "/cost", "and tests"].map(String::from)[..], "half")
+        );
+        steer.typing.clear();
+        steer.key(Key::Up);
+        assert_eq!((steer.sent.len(), steer.typing.as_str()), (2, "and tests"));
+        // Up while typing changes nothing.
+        steer.key(Key::Up);
+        assert_eq!((steer.sent.len(), steer.typing.as_str()), (2, "and tests"));
+    }
+
+    #[test]
+    fn a_command_waits_for_the_lines_before_it() {
+        let mut steer = typed(b"one\r/src/main.rs too\r/cost\rthree\r");
+        assert_eq!(steer.take().as_deref(), Some("one\n/src/main.rs too"));
+        assert_eq!(steer.take(), None);
+        assert_eq!(steer.sent, ["/cost", "three"]);
+    }
+
+    #[test]
+    fn the_row_fits_the_terminal() {
+        let plain = |s: String| {
+            let mut parts = s.split('\x1b');
+            let first = parts.next().unwrap_or_default().to_string();
+            first + &parts.map(|p| p.split_once('m').map_or(p, |(_, rest)| rest)).collect::<String>()
+        };
+        for bytes in [&b""[..], b"queued\r", b"/cost\r", "a long line with 漢字 in it ".repeat(9).as_bytes()] {
+            let steer = typed(bytes);
+            for cols in [20, 41, 100] {
+                let row = plain(steer.row(cols));
+                assert!(row.width() < cols && row.starts_with("› "), "{cols} {row:?}");
+            }
+        }
+        // What is typed shows its end, where the cursor is.
+        assert!(plain(typed(b"first words, then the last ones").row(20)).ends_with("the last ones▏"));
+        assert_eq!(ending("ab漢字", 3), "字");
+    }
 }

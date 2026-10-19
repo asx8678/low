@@ -286,7 +286,7 @@ pub fn keys(bytes: &[u8]) -> Vec<Key> {
 }
 
 /// Whether the bytes end inside an escape sequence, so the rest is still on its way.
-fn incomplete(bytes: &[u8]) -> bool {
+pub fn incomplete(bytes: &[u8]) -> bool {
     let Some(at) = bytes.iter().rposition(|&b| b == 0x1b) else { return false };
     match &bytes[at + 1..] {
         [] => true,
@@ -352,7 +352,7 @@ impl Drop for Raw {
 }
 
 /// Whether stdin has input within `ms` milliseconds.
-fn ready(ms: i32) -> bool {
+pub fn ready(ms: i32) -> bool {
     let mut fd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
     unsafe { libc::poll(&mut fd, 1, ms) > 0 }
 }

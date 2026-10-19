@@ -105,6 +105,8 @@ In the REPL:
 | `/think` | shows the model's last reasoning |
 | `/compact` | compacts the context now |
 
+While a turn runs, what you type shows on the row above the status bar, and Enter sends it to the model with its next request, once the runs in flight have their results: it steers the turn without stopping it. ↑ takes back the last line while no request has taken it. What the turn doesn't take (a line sent as the model writes its final reply, or a command such as `/cost`) runs when the turn ends, and a line not yet sent starts the next prompt. Ctrl-C still stops the turn, and puts what wasn't taken back at the prompt instead of running it.
+
 ## Configuration
 
 | file | holds |
@@ -143,7 +145,7 @@ Inside `run(code)`, the model has a few helpers:
 | `check()` | runs the repository's `check` inside the sandbox; with none configured it runs nothing and returns `True` |
 | `accept(criteria)` · `plan(steps)` · `done()` | record what done means and track the turn's steps: shown as the turn runs, and in a `--json` result |
 | `finish(report)` · `ask(question)` | end the turn with the final report, or with a question for you that the next task answers |
-| `search(query)` · `fetch(url)` | web search and a page as markdown, through [DeepSeek's search API](https://api-docs.deepseek.com/guides/search/); low makes the request, since the sandbox has no network. Only when a provider is set up for it (below). `fetch` takes only a URL that a `search` returned or the task gives, and both refuse an argument that looks like a secret, so code in a run can't send what it read out through them |
+| `search(query)` · `fetch(url)` | web search and a page as markdown (JSON, code and other text files as their text, less some blank lines), through [DeepSeek's search API](https://api-docs.deepseek.com/guides/search/); low makes the request, since the sandbox has no network. A list of up to 50 queries or URLs goes out at once, 10 requests at a time, and comes back as a list in the same order, with the error in place of each one that failed. Only when a provider is set up for it (below). `fetch` takes a URL that a `search` returned or the task gives, or any https URL on a package registry, CDN or docs host that shows no one the URLs asked of it (npm, PyPI, crates.io, docs.rs, GitHub's API and raw files, jsDelivr, unpkg, cdnjs, and the Rust, Python and MDN docs; jsDelivr's public hit counts per file are the nearest thing); both refuse an argument that looks like a secret, so code in a run can't send what it read to someone who would see it |
 
 Repository files change only through `edit` and `write`, so low knows exactly what the model touched. A turn that changed files without using either is asked once to clean up its scratch output.
 

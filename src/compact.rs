@@ -5,8 +5,24 @@ use std::collections::BTreeMap;
 const MAX_BYTES: usize = 32 * 1024;
 const EXCHANGE: usize = 3968;
 
+/// A user message that starts a task: not one of low's own, and not a line the user typed during a turn to steer it.
+pub fn task(entry: &Value) -> bool {
+    entry["role"] == "user" && entry["meta"]["host"].is_null() && entry["meta"]["steer"].is_null()
+}
+
 pub fn newest_task(entries: &[Value]) -> Option<usize> {
-    (1..entries.len()).rev().find(|&i| entries[i]["role"] == "user" && entries[i]["meta"]["host"].is_null())
+    (1..entries.len()).rev().find(|&i| task(&entries[i]))
+}
+
+/// What the user typed to steer task `u` before entry `keep`, in full, to follow the task wherever a summary carries it.
+pub fn steers(entries: &[Value], u: usize, keep: usize) -> String {
+    let steer = |i: &usize| entries[*i]["meta"]["steer"] == true;
+    (u + 1..keep.min(entries.len()))
+        .filter(steer)
+        .map(|i| {
+            format!("\n\n[Steered by the user, entry #{i}]\n{}", entries[i]["content"].as_str().unwrap_or_default())
+        })
+        .collect()
 }
 
 pub fn baked(u: usize) -> String {
@@ -49,8 +65,7 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
     let text = |i: usize| entries[i]["content"].as_str().unwrap_or_default();
     let said = |i: usize| !text(i).trim().is_empty();
     let range = 1..keep;
-    let users: Vec<usize> =
-        range.clone().filter(|&i| role(i) == "user" && entries[i]["meta"]["host"].is_null()).collect();
+    let users: Vec<usize> = range.clone().filter(|&i| task(&entries[i])).collect();
     let recent = &users[users.len().saturating_sub(3)..];
     let current = newest_task(entries).filter(|&u| u < keep);
 
@@ -89,7 +104,7 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
         .iter()
         .filter(|_| reported)
         .filter_map(|&u| {
-            let next = (u + 1..entries.len()).find(|&i| role(i) == "user" && entries[i]["meta"]["host"].is_null());
+            let next = (u + 1..entries.len()).find(|&i| task(&entries[i]));
             let end = next.unwrap_or(entries.len());
             let report = entries[u..end].iter().rev().find_map(Report::of);
             if report.is_none() && next.is_none() {
@@ -110,7 +125,7 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
     let mut failing_check = None;
     for i in range.clone() {
         let meta = &entries[i]["meta"];
-        if role(i) == "user" && meta["host"].is_null() {
+        if task(&entries[i]) {
             criteria.clear();
         }
         if let Some(c) = meta["accepted"].as_str() {
@@ -247,7 +262,7 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
     }
     out += &footer;
     if let Some(u) = current {
-        out += &format!("\n\n{}\n{}", baked(u), text(u));
+        out += &format!("\n\n{}\n{}{}", baked(u), text(u), steers(entries, u, keep));
     }
     out
 }
@@ -357,6 +372,20 @@ mod tests {
         entries.push(json!({"role": "user", "content": "nudge", "meta": {"host": true}}));
         assert_eq!(super::newest_task(&entries), Some(9));
         assert_eq!(super::newest_task(&entries[..1]), None);
+    }
+
+    #[test]
+    fn steers_stay_with_their_task() {
+        let mut entries = session(3);
+        entries.push(json!({"role": "user", "content": "use tabs, not spaces", "meta": {"steer": true}}));
+        entries.push(json!({"role": "assistant", "content": "ok", "meta": {}}));
+        assert_eq!(super::newest_task(&entries), Some(9));
+        let summary = super::summary(&entries, entries.len() - 1);
+        let tail =
+            format!("{}\ntask 2: fix bug 2\n\n[Steered by the user, entry #13]\nuse tabs, not spaces", super::baked(9));
+        assert!(summary.ends_with(&tail), "{summary}");
+        // A steer past the kept tail's start is sent as it is, not in the summary.
+        assert!(!super::summary(&entries, 13).contains("[Steered by the user"));
     }
 
     #[test]

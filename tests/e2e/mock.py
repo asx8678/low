@@ -21,14 +21,23 @@ result with after_tool and a user message with the first rule whose text it cont
 Every request is appended to REQUESTS.jsonl: its index, time, Authorization header, parsed body and raw body. Usage
 is simulated with a perfect prefix cache: cached = the longest common prefix of the messages' JSON with any earlier
 request's, / 4, floored to 64-token blocks; prompt = the messages' JSON bytes / 4.
+
+POST /v1/tools/search and /v1/tools/fetch answer as DeepSeek's tools API does, from PAGES: search returns every page
+not on an open host, its URL with DeepSeek's #1 and the query in its title; fetch returns a page's text with a
+backslash before each ASCII punctuation mark, or 404. A URL with /slow/ in it is a page that takes 1 s, as is a search
+for "slow". They are logged with their tool's name instead of an index, as they arrive, and use none of SCRIPT.
 """
-import json, os, sys, threading, time
+import json, os, re, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 script = json.load(open(sys.argv[1]))
 portfile, logfile, repo = sys.argv[2], sys.argv[3], sys.argv[4]
 lock = threading.Lock()
 state = {'n': 0, 'seen': []}
+PAGES = {
+    'https://example.org/three/releases': '# r186\n\nthree.js r186 (0.186.1), see "notes".\n',
+    'https://registry.npmjs.org/three/latest': '{"name": "three", "version": "0.186.1", "description": "a \\"3D\\" library"}',
+}
 
 
 def lcp(a, b):
@@ -52,9 +61,36 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def tool(self, name, req):
+        with lock, open(logfile, 'a') as f:
+            f.write(json.dumps({'tool': name, 'at': time.time(), 'auth': self.headers.get('authorization'),
+                                'body': req}) + '\n')
+        status, answer = 200, None
+        url = req.get('url', '').split('#')[0]
+        if '/slow/' in url or 'slow' in str(req.get('query')):
+            time.sleep(1)
+        if name == 'search':
+            found = [url for url in PAGES if 'registry.npmjs.org' not in url]
+            answer = {'results': [{'title': f"{req['query']}: {url}", 'url': url + '#1', 'summary': PAGES[url][:80],
+                                   'snippet': '', 'content': '', 'date': None, 'site_name': None,
+                                   'rerank_score': 1.5, 'authority': 3} for url in found[:req['count']]]}
+        elif url in PAGES or '/slow/' in url:
+            text = PAGES.get(url, f'slow page {url.rsplit("/", 1)[-1]}')
+            answer = {'title': '', 'content': re.sub(r'([!-/:-@\[-`{-~])', r'\\\1', text)}
+        else:
+            status, answer = 404, {'error': {'message': 'failed to fetch URL', 'type': 'not_found_error'}}
+        body = json.dumps(answer).encode()
+        self.send_response(status)
+        self.send_header('content-type', 'application/json')
+        self.send_header('content-length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get('content-length') or 0))
         req = json.loads(raw)
+        if self.path.startswith('/v1/tools/'):
+            return self.tool(self.path.rsplit('/', 1)[1], req)
         msgs = req.get('messages', [])
         text = ''.join(json.dumps(m, sort_keys=True, ensure_ascii=False) for m in msgs)
         with lock:
