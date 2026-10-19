@@ -259,19 +259,22 @@ fn touch<'a>(files: &mut BTreeMap<&'a str, (usize, usize)>, path: &'a str, rank:
 
 fn block(title: &str, lines: &[String], cap: usize) -> String {
     let n = lines.len();
-    for keep in (0..=n).rev() {
-        let mut kept = vec![title.to_string()];
-        kept.extend_from_slice(&lines[..keep.div_ceil(2)]);
-        if keep < n {
-            kept.push(format!("… {} omitted", n - keep));
-        }
-        kept.extend_from_slice(&lines[n - keep / 2..]);
-        let block = kept.join("\n");
-        if block.len() <= cap {
-            return block;
-        }
+    // The joined length of every candidate from running sums, so that only the one that fits is joined.
+    let mut sums = vec![0];
+    sums.extend(lines.iter().scan(0, |sum, line| {
+        *sum += line.len() + 1;
+        Some(*sum)
+    }));
+    let omitted = |keep: usize| if keep < n { format!("… {} omitted", n - keep).len() + 1 } else { 0 };
+    let size = |keep: usize| title.len() + sums[keep.div_ceil(2)] + omitted(keep) + sums[n] - sums[n - keep / 2];
+    let Some(keep) = (0..=n).rev().find(|&keep| size(keep) <= cap) else { return String::new() };
+    let mut kept = vec![title.to_string()];
+    kept.extend_from_slice(&lines[..keep.div_ceil(2)]);
+    if keep < n {
+        kept.push(format!("… {} omitted", n - keep));
     }
-    String::new()
+    kept.extend_from_slice(&lines[n - keep / 2..]);
+    kept.join("\n")
 }
 
 pub fn quote(s: &str) -> String {
@@ -297,4 +300,87 @@ fn clip(s: &str, max: usize) -> &str {
 
 pub fn tail(s: &str, max: usize) -> &str {
     &s[s.ceil_char_boundary(s.len().saturating_sub(max))..]
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    /// block() as it was before its running sums: the most lines that fit, found by joining every candidate.
+    fn joined(title: &str, lines: &[String], cap: usize) -> String {
+        let n = lines.len();
+        for keep in (0..=n).rev() {
+            let mut kept = vec![title.to_string()];
+            kept.extend_from_slice(&lines[..keep.div_ceil(2)]);
+            if keep < n {
+                kept.push(format!("… {} omitted", n - keep));
+            }
+            kept.extend_from_slice(&lines[n - keep / 2..]);
+            let block = kept.join("\n");
+            if block.len() <= cap {
+                return block;
+            }
+        }
+        String::new()
+    }
+
+    #[test]
+    fn block_matches_joining_every_candidate() {
+        let lines: Vec<String> = (0..40).map(|i| "é".repeat(i % 7) + &format!("line {i}")).collect();
+        for n in [0, 1, 2, 3, 10, 40] {
+            for cap in (0..700).step_by(7) {
+                assert_eq!(super::block("\n## T", &lines[..n], cap), joined("\n## T", &lines[..n], cap), "{n} {cap}");
+            }
+        }
+    }
+
+    /// A session of `tasks` tasks, each a user message, a reply with a run, its result and a final reply.
+    fn session(tasks: usize) -> Vec<Value> {
+        let mut entries = vec![json!({"provider": "p", "model": "m", "system": "s"})];
+        for t in 0..tasks {
+            entries.push(json!({"role": "user", "content": format!("task {t}: fix bug {t}"), "meta": {}}));
+            let call = json!([{"id": format!("c{t}"), "type": "function",
+                               "function": {"name": "run", "arguments": "{\"code\": \"check()\"}"}}]);
+            entries.push(json!({"role": "assistant", "content": "", "tool_calls": call, "meta": {}}));
+            let actions = json!([{"tool": "edit", "path": format!("src/f{}.rs", t % 5), "ok": true}]);
+            let meta = json!({"actions": actions, "accepted": format!("bug {t} fixed")});
+            entries.push(json!({"role": "tool", "tool_call_id": format!("c{t}"), "content": "ok", "meta": meta}));
+            entries.push(json!({"role": "assistant", "content": format!("fixed bug {t}"), "meta": {}}));
+        }
+        entries
+    }
+
+    #[test]
+    fn newest_task_skips_host_messages() {
+        let mut entries = session(3);
+        assert_eq!(super::newest_task(&entries), Some(9));
+        entries.push(json!({"role": "user", "content": "nudge", "meta": {"host": true}}));
+        assert_eq!(super::newest_task(&entries), Some(9));
+        assert_eq!(super::newest_task(&entries[..1]), None);
+    }
+
+    #[test]
+    fn cut_keeps_whole_replies() {
+        let entries = session(20);
+        let keep = super::cut(&entries, 1, 100, false);
+        assert!(keep > 1 && keep < entries.len() && entries[keep]["role"] == "assistant", "{keep}");
+        // Everything fits: nothing to compact, unless an overflow asks for a cut anyway.
+        assert_eq!(super::cut(&entries, 1, 1 << 30, false), 1);
+        assert!(super::cut(&entries, 1, 0, true) > 1);
+    }
+
+    #[test]
+    fn summary_is_bounded_and_deterministic() {
+        for tasks in [1, 3, 50, 400] {
+            let entries = session(tasks);
+            let keep = entries.len() - 1;
+            let summary = super::summary(&entries, keep);
+            assert_eq!(summary, super::summary(&entries, keep));
+            assert!(summary.len() <= super::MAX_BYTES + 200, "{tasks}: {}", summary.len());
+            assert!(summary.contains(&format!("[Entries #1-#{} are summarized here.", keep - 1)), "{summary}");
+            let latest = super::newest_task(&entries).unwrap();
+            assert!(summary.contains(&super::baked(latest)) && summary.contains(&format!("task {}", tasks - 1)));
+            assert!(summary.contains("## Files") && summary.contains("src/f0.rs"), "{summary}");
+        }
+    }
 }

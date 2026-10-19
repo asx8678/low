@@ -64,6 +64,16 @@ pub fn redact(text: &str) -> (String, usize) {
         let boundary = i == 0
             || !(bytes[i - 1].is_ascii_alphanumeric() || matches!(bytes[i - 1], b'_' | b'-'))
             || ESCAPES.iter().any(|e| text[..i].ends_with(e));
+        // A value that is a secret by where it stands: a URL's password, an AWS secret key after its name.
+        if (bytes[i] == b':' || boundary && bytes[i].is_ascii_alphabetic())
+            && let Some((start, len, kind)) = placed(&text[i..], boundary)
+        {
+            out += &text[copied..i + start];
+            out += &format!("[redacted {kind}]");
+            (hidden, i) = (hidden + 1, i + start + len);
+            copied = i;
+            continue;
+        }
         if boundary
             && STARTS[bytes[i] as usize]
             && let Some((len, kind)) = secret(&text[i..])
@@ -81,6 +91,33 @@ pub fn redact(text: &str) -> (String, usize) {
     }
     out += &text[copied..];
     (out, hidden)
+}
+
+/// A secret that only its place tells apart: where it starts after `s`'s start, its length and what to call it.
+fn placed(s: &str, boundary: bool) -> Option<(usize, usize, &'static str)> {
+    // scheme://user:password@host, with the user kept.
+    if let Some(rest) = s.strip_prefix("://") {
+        let end = rest.find(|c: char| c.is_whitespace() || "/?#\"'<>".contains(c)).unwrap_or(rest.len());
+        let (userinfo, _) = rest[..end].rsplit_once('@')?;
+        let (user, password) = userinfo.split_once(':')?;
+        return (!password.is_empty()).then_some((3 + user.len() + 1, password.len(), "password"));
+    }
+    // aws_secret_access_key = …, "SecretAccessKey": "…": 40 characters of base64.
+    if !boundary {
+        return None;
+    }
+    let name = s.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(s.len());
+    let tail = s[..name].bytes().rev().filter(|&b| b != b'_').map(|b| b.to_ascii_lowercase());
+    if !tail.take(15).eq(b"secretaccesskey".iter().rev().copied()) {
+        return None;
+    }
+    let gap = s[name..].find(|c: char| !(c.is_whitespace() || "\"':=".contains(c))).map_or(s.len(), |g| name + g);
+    if !s[name..gap].contains(['=', ':']) {
+        return None;
+    }
+    let base64 = |c: char| c.is_ascii_alphanumeric() || "/+".contains(c);
+    let len = s[gap..].find(|c: char| !base64(c)).unwrap_or(s.len() - gap);
+    (len == 40 && !s[gap + len..].starts_with('=')).then_some((gap, len, "aws secret key"))
 }
 
 fn secret(s: &str) -> Option<(usize, &'static str)> {
@@ -111,4 +148,57 @@ fn secret(s: &str) -> Option<(usize, &'static str)> {
         let keyish = !WORDY.contains(&prefix) || body[..len].bytes().any(|b| b.is_ascii_digit());
         (len >= min && keyish).then_some((prefix.len() + len, kind))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact;
+
+    /// What review/v2/redact_probe.py printed from a run, and its near misses: each input with what reaches the model.
+    #[test]
+    fn redacts_known_shapes_only() {
+        let cases = [
+            ("token ghp_0123456789abcdefghijABCDEFGHIJ012345 here", "token [redacted github token] here"),
+            ("ANTHROPIC=sk-ant-api03-abcdefghij0123456789", "ANTHROPIC=[redacted api key]"),
+            ("key AKIAIOSFODNN7EXAMPLE", "key [redacted aws key]"),
+            (
+                "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "aws_secret_access_key = [redacted aws secret key]",
+            ),
+            (
+                r#""SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","#,
+                r#""SecretAccessKey": "[redacted aws secret key]","#,
+            ),
+            (
+                "postgres://admin:S3cretPassw0rd!@db.internal:5432/x",
+                "postgres://admin:[redacted password]@db.internal:5432/x",
+            ),
+            (
+                "HTTPS_PROXY=http://alice:hunter2pw@127.0.0.1:9",
+                "HTTPS_PROXY=http://alice:[redacted password]@127.0.0.1:9",
+            ),
+            ("-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----!", "[redacted private key]!"),
+            ("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig", "jwt [redacted json web token]"),
+        ];
+        let cases = cases.into_iter().chain([("…:// é://u:p@h …", "…:// é://u:[redacted password]@h …")]);
+        for (input, want) in cases {
+            assert_eq!(redact(input).0, want, "{input}");
+        }
+        let kept = [
+            "https://example.com/path?a=1",
+            "git@github.com:owner/repo.git",
+            "ssh://git@host/repo",
+            "mailto://user@host",
+            "sk-learn is a word",
+            "xghp_0123456789abcdefghijABCDEFGHIJ012345",
+            "secret_access_key = short",
+            "secret_access_key_id = AKIDNOTFORTYCHARS",
+            "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEYTOOLONG",
+            "a://b:@c",
+            "… é ✓ secret_access_key: …",
+        ];
+        for input in kept {
+            assert_eq!(redact(input), (input.to_string(), 0), "{input}");
+        }
+    }
 }

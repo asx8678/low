@@ -20,9 +20,59 @@ pub struct Session {
     pub entries: Vec<Value>,
     file: File,
     opened: (usize, Instant),
+    marks: Marks,
 }
 
+/// What every request looks up in the log, kept up as entries arrive, so that no request walks a log that only grows
+/// (a --serve session's runs to 100k entries).
 #[derive(Default)]
+struct Marks {
+    /// The last {switch}, or 0 for the header.
+    header: usize,
+    /// The last {compact}, and the last that names its keep and its summary.
+    compact: Option<usize>,
+    keep: Option<usize>,
+    summary: Option<usize>,
+    /// The newest task: a user message that is not from low.
+    task: Option<usize>,
+    state: State,
+    /// What the replies have spent, weighed as a turn's budget weighs them.
+    spent: u64,
+}
+
+impl Marks {
+    fn add(&mut self, i: usize, entry: &Value) {
+        if entry.get("switch").is_some() {
+            self.header = i;
+        }
+        let compact = &entry["compact"];
+        if compact.is_object() {
+            self.compact = Some(i);
+        }
+        if let Some(keep) = compact["keep"].as_u64() {
+            self.keep = Some(keep as usize);
+        }
+        if compact["summary"].is_string() {
+            self.summary = Some(i);
+        }
+        if i > 0 && entry["role"] == "user" && entry["meta"]["host"].is_null() {
+            self.task = Some(i);
+            self.state = State::default();
+        }
+        let meta = &entry["meta"];
+        if let Some(criteria) = meta["accepted"].as_str() {
+            self.state.accepted = Some(criteria.into());
+        }
+        if meta["plan"].is_object() {
+            self.state.plan = meta["plan"].clone();
+        }
+        if entry["role"] == "assistant" {
+            self.spent += crate::agent::weighted(meta);
+        }
+    }
+}
+
+#[derive(Default, Clone)]
 pub struct State {
     pub accepted: Option<String>,
     pub plan: Value,
@@ -45,7 +95,7 @@ impl Session {
         let path = dir.join(format!("{secs}-{}.jsonl", std::process::id()));
         let file = OpenOptions::new().create_new(true).append(true).mode(0o600).open(&path)?;
         file.try_lock()?;
-        let mut session = Self { path, entries: vec![], file, opened: (0, Instant::now()) };
+        let mut session = Self { path, entries: vec![], file, opened: (0, Instant::now()), marks: Marks::default() };
         let mut header = settings(provider, model, system, profile);
         header["cwd"] = json!(root);
         // One stable id per conversation; OpenCode's gateway routes by it.
@@ -67,7 +117,8 @@ impl Session {
     }
 
     pub fn header(&self) -> &Value {
-        self.entries.iter().rev().find_map(|e| e.get("switch")).unwrap_or(&self.entries[0])
+        let at = self.marks.header;
+        self.entries[at].get("switch").unwrap_or(&self.entries[at])
     }
 
     /// The newest session of this repository, or the one `id` names (its id, or its log's path).
@@ -107,7 +158,9 @@ impl Session {
                 backfill_id(&mut entries, &path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default());
                 eprintln!("[resumed {}]", path.display());
                 let opened = (entries.len(), Instant::now());
-                let mut session = Self { file, path, entries, opened };
+                let mut marks = Marks::default();
+                entries.iter().enumerate().for_each(|(i, entry)| marks.add(i, entry));
+                let mut session = Self { file, path, entries, opened, marks };
                 session.push(json!({"resume": context}))?;
                 return Ok(session);
             }
@@ -130,6 +183,7 @@ impl Session {
     fn write(&mut self, mut entry: Value) -> Result<()> {
         stamp(&mut entry, crate::ui::now_ms());
         self.file.write_all(format!("{entry}\n").as_bytes())?;
+        self.marks.add(self.entries.len(), &entry);
         self.entries.push(entry);
         Ok(())
     }
@@ -140,7 +194,22 @@ impl Session {
     }
 
     pub fn keep(&self) -> usize {
-        self.entries.iter().rev().find_map(|e| e["compact"]["keep"].as_u64()).map_or(1, |k| k as usize)
+        self.marks.keep.unwrap_or(1)
+    }
+
+    /// The last {compact} entry.
+    pub fn compaction(&self) -> Option<usize> {
+        self.marks.compact
+    }
+
+    /// The newest task's entry: a user message that is not from low.
+    pub fn newest_task(&self) -> Option<usize> {
+        self.marks.task
+    }
+
+    /// What the session's replies have spent, weighed as a turn's budget weighs them.
+    pub fn spent(&self) -> u64 {
+        self.marks.spent
     }
 
     /// The prompt size the provider last reported; 0 once a compaction since then has made it stale.
@@ -151,8 +220,8 @@ impl Session {
 
     pub fn messages(&self) -> Vec<Value> {
         let mut out = vec![json!({"role": "system", "content": self.header()["system"]})];
-        let (keep, newest) = (self.keep(), crate::compact::newest_task(&self.entries));
-        if let Some(summary) = self.entries.iter().rev().find_map(|e| e["compact"]["summary"].as_str()) {
+        let (keep, newest) = (self.keep(), self.newest_task());
+        if let Some(summary) = self.marks.summary.and_then(|at| self.entries[at]["compact"]["summary"].as_str()) {
             let mut content = summary.to_string();
             if let Some(u) = newest.filter(|&u| u < keep && !summary.contains(&crate::compact::baked(u))) {
                 let task = self.entries[u]["content"].as_str().unwrap_or_default();
@@ -201,21 +270,7 @@ impl Session {
     }
 
     pub fn state(&self) -> State {
-        let mut state = State::default();
-        for entry in &self.entries {
-            if entry["role"] == "user" && entry["meta"]["host"].is_null() {
-                state.accepted = None;
-                state.plan = Value::Null;
-            }
-            let meta = &entry["meta"];
-            if let Some(criteria) = meta["accepted"].as_str() {
-                state.accepted = Some(criteria.into());
-            }
-            if meta["plan"].is_object() {
-                state.plan = meta["plan"].clone();
-            }
-        }
-        state
+        self.marks.state.clone()
     }
 }
 
@@ -279,5 +334,81 @@ fn backfill_id(entries: &mut [Value], id: &str) {
         if let Some(header) = header.filter(|h| h.get("id").and_then(Value::as_str).is_none_or(str::is_empty)) {
             header.insert("id".into(), id.into());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Session;
+    use serde_json::{Map, Value, json};
+
+    fn assistant(content: &str, calls: &[&str], prompt: u64) -> Value {
+        let calls: Vec<Value> = calls
+            .iter()
+            .map(|id| json!({"id": id, "type": "function", "function": {"name": "run", "arguments": "{}"}}))
+            .collect();
+        let mut entry = json!({"role": "assistant", "content": content,
+                               "meta": {"usage": {"prompt_tokens": prompt, "completion_tokens": 10}}});
+        if !calls.is_empty() {
+            entry["tool_calls"] = calls.into();
+        }
+        entry
+    }
+
+    /// What a request is built from, live and after a resume: the same messages, header, state, keep and spend.
+    #[test]
+    fn messages_and_marks_survive_resume() {
+        let home = std::env::temp_dir().join(format!("low-session-test-{}", std::process::id()));
+        let root = home.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut session = Session::create(&home, &root, "p", "m", "sys", Map::new(), Map::new()).unwrap();
+        let entries = [
+            json!({"role": "user", "content": "first task", "meta": {}}),
+            assistant("", &["a"], 1000),
+            json!({"role": "tool", "tool_call_id": "a", "content": "ok",
+                   "meta": {"accepted": "it works", "plan": {"steps": ["x"]}}}),
+            json!({"role": "user", "content": "keep going", "meta": {"host": true}}),
+            assistant("", &["b", "c"], 2000),
+            json!({"role": "tool", "tool_call_id": "c", "content": "ran c", "meta": {}}),
+            json!({"role": "user", "content": "second task", "meta": {}}),
+        ];
+        for entry in entries {
+            session.push(entry).unwrap();
+        }
+        let messages = session.messages();
+        let roles: Vec<&str> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "tool", "user", "assistant", "tool", "tool", "user"]);
+        // A call that never got its result is answered, in the order the reply made them.
+        assert_eq!((&messages[6]["tool_call_id"], &messages[6]["content"]), (&json!("c"), &json!("ran c")));
+        assert_eq!(messages[7]["content"], "tool result missing (interrupted)");
+        assert!(messages.iter().all(|m| m.get("meta").is_none()));
+        // A new task drops the last one's criteria and plan.
+        assert_eq!((session.state().accepted, session.newest_task()), (None, Some(7)));
+        assert_eq!(session.spent(), 3020);
+        session.switch("p", "m2", "sys2", Map::new()).unwrap();
+        session.push(json!({"compact": {"keep": 7, "summary": "SUMMARY"}})).unwrap();
+        session.push(json!({"role": "user", "content": "more", "meta": {}})).unwrap();
+        let messages = session.messages();
+        assert_eq!((&messages[0]["content"], &messages[1]["role"]), (&json!("sys2"), &json!("user")));
+        let joined = messages[1]["content"].as_str().unwrap();
+        assert!(joined.starts_with("SUMMARY") && joined.contains("[Next user message, entry #10]\nmore"), "{joined}");
+        let live = (messages, session.header().clone(), session.keep(), session.compaction(), session.spent());
+        drop(session);
+        // A process another test forks meanwhile holds the log's lock until it execs.
+        let mut resumed = Session::resume(&home, &root, Map::new(), None);
+        for _ in 0..50 {
+            if resumed.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            resumed = Session::resume(&home, &root, Map::new(), None);
+        }
+        let session = resumed.unwrap();
+        let resumed =
+            (session.messages(), session.header().clone(), session.keep(), session.compaction(), session.spent());
+        assert_eq!(live, resumed);
+        assert_eq!((resumed.1["model"].as_str(), resumed.2, resumed.3), (Some("m2"), 7, Some(9)));
+        drop(session);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

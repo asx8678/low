@@ -35,15 +35,23 @@ const ENV: &str = "PATH HOME USER LOGNAME SHELL LANG LC_* TERM TMPDIR TZ PWD CAR
                    GOPATH GOROOT GOFLAGS VIRTUAL_ENV CONDA_PREFIX PYENV_ROOT NVM_DIR JAVA_HOME MIX_HOME HEX_HOME ERL_* \
                    ELIXIR_* DEVELOPER_DIR SDKROOT";
 
-/// What low itself reads besides the worker's variables: color, its HTTP client's proxies and certificates, git's own
-/// settings and the XDG folders.
-const OWN_ENV: &str = "NO_COLOR COLUMNS LINES RUST_BACKTRACE XDG_* GIT_* HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
-                       http_proxy https_proxy all_proxy no_proxy SSL_CERT_FILE SSL_CERT_DIR";
-/// Set in the environment low starts over with: the descriptor of the pipe that holds LOW_API_KEY, or "-".
+/// What low itself reads besides the worker's variables: color, its HTTP client's certificates, where git finds its
+/// repository and configuration, and the XDG folders. Not GIT_CONFIG_PARAMETERS or GIT_CONFIG_KEY_*/VALUE_*, which
+/// can carry an http.extraHeader with a token, nor GIT_ASKPASS or GIT_SSH*: low's git never talks to a remote.
+const OWN_ENV: &str = "NO_COLOR COLUMNS LINES RUST_BACKTRACE XDG_* GIT_DIR GIT_WORK_TREE GIT_CEILING_DIRECTORIES \
+                       GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM \
+                       GIT_EXEC_PATH GIT_AUTHOR_* GIT_COMMITTER_* GIT_TRACE* SSL_CERT_FILE SSL_CERT_DIR";
+/// The proxies low's HTTP client reads. A proxy's URL can hold its password, so they come along through the pipe with
+/// LOW_API_KEY, not in the environment, and the client is given them directly.
+const PROXY_ENV: &str = "ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy NO_PROXY no_proxy";
+/// Set in the environment low starts over with: the descriptor of the pipe that holds LOW_API_KEY and the proxies, or
+/// "-".
 const SCRUBBED: &str = "LOW_SCRUBBED";
 
 static EXTRA_ENV: OnceLock<Vec<String>> = OnceLock::new();
 static API_KEY: OnceLock<Option<String>> = OnceLock::new();
+/// The proxy variables low started with, once it has started over without them; unset when it has not.
+static PROXIES: OnceLock<Vec<(String, String)>> = OnceLock::new();
 
 pub fn allow_env(names: Vec<String>) {
     let _ = EXTRA_ENV.set(names);
@@ -57,23 +65,27 @@ fn listed(list: &[&str], name: &str) -> bool {
 /// On macOS code running as the user can read the environment any of the user's processes started with, sandboxed or
 /// not (sysctl KERN_PROCARGS2), unless the process is one of Apple's binaries, and no sandbox-exec rule stops it. The
 /// model's code could find every secret exported in the shell that started low. So low starts over once, before
-/// anything else, with only the variables it and the worker use (`extra` is config.toml's env), and LOW_API_KEY comes
-/// along through an inherited pipe. Other processes stay readable: a Claude Code that started low, for one. On Linux
-/// bwrap's --unshare-all gives the sandbox its own process namespace and /proc, so no process outside it is visible.
+/// anything else, with only the variables it and the worker use (`extra` is config.toml's env, which stays readable),
+/// and LOW_API_KEY and the proxies come along through an inherited pipe. Other processes stay readable: a Claude Code
+/// that started low, for one. On Linux bwrap's --unshare-all gives the sandbox its own process namespace and /proc, so
+/// no process outside it is visible.
 pub fn scrub(extra: &[String]) {
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
     if let Ok(fd) = std::env::var(SCRUBBED) {
-        let key = fd.parse::<i32>().ok().filter(|&fd| fd > 2).map(|fd| {
+        let held = fd.parse::<i32>().ok().filter(|&fd| fd > 2).map(|fd| {
             // SAFETY: the read end of the pipe this process opened before it started over and left open for this, so
             // nothing else here owns it; reading it to the end and closing it is all that happens to it.
             let mut pipe = unsafe { std::fs::File::from_raw_fd(fd) };
-            let mut key = String::new();
-            let _ = pipe.read_to_string(&mut key);
-            key
+            let mut held = String::new();
+            let _ = pipe.read_to_string(&mut held);
+            serde_json::from_str::<Value>(&held).unwrap_or_default()
         });
-        let _ = API_KEY.set(key.filter(|k| !k.is_empty()));
+        let held = held.unwrap_or_default();
+        let _ = API_KEY.set(held["key"].as_str().filter(|k| !k.is_empty()).map(String::from));
+        let proxies = held["proxies"].as_object().into_iter().flatten();
+        let _ = PROXIES.set(proxies.filter_map(|(name, value)| Some((name.clone(), value.as_str()?.into()))).collect());
         return;
     }
     if !cfg!(target_os = "macos") {
@@ -87,9 +99,14 @@ pub fn scrub(extra: &[String]) {
             ENV.split_whitespace().chain(OWN_ENV.split_whitespace()).chain(extra.iter().map(String::as_str)).collect();
         cmd.envs(std::env::vars_os().filter(|(name, _)| name.to_str().is_some_and(|name| listed(&kept, name))));
         let (mut fd, mut pipe) = ("-".to_string(), None);
-        if let Some(key) = std::env::var("LOW_API_KEY").ok().filter(|k| !k.is_empty()) {
+        let key = std::env::var("LOW_API_KEY").ok().filter(|k| !k.is_empty());
+        let proxies: serde_json::Map<String, Value> = PROXY_ENV
+            .split_whitespace()
+            .filter_map(|name| Some((name.to_string(), std::env::var(name).ok()?.into())))
+            .collect();
+        if key.is_some() || !proxies.is_empty() {
             let (reader, mut writer) = std::io::pipe()?;
-            writer.write_all(key.as_bytes())?;
+            writer.write_all(json!({"key": key, "proxies": proxies}).to_string().as_bytes())?;
             drop(writer);
             rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::empty())?;
             fd = reader.as_raw_fd().to_string();
@@ -101,6 +118,35 @@ pub fn scrub(extra: &[String]) {
     };
     let e = restart().unwrap_or_else(|e| e);
     eprintln!("low: could not start over without your environment's secrets ({e}); the model's code can read them");
+}
+
+/// Gives an HTTP client the proxies low started with, when it started over without them in its environment; otherwise
+/// the client reads them from the environment itself, as it would, with the same names and order.
+pub fn proxied(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let Some(vars) = PROXIES.get() else {
+        return builder;
+    };
+    let var = |names: &[&str]| {
+        let set = |name: &&str| vars.iter().find(|(var, _)| var == name).map(|(_, value)| value.as_str());
+        names.iter().find_map(set).filter(|value| !value.is_empty())
+    };
+    let no = var(&["NO_PROXY", "no_proxy"]).and_then(reqwest::NoProxy::from_string);
+    let mut builder = builder.no_proxy();
+    for (names, scheme) in [
+        (["HTTPS_PROXY", "https_proxy"], "https"),
+        (["HTTP_PROXY", "http_proxy"], "http"),
+        (["ALL_PROXY", "all_proxy"], "all"),
+    ] {
+        let proxy = var(&names).map(|url| match scheme {
+            "https" => reqwest::Proxy::https(url),
+            "http" => reqwest::Proxy::http(url),
+            _ => reqwest::Proxy::all(url),
+        });
+        if let Some(Ok(proxy)) = proxy {
+            builder = builder.proxy(proxy.no_proxy(no.clone()));
+        }
+    }
+    builder
 }
 
 /// The API key from LOW_API_KEY, which a low that started over has from its pipe.
@@ -519,6 +565,12 @@ mod tests {
             ),
             ("total = 1\nratio(total, 0)", "    return a / b"),
             ("show = 1", "[show: low's helpers, restored before the next run]"),
+            ("show('a.py', 10)", "[a.py: 2 lines; nothing at line 10]"),
+            ("write('a\\u202eb.txt', 'x')", "has invisible or bidi characters in its name"),
+            ("print(sh('rm -rf ./* ./.[!.]*'))", "[refused: rm -r ./* deletes the files git ignores"),
+            ("print(sh('cd . && rm -fr .'))", "[refused: rm -r . deletes the files git ignores"),
+            ("print(sh('rm -rf build* && echo kept'))", "kept"),
+            ("import subprocess\nsubprocess.Popen(['sleep', '60'])", "[stopped 1 process this run left running"),
             (
                 "edit('a.py', 'return 2', 'return 4')\n1 / 0",
                 "[applied before the error: edit a.py; inspect before repeating them]",
@@ -529,6 +581,12 @@ mod tests {
             assert!(reply["out"].as_str().is_some_and(|out| out.contains(part)), "{code}: {reply}");
         }
         assert!(std::fs::read_to_string(dir.join("a.py")).unwrap().contains("return 4"));
+        assert!(!dir.join("a\u{202e}b.txt").exists());
+        // The process a run leaves running is gone by the next run.
+        let reply = run(&mut worker, "import subprocess\nlive = subprocess.Popen(['sleep', '60'])").await;
+        assert!(reply["out"].as_str().is_some_and(|out| out.contains("[stopped 1 process")), "{reply}");
+        let gone = "import os\ntry:\n    os.kill(live.pid, 0)\nexcept ProcessLookupError:\n    print('gone')";
+        assert_eq!(run(&mut worker, gone).await["out"], "gone\n");
         let reply = run(&mut worker, "edit('a.py', 'return 4', 'return 5')\nassert check()\nfinish('done')").await;
         assert_eq!((&reply["finish"], &reply["own"], &reply["check"]), (&json!("done"), &json!(0), &json!(true)));
         assert_eq!(run(&mut worker, "print('x')\nfinish('done')").await["own"], 2);

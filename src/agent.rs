@@ -49,6 +49,8 @@ const STRAY_END: &str = "Delete the ones that are scratch output from running co
 const PLANTED: &str = "This turn made a git repository inside the tree:";
 const PLANTED_END: &str = "The user's git would run hooks and config from there, outside the sandbox. Delete it if it is \
                            scratch, or say in your final message why it belongs, then finish again.";
+/// DeepSeek's own tool-call markup, which leaks into a run()'s code at times: what follows it is no Python.
+const MARKUP: &[&str] = &["<｜end▁of▁thinking｜>", "｜DSML｜"];
 const HELPERS: &[&str] =
     &["sh", "show", "accept", "edit", "write", "check", "plan", "done", "finish", "ask", "search", "fetch"];
 /// The helpers that reach the web, in the prompt only when config.toml's search names a provider.
@@ -751,7 +753,7 @@ impl Agent {
     /// entries it kept. From the log, so a resumed session waits as long.
     fn compacted(&self) -> u64 {
         let entries = &self.session.entries;
-        let Some(at) = entries.iter().rposition(|e| e["compact"].is_object()) else { return 0 };
+        let Some(at) = self.session.compaction() else { return 0 };
         let keep = entries[at]["compact"]["keep"].as_u64().unwrap_or(0) as usize;
         let summary = entries[at]["compact"]["summary"].as_str().map_or(0, str::len);
         let system = self.session.header()["system"].as_str().map_or(0, str::len);
@@ -768,7 +770,7 @@ impl Agent {
 
     /// What the session's replies have spent, weighed as a turn's budget weighs them.
     fn spent(&self) -> u64 {
-        self.session.entries.iter().filter(|e| e["role"] == "assistant").map(|e| weighted(&e["meta"])).sum()
+        self.session.spent()
     }
 
     /// Logs a request that found less than half of the previous request's prompt in the provider's cache, with the cause
@@ -796,7 +798,7 @@ impl Agent {
     /// the whole request by bytes when no count has come back since the last compaction.
     fn upcoming(&self) -> u64 {
         let entries = &self.session.entries;
-        let compacted = entries.iter().rposition(|e| e["compact"].is_object()).map_or(0, |i| i + 1);
+        let compacted = self.session.compaction().map_or(0, |i| i + 1);
         let counted = (compacted..entries.len()).rev().find(|&i| entries[i]["meta"]["usage"]["prompt_tokens"].is_u64());
         let Some(i) = counted else { return self.sent() };
         let added = (i..entries.len()).filter(|&j| entries[j]["role"].is_string());
@@ -833,6 +835,16 @@ impl Agent {
         let args: Value =
             serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or_default()).unwrap_or_default();
         match (call["function"]["name"].as_str(), args["code"].as_str()) {
+            (Some("run"), Some(code)) if MARKUP.iter().any(|m| code.contains(m)) => {
+                ui::event(
+                    "bad_call",
+                    "the model's run() had its own tool-call markup in the code; not run",
+                    Value::Null,
+                );
+                let out = "error: your code had tool-call markup in it (<｜end▁of▁thinking｜>, <｜｜DSML｜｜ …>), so \
+                           none of it ran; send the run() again with the Python alone";
+                (out.into(), json!({"tool": "run", "error": true}))
+            }
             (Some("run"), Some(code)) => self.run_code(code).await,
             (Some("run"), None) => {
                 ui::event(
@@ -1575,7 +1587,7 @@ impl TurnState {
 
 /// What a reply counts against a budget: cached input is billed at a fraction of fresh input, so a long, well-cached
 /// session isn't stopped for re-sending its own context.
-fn weighted(meta: &Value) -> u64 {
+pub fn weighted(meta: &Value) -> u64 {
     let usage = &meta["usage"];
     let attempts = meta["timing"]["attempts"].as_u64().unwrap_or(1).max(1);
     let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);

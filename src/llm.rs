@@ -142,7 +142,8 @@ fn window(error: &str) -> Option<u64> {
 /// One call to DeepSeek's tools API (search or fetch) at this provider: the response body, or why it failed.
 pub async fn tool(base_url: &str, key: Option<&str>, name: &str, body: &Value) -> Result<String> {
     let base = base_url.trim_end_matches('/').trim_end_matches("/v1");
-    let http = reqwest::Client::builder().user_agent(USER_AGENT).timeout(Duration::from_secs(60)).build()?;
+    let builder = reqwest::Client::builder().user_agent(USER_AGENT).timeout(Duration::from_secs(60));
+    let http = crate::worker::proxied(builder).build()?;
     let mut request = http.post(format!("{base}/v1/tools/{name}")).header("content-type", "application/json");
     if let Some(key) = key {
         request = request.bearer_auth(key);
@@ -198,11 +199,11 @@ pub struct Llm {
 impl Llm {
     pub fn new(base_url: &str, key: Option<&str>, header: &Value) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(30))
-                .user_agent(USER_AGENT)
-                .build()
-                .expect("a plain rustls client builds"),
+            http: crate::worker::proxied(
+                reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).user_agent(USER_AGENT),
+            )
+            .build()
+            .expect("a plain rustls client builds"),
             base: base_url.trim_end_matches('/').into(),
             key: key
                 .map(String::from)
@@ -308,6 +309,7 @@ impl Llm {
         let mut body = self.body(messages, tools);
         let url = format!("{}/chat/completions", self.base);
         let start = Instant::now();
+        let mut stalls = 0;
         for attempt in 1.. {
             let bytes = serde_json::to_vec(&body)?;
             let asked = json!({"url": endpoint(&url), "model": self.model, "messages": count, "bytes": bytes.len()});
@@ -325,10 +327,14 @@ impl Llm {
                     extra["attempt"] = attempt.into();
                     extra["ms"] = crate::ui::ms(began).into();
                     extra["request"] = asked.clone();
-                    if attempt == 4 || began.elapsed() > LONG {
+                    // A long attempt is not tried again, as its reply would likely be cut the same way, except for one
+                    // that stalled: past IDLE it is always long, and a stall is the upstream's, not the reply's.
+                    let stalled = extra["stalled"] == true;
+                    if attempt == 4 || (began.elapsed() > LONG && !(stalled && stalls == 0)) {
                         crate::ui::event("interrupted", &e.to_string(), extra);
                         return Err(e);
                     }
+                    stalls += usize::from(stalled);
                     // On the status bar only while low waits; the event above shows it if low gives up.
                     let wait = 2 << attempt;
                     crate::ui::record("interrupted", &format!("{e}; retrying from the start"), extra);
@@ -789,5 +795,69 @@ impl Calls {
             json!({"id": id, "type": "function", "function": {"name": name, "arguments": args}})
         });
         calls.collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    fn all(lines: &mut super::Lines) -> Vec<String> {
+        std::iter::from_fn(|| lines.next()).collect()
+    }
+
+    /// Lines end in \n, \r\n or a lone \r, and a line split across chunks comes out once it ends.
+    #[test]
+    fn lines_split_on_any_line_end() {
+        let mut lines = super::Lines::default();
+        lines.push(b"data: a\r\ndata: b\rdata: c\nda");
+        assert_eq!(all(&mut lines), ["data: a", "", "data: b", "data: c"]);
+        assert_eq!(lines.partial(), 2);
+        lines.push("ta: é".as_bytes());
+        assert_eq!(all(&mut lines), Vec::<String>::new());
+        lines.push(b"\n");
+        assert_eq!(all(&mut lines), ["data: é"]);
+        assert_eq!(lines.partial(), 0);
+    }
+
+    #[test]
+    fn calls_assemble_by_index_and_id() {
+        let mut calls = super::Calls::default();
+        let piece = |index: Option<u64>, id: &str, name: Option<&str>, args: &str| {
+            let mut piece = json!({"id": id, "function": {"name": name, "arguments": args}});
+            if let Some(index) = index {
+                piece["index"] = index.into();
+            }
+            piece
+        };
+        assert!(calls.add(&piece(Some(0), "a", Some("run"), "{\"code\":")));
+        assert!(calls.add(&piece(Some(0), "", None, " \"1\"}")));
+        assert!(calls.add(&piece(Some(1), "b", Some("run"), "{\"code\": \"2\"}")));
+        // No index: a piece with a name after a whole call starts the next; one that repeats the id starts one too.
+        assert!(calls.add(&piece(None, "c", Some("run"), "{\"code\": \"3\"}")));
+        assert!(calls.add(&piece(None, "d", Some("run"), "{\"code\": \"4\"")));
+        assert!(!calls.add(&json!({"index": 5, "id": "e", "function": {"name": "run"}})));
+        let list = calls.into_json();
+        let ids: Vec<&str> = list.as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["a", "b", "c", "d", "e"]);
+        assert_eq!(list[0]["function"]["arguments"], "{\"code\": \"1\"}");
+        // Arguments cut short are not whole JSON, so they become {}.
+        assert_eq!(list[3]["function"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn errors_classified() {
+        assert_eq!(super::window("This model's maximum context length is 131,072 tokens"), Some(131_072));
+        assert_eq!(super::window("context window is 128k"), Some(128_000));
+        assert_eq!(super::window("rate limited"), None);
+        assert!(super::overflow("Error: context_length_exceeded"));
+        assert!(super::refused(&json!({"code": 401})) && super::refused(&json!({"type": "invalid_request_error"})));
+        assert!(!super::refused(&json!({"code": 429})) && !super::refused(&json!({"code": 500})));
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(super::retry_after(&headers), None);
+        headers.insert("retry-after", "7".parse().unwrap());
+        assert_eq!(super::retry_after(&headers), Some(7));
+        headers.insert("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
+        assert_eq!(super::retry_after(&headers), Some(0));
     }
 }

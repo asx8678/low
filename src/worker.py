@@ -73,6 +73,29 @@ def _kill():
     os.kill(os.getpid(), signal.SIGKILL)
 
 
+def _reap():
+    """Stops what a run left running, a server or watcher started with subprocess.Popen say: it holds the run's
+    capture, a deleted file nothing reads or caps once the run is over, and would fill the disk from there. Returns
+    how many processes it stopped."""
+    tree = _children(os.getpid())
+    for parent in tree:
+        tree.extend(_children(parent))
+    groups = set()
+    for pid in tree:
+        with contextlib.suppress(OSError):
+            groups.add(os.getpgid(pid))
+    for group in groups - {0, 1, os.getpgrp()}:
+        with contextlib.suppress(OSError):
+            os.killpg(group, signal.SIGKILL)
+    for pid in tree:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    for pid in _children(os.getpid()):
+        with contextlib.suppress(OSError):
+            os.waitpid(pid, 0)
+    return len(tree)
+
+
 def _watch(parent):
     global _dropped
     while os.getppid() == parent:
@@ -160,6 +183,8 @@ def _change(tool, path, make):
     try:
         if rel.startswith("..") or not real.startswith(ROOT + os.sep):
             raise ValueError(f"{path} is outside the repo")
+        if IGNORABLE.search(rel):
+            raise ValueError(f"{path!r} has invisible or bidi characters in its name; low will not change it")
         parts = (rel + os.sep + os.path.relpath(real, ROOT)).split(os.sep)
         if any(d == real or real.startswith(d + os.sep) for d in LOCKED):
             raise ValueError(f"{path} is protected (protect in low.toml, or --protect); low will not change it")
@@ -276,14 +301,14 @@ def write(path, content):
     _change("write", path, make)
 
 
-def _cleans_ignored(cmd):
-    # git clean -x or -X, not a dry run: it deletes the files git ignores, which no undo restores.
+def _commands(cmd):
+    """The commands a shell line runs, each as its name and arguments; none when it does not parse."""
     lexer = shlex.shlex(str(cmd), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     try:
         words = list(lexer)
     except ValueError:
-        return False
+        return
     first = True  # where a command starts: the beginning, after an operator, after VAR=value
     for i, word in enumerate(words):
         if word.strip("();<>|&") == "":
@@ -291,29 +316,51 @@ def _cleans_ignored(cmd):
             continue
         if first and "=" in word and not word.startswith("-"):
             continue
-        rest = []
-        for w in words[i + 1:]:
-            if w.strip("();<>|&") == "":
-                break
-            rest.append(w)
-        if first and os.path.basename(word) == "git" and "clean" in rest:
+        if first:
+            rest = []
+            for w in words[i + 1:]:
+                if w.strip("();<>|&") == "":
+                    break
+                rest.append(w)
+            yield os.path.basename(word), rest
+        first = False
+
+
+# What rm -r is given to empty the whole tree: the root itself, or every top-level name or dotfile.
+_EVERYTHING = {"*", ".*", ".[!.]*", ".[^.]*", "..?*", ".??*"}
+# What an operand can start with that the shell, not rm, turns into the working directory or the home.
+_HERE = re.compile(r"^(\$PWD|\$\{PWD\}|~)(?=/|$)")
+
+
+def _cleans_ignored(cmd):
+    # git clean -x or -X, not a dry run, or rm -r of the whole tree: either deletes the files git ignores, which no
+    # undo restores.
+    for name, rest in _commands(cmd):
+        if name == "git" and "clean" in rest:
             flags = [w for w in rest[rest.index("clean") + 1:] if w.startswith("-") and not w.startswith("--")]
             if any(set(f) & {"x", "X"} for f in flags) and not any("n" in f for f in flags) and "--dry-run" not in rest:
-                return True
-        first = False
-    return False
+                return "git clean -x or -X"
+        if name == "rm" and any(w == "--recursive" or w[:1] == "-" and w[1:2] != "-" and set(w) & {"r", "R"}
+                                for w in rest):
+            for w in (w for w in rest if not w.startswith("-")):
+                here = _HERE.sub(lambda m: os.path.expanduser("~") if m[0] == "~" else ROOT, w)
+                path = os.path.normpath(os.path.join(ROOT, here))
+                if path == ROOT or os.path.dirname(path) == ROOT and os.path.basename(path) in _EVERYTHING:
+                    return f"rm -r {w}"
+    return None
 
 
 def sh(cmd, timeout=120):
     entry = [str(cmd), None, []]
     _report.setdefault("cmds", []).append(entry)
-    if _cleans_ignored(cmd):
+    what = _cleans_ignored(cmd)
+    if what:
         entry[1] = "refused"
         listed = subprocess.run(["git", "ls-files", "-o", "-i", "--exclude-standard", "--directory"], cwd=ROOT,
                                 capture_output=True, text=True).stdout.split()
         some = ", ".join(listed[:5]) + (f" and {len(listed) - 5} more" if len(listed) > 5 else "")
-        return (f"[refused: git clean -x or -X deletes the files git ignores ({some or 'none now'}), and no undo restores "
-                "them; delete the ones you mean by name]")
+        return (f"[refused: {what} deletes the files git ignores ({some or 'none now'}), and no undo restores them; "
+                "delete the ones you mean by name]")
     out, code = _exec(cmd, timeout)
     entry[1:] = [code, [_rel(w) for w in str(cmd).split() if os.path.isfile(os.path.join(ROOT, w))]]
     return out.rstrip("\n") + (f"\n[exit {code}]" if code else "")
@@ -337,6 +384,9 @@ def show(path, start=1, end=None):
                 room -= len(line) + len(str(total)) + 3
                 if room >= 0 or not rows:
                     rows.append(f"{total}: {line}")
+    if start > total:
+        print(f"[{_rel(path)}: empty]" if not total else f"[{_rel(path)}: {total} lines; nothing at line {start}]")
+        return
     end, stop = min(asked or total, total), start + len(rows) - 1
     rest = f"; show({_rel(path)!r}, {stop + 1}{f', {asked}' if asked else ''}) continues" if stop < end else ""
     print(f"[{_rel(path)}: lines {start}-{stop} of {total}{rest}]")
@@ -498,6 +548,9 @@ for n, request in enumerate(_inbox, 1):
         _report["shadowed"] = shadowed
         print(f"[{', '.join(shadowed)}: low's helpers, restored before the next run]")
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    left = _reap()
+    if left:
+        _say(f"[stopped {left} process{'es' if left > 1 else ''} this run left running: what a run starts ends with it]")
     if _report.get("check") and _tree() != _checked:
         _report["check"] = False
         print("[check no longer applies: files changed after it passed; run check() again]")
