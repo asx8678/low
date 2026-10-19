@@ -886,10 +886,11 @@ def search(query, count=10):
 
 def fetch(url):
     # DeepSeek escapes every punctuation mark (\{\"name\"\: ...): undone, a JSON API's body parses and code reads as
-    # written. Only when every backslash is such an escape, so text that came back unescaped stays as it is.
+    # written. Only when every backslash is such an escape, so text that came back unescaped stays as it is. What low
+    # fetched itself (raw) is as the host served it: its \" in a JSON string is no escape of DeepSeek's.
     def text(found):
         text = found.get("content") or ""
-        return text if "\\" in ESCAPED.sub("", text) else ESCAPED.sub(r"\1", text)
+        return text if found.get("raw") or "\\" in ESCAPED.sub("", text) else ESCAPED.sub(r"\1", text)
     return _each(url, lambda u: {"fetch": str(u)}, text)
 
 

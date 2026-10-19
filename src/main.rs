@@ -1,6 +1,7 @@
 mod agent;
 mod compact;
 mod detect;
+mod fetch;
 mod git;
 mod llm;
 mod picker;

@@ -1,4 +1,5 @@
 use crate::detect::Detected;
+use crate::fetch::{self, Fetched};
 use crate::git::{changes, git, guard_git, snapshot};
 use crate::llm::{self, Llm};
 use crate::providers::Providers;
@@ -107,16 +108,25 @@ const UNDO: &str = "undo(*paths)                  # put files back as they were 
 /// The helpers that reach the web, in the prompt only when config.toml's search names a provider.
 const WEB: &str = "search(query, count=10) -> list  # web search: [{title, url, summary, date, site_name}]; site:, \"phrase\", \
                    after:2025 work; query up to 128 chars, count up to 50\nfetch(url) -> str             # a web page \
-                   as markdown; JSON, code and other text files as their text, less some blank lines; a URL a search() \
-                   returned or the task gives, or any URL on \
+                   as markdown; JSON, code and other text files as their text, as served on the open hosts named here and \
+                   less some blank lines elsewhere; a URL a search() returned or the task gives, or any URL on \
                    registry.npmjs.org, pypi.org, crates.io, docs.rs, api.github.com, raw.githubusercontent.com, \
                    cdn.jsdelivr.net, data.jsdelivr.com, unpkg.com, cdnjs.cloudflare.com, doc.rust-lang.org, \
                    docs.python.org, developer.mozilla.org\nsearch([query, ...]), fetch([url, ...]) -> list  # up to \
                    50 at once, 10 at a time: the answers in order, a RuntimeError in place of each that failed\n";
+/// WEB's fetch() without a search provider: low reads the open hosts itself, and nothing else.
+const WEB_OPEN: &str = "fetch(url) -> str             # a URL's text as its host serves it: JSON, code and other text \
+                        files, not HTML pages; any URL on HOSTS\nfetch([url, ...]) -> list  # up to 50 at once, 10 \
+                        at a time: the answers in order, a RuntimeError in place of each that failed\n";
 /// How many requests in a run's list of searches or fetches go out at once: DeepSeek takes fetches at 25 a second.
 const WEB_AT_ONCE: usize = 10;
 /// The most requests one list may hold.
 const WEB_LIST: usize = 50;
+/// What a request the tools API would make gets without a search provider: a search(), and a fetch() off the open hosts.
+const UNSET: [&str; 2] = [
+    "web search is not set up: config.toml's search names no provider",
+    "without a search provider in config.toml, fetch() reads only URLs on the open hosts its help lists",
+];
 /// Hosts where fetch() takes any URL, not only one a search() returned: package registries, CDNs and docs that show no
 /// one the URLs asked of them, so a URL a run made up there can't carry what it read to someone who would see it. The
 /// nearest thing is jsDelivr's public hit counts per file, which tell a package's author which of its files was fetched.
@@ -1262,10 +1272,7 @@ impl Agent {
     /// why it failed], in the order asked.
     async fn web(&mut self, requests: &[Value]) -> String {
         let provider = self.config.search.as_ref().and_then(|name| self.config.providers.get(name));
-        let Some((base, key)) = provider.map(|p| (p.base_url.clone(), p.api_key.clone())) else {
-            let off = (false, "web search is not set up: config.toml's search names no provider");
-            return json!(vec![off; requests.len()]).to_string();
-        };
+        let provider = provider.map(|p| (p.base_url.clone(), p.api_key.clone()));
         let _busy = ui::busy(&match requests {
             [one] => format!("{} on the web", if one["fetch"].is_string() { "fetching" } else { "searching" }),
             many => format!("{} web requests at once", many.len()),
@@ -1276,6 +1283,9 @@ impl Agent {
         let mut asked = vec![];
         for (i, request) in requests.iter().enumerate() {
             match self.web_request(request, i) {
+                Ok(call) if provider.is_none() && direct(&call).is_none() => {
+                    answers[i].1 = UNSET[usize::from(call.0 == "fetch")].into()
+                }
                 Ok(call) => asked.push((i, call)),
                 Err(refused) => answers[i].1 = refused,
             }
@@ -1283,14 +1293,36 @@ impl Agent {
         let (mut asked, mut running) = (asked.into_iter(), tokio::task::JoinSet::new());
         loop {
             while running.len() < WEB_AT_ONCE
-                && let Some((i, (tool, body, what))) = asked.next()
+                && let Some((i, call)) = asked.next()
             {
-                let (base, key) = (base.clone(), key.clone());
-                let call = async move { (i, tool, llm::tool(&base, key.as_deref(), tool, &body).await, body, what) };
-                running.spawn(call);
+                let provider = provider.clone();
+                running.spawn(async move {
+                    // A fetch() on an open host is low's own request first; the tools API gets what that sends on.
+                    let elsewhere = match direct(&call) {
+                        Some(url) => match fetch::direct(url, open).await {
+                            Ok(Fetched::Text(text)) => {
+                                let raw = json!({"content": text, "raw": true}).to_string();
+                                return (i, call, Ok(raw), "direct", None);
+                            }
+                            Err(e) => return (i, call, Err(e), "direct", None),
+                            Ok(Fetched::Elsewhere(why)) => Some(why),
+                        },
+                        None => None,
+                    };
+                    let (tool, body) = (call.0, &call.1);
+                    let result = match &provider {
+                        Some((base, key)) => llm::tool(base, key.as_deref(), tool, body).await,
+                        None => Err(anyhow::anyhow!(
+                            "{}; low reads that only through DeepSeek's tools API, and config.toml's search names no \
+                             provider",
+                            elsewhere.as_deref().unwrap_or_default()
+                        )),
+                    };
+                    (i, call, result, "tools API", elsewhere)
+                });
             }
             let Some(done) = running.join_next().await else { break };
-            let Ok((i, tool, result, body, what)) = done else { continue };
+            let Ok((i, (tool, body, what), result, via, elsewhere)) = done else { continue };
             let (ok, out) = match result {
                 Ok(text) => (true, text),
                 Err(e) => (false, format!("{tool} failed: {e:#}")),
@@ -1302,7 +1334,9 @@ impl Agent {
                 .flat_map(|f| f["results"].as_array().into_iter().flatten())
                 .filter_map(|r| r["url"].as_str())
                 .collect();
-            ui::record("web", &what, json!({"request": body, "ok": ok, "bytes": out.len(), "urls": urls}));
+            let extra =
+                json!({"request": body, "ok": ok, "bytes": out.len(), "urls": urls, "via": via, "direct": elsewhere});
+            ui::record("web", &what, extra);
             answers[i] = (ok, out);
         }
         json!(answers).to_string()
@@ -2102,6 +2136,11 @@ fn repos(root: &Path, paths: &[String]) -> Vec<String> {
     found
 }
 
+/// The URL of a fetch() that low makes itself, one on an OPEN host; None for what goes to the tools API.
+fn direct<'a>(call: &'a (&'static str, Value, String)) -> Option<&'a str> {
+    call.1["url"].as_str().filter(|url| call.0 == "fetch" && open(url))
+}
+
 /// A URL on an OPEN host, over https, with no credentials or port of its own.
 fn open(url: &str) -> bool {
     reqwest::Url::parse(url).is_ok_and(|u| {
@@ -2326,10 +2365,10 @@ fn today() -> Option<String> {
     Some(format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday))
 }
 
-fn system_prompt(root: &Path, yolo: bool, config: &Config, repo: bool, web: bool) -> String {
+fn system_prompt(root: &Path, yolo: bool, config: &Config, repo: bool, search: bool) -> String {
     let mut prompt = include_str!("prompt.md").to_string();
-    if !web {
-        prompt = prompt.replace(WEB, "");
+    if !search {
+        prompt = prompt.replace(WEB, &WEB_OPEN.replace("HOSTS", &OPEN.join(", ")));
     }
     if !repo {
         prompt = prompt.replace(UNDO, "");
@@ -2357,9 +2396,7 @@ fn system_prompt(root: &Path, yolo: bool, config: &Config, repo: bool, web: bool
         prompt += SANDBOX;
         prompt += if cfg!(target_os = "macos") { MACOS } else { LINUX };
         prompt += PERMANENT;
-        if web {
-            prompt += REGISTRIES;
-        }
+        prompt += REGISTRIES;
     }
     // One that is there but can't be read is noted, and the next one tried.
     for name in INSTRUCTIONS {

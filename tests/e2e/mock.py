@@ -29,6 +29,10 @@ POST /v1/tools/search and /v1/tools/fetch answer as DeepSeek's tools API does, f
 not on an open host, its URL with DeepSeek's #1 and the query in its title; fetch returns a page's text with a
 backslash before each ASCII punctuation mark, or 404. A URL with /slow/ in it is a page that takes 1 s, as is a search
 for "slow". They are logged with their tool's name instead of an index, as they arrive, and use none of SCRIPT.
+
+GET /open/<host><path> answers as the open hosts do low's own fetch() (a debug build sends it here when
+$LOW_OPEN_ORIGIN is set), from OPEN: each URL's status, content type and body (a redirect's Location), or a slow page,
+or 404. It is logged as tool "open".
 """
 import json, os, re, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,6 +46,17 @@ ASIDE = {'content': 'uncertain: the mock checks no claims - it answers every sec
 PAGES = {
     'https://example.org/three/releases': '# r186\n\nthree.js r186 (0.186.1), see "notes".\n',
     'https://registry.npmjs.org/three/latest': '{"name": "three", "version": "0.186.1", "description": "a \\"3D\\" library"}',
+    'https://docs.python.org/3/library/json.html': '# json\n\nJSON encoder and decoder.\n',
+    'https://api.github.com/limited': '{"from": "the tools API"}',
+}
+OPEN = {
+    'https://registry.npmjs.org/three/latest': (200, 'application/json', PAGES['https://registry.npmjs.org/three/latest']),
+    'https://unpkg.com/three': (302, 'text/plain', '/three@0.186.1/build/three.module.js'),
+    'https://unpkg.com/three@0.186.1/build/three.module.js': (200, 'application/javascript', 'export const REVISION = "186";'),
+    'https://api.github.com/repos/mrdoob/three.js/tarball': (302, 'text/plain', 'https://codeload.github.com/mrdoob/three.js/tar.gz/r186'),
+    'https://api.github.com/limited': (403, 'application/json', '{"message": "API rate limit exceeded"}'),
+    'https://docs.python.org/3/library/json.html': (200, 'text/html; charset=utf-8', '<html><h1>json</h1></html>'),
+    'https://registry.npmjs.org/three/-/three-0.186.1.tgz': (200, 'application/octet-stream', '\x1f\x8b\x08\x00\x00'),
 }
 
 
@@ -59,9 +74,28 @@ class H(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path.startswith('/open/'):
+            return self.open_host('https://' + self.path[len('/open/'):])
         body = json.dumps({'data': [{'id': 'mock-model'}]}).encode()
         self.send_response(200)
         self.send_header('content-type', 'application/json')
+        self.send_header('content-length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def open_host(self, url):
+        with lock, open(logfile, 'a') as f:
+            f.write(json.dumps({'tool': 'open', 'at': time.time(), 'body': {'url': url}}) + '\n')
+        if '/slow/' in url:
+            time.sleep(1)
+            status, kind, text = 200, 'text/plain', f'slow page {url.rsplit("/", 1)[-1]}'
+        else:
+            status, kind, text = OPEN.get(url, (404, 'application/json', '{"error": "Not found"}'))
+        body = b'' if status in (301, 302) else text.encode('latin-1' if 'octet' in kind else 'utf-8')
+        self.send_response(status)
+        if status in (301, 302):
+            self.send_header('location', text)
+        self.send_header('content-type', kind)
         self.send_header('content-length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -75,7 +109,7 @@ class H(BaseHTTPRequestHandler):
         if '/slow/' in url or 'slow' in str(req.get('query')):
             time.sleep(1)
         if name == 'search':
-            found = [url for url in PAGES if 'registry.npmjs.org' not in url]
+            found = [url for url in PAGES if url.startswith('https://example.org/')]
             answer = {'results': [{'title': f"{req['query']}: {url}", 'url': url + '#1', 'summary': PAGES[url][:80],
                                    'snippet': '', 'content': '', 'date': None, 'site_name': None,
                                    'rerank_score': 1.5, 'authority': 3} for url in found[:req['count']]]}

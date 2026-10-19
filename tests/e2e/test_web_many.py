@@ -29,7 +29,8 @@ r = e.low('--json', 'read the release pages')
 out = (e.tools() or [''])[-1]
 line = lambda name: next((l for l in out.splitlines() if l.startswith(name + ' ')), '')
 asked = [x for x in e.entries() if 'tool' in x]
-fetched = [a for a in asked if a['tool'] == 'fetch']
+# What left low: the tools API's fetches, and the open hosts' URLs that low asks itself.
+fetched = [a for a in asked if a['tool'] in ('fetch', 'open')]
 system = next((b['messages'][0]['content'] for b in r['requests'] if 'messages' in b), '')
 
 check('the turn completes', r['code'] == 0 and r['result'].get('answer') == 'done', r['result'])
@@ -42,7 +43,7 @@ check('twelve go out 10 at a time',
 check('a refused URL and a failed one are RuntimeErrors in their places, between pages that came back',
       line('mixed') == "mixed ['str', 'RuntimeError', 'RuntimeError']" and 'registry.npmjs.org' in line('refused')
       and '404' in line('missing'), out)
-check('the refused URL never reaches the tools API', not any('example.org' in a['body'].get('url', '') for a in fetched),
+check('the refused URL never leaves the machine', not any('example.org' in a['body'].get('url', '') for a in fetched),
       fetched)
 check('a list of searches answers each query in its place',
       line('search') == "search [['alpha: https://example.org/three/releases'], "

@@ -60,7 +60,9 @@ class Env:
 
     def env(self, extra=None):
         env = {k: v for k, v in os.environ.items() if k in ('PATH', 'TERM', 'TMPDIR', 'USER', 'LANG')}
-        return {**env, 'HOME': self.home, **(extra or {})}
+        # A debug build's own fetch() of an open host goes to the mock too, so no request leaves the machine.
+        origin = {'LOW_OPEN_ORIGIN': f'http://127.0.0.1:{self.port}'}
+        return {**env, 'HOME': self.home, **origin, **(extra or {})}
 
     def low(self, *args, timeout=300, env=None, cwd=None):
         """Run low in the repo, or in `cwd`. Returns its exit code, output, the last stdout line parsed as JSON

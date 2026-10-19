@@ -95,8 +95,14 @@ pub fn scrub(extra: &[String]) {
         let mut args = std::env::args_os();
         let mut cmd = std::process::Command::new(std::env::current_exe()?);
         cmd.arg0(args.next().unwrap_or_default()).args(args).env_clear();
-        let kept: Vec<&str> =
-            ENV.split_whitespace().chain(OWN_ENV.split_whitespace()).chain(extra.iter().map(String::as_str)).collect();
+        // A debug build's tests point fetch()'s direct requests at their mock (fetch::served_from).
+        let test = cfg!(debug_assertions).then_some("LOW_OPEN_ORIGIN");
+        let kept: Vec<&str> = ENV
+            .split_whitespace()
+            .chain(OWN_ENV.split_whitespace())
+            .chain(test)
+            .chain(extra.iter().map(String::as_str))
+            .collect();
         cmd.envs(std::env::vars_os().filter(|(name, _)| name.to_str().is_some_and(|name| listed(&kept, name))));
         let (mut fd, mut pipe) = ("-".to_string(), None);
         let key = std::env::var("LOW_API_KEY").ok().filter(|k| !k.is_empty());
