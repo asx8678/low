@@ -23,9 +23,6 @@ Verified: the project check (`python3 -m unittest -q`) passes, and direct calls 
 `add(2,3)==5`, `add(-4,1)==-3`, `add(0,0)==0`. Nothing open.
 
 ── VERIFIED ────────────────────────────────────
-task      add() returns the wrong result; fix it
-criteria  add(2, 3) == 5; add returns a + b; the project check passes
-check     passed on the final tree
 changes   calc.py +1 −1
 undo      git restore --source=790cc5e2fb18 --worktree -- calc.py  (low's edit()/write() paths; new files stay)
 cost      3 requests · 2 runs · 4.9k tok in · 266 tok out · 0:10
@@ -143,7 +140,7 @@ Inside `run(code)`, the model has a few helpers:
 | `edit(path, old, new)` | replaces exactly one occurrence, or several pairs all-or-none, then runs `fmt` |
 | `write(path, content)` | creates a file, or replaces one |
 | `check()` | runs the repository's `check` inside the sandbox; with none configured it runs nothing and returns `True` |
-| `accept(criteria)` · `plan(steps)` · `done()` | record what done means and track progress for the turn report |
+| `accept(criteria)` · `plan(steps)` · `done()` | record what done means and track the turn's steps: shown as the turn runs, and in a `--json` result |
 | `finish(report)` · `ask(question)` | end the turn with the final report, or with a question for you that the next task answers |
 | `search(query)` · `fetch(url)` | web search and a page as markdown, through [DeepSeek's search API](https://api-docs.deepseek.com/guides/search/); low makes the request, since the sandbox has no network. Only when a provider is set up for it (below). `fetch` takes only a URL that a `search` returned or the task gives, and both refuse an argument that looks like a secret, so code in a run can't send what it read out through them |
 

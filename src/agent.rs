@@ -38,6 +38,8 @@ const REPEATS: usize = 5;
 const DAY: Duration = Duration::from_secs(86_400);
 /// Margin around a run's recorded start and end when matching file times to it.
 const SLACK_MS: u64 = 250;
+/// Files a report row names before it says how many more: a port turn changed 12,725.
+const LISTED: usize = 10;
 const GATE: &str = "The project check failed on the current tree. Fix what fails, run check(), then finish again. \
                     If it cannot pass, say why in one line. The check output ended with:";
 const RETRY: &str = "Send one run() now with the next step, or a shorter answer.";
@@ -209,7 +211,7 @@ impl Agent {
         let meta = self.llm.warm(self.session.messages(), &tools()).await?;
         let (prompt, cached) =
             (meta["usage"]["prompt_tokens"].as_u64().unwrap_or(0), ui::cached(&meta["usage"]).unwrap_or(0));
-        ui::event(
+        ui::record(
             "warm",
             &format!("kept the prompt cache warm: {cached} of {prompt} tokens cached"),
             json!({"meta": meta}),
@@ -388,8 +390,17 @@ impl Agent {
         // The push first writes what the snapshot logged, so the turn begins at the task itself.
         let began = self.session.entries.len() - 1;
         self.current = Some((began, clock));
-        if let Some(moved) = self.moved_since(&start).await {
-            ui::event("moved", &moved, Value::Null);
+        if let Some(files) = self.moved_since(&start).await {
+            let more = files.len().saturating_sub(20);
+            let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+            let shown = files[..files.len().min(20)].join(", ");
+            let moved = format!("Files changed since your last turn, outside this conversation: {shown}{more}");
+            // The screen gets one line of it, the log and the model all of it.
+            let s = if files.len() == 1 { "" } else { "s" };
+            let line =
+                format!("{} file{s} changed since the last turn, outside this conversation: {shown}", files.len());
+            ui::show(&ui::line(&line));
+            ui::record("moved", &moved, Value::Null);
             self.session.push(json!({"role": "user", "content": format!("[{moved}]"), "meta": {"host": true}}))?;
         }
         let mut state = TurnState::default();
@@ -411,7 +422,8 @@ impl Agent {
             // Twice what the last compaction left, too: a compact_at that the summary and the kept tail fill on their
             // own would compact before every task, each time a cache miss.
             if self.upcoming() >= self.compact_at.max(2 * self.compacted()) {
-                self.compact()?;
+                let done = self.compact_to(self.compact_at as usize / 5, false)?;
+                ui::record("note", &done, Value::Null);
             }
             let Some(message) = self.request(&mut state).await? else { continue };
             let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
@@ -646,7 +658,7 @@ impl Agent {
 
     /// The files that changed between the end of the last turn and the start of this one, outside the conversation: the
     /// user's editor, a pull, a branch switch. None when nothing did or the last turn's tree is unknown.
-    async fn moved_since(&self, start: &str) -> Option<String> {
+    async fn moved_since(&self, start: &str) -> Option<Vec<String>> {
         let last = self.session.entries.iter().rev().find_map(|e| Report::of(e)?.tree)?;
         let (last, now) = (last.split(' ').next()?.to_string(), start.split(' ').next()?.to_string());
         if last == now || now.is_empty() {
@@ -666,11 +678,7 @@ impl Agent {
                 _ => None,
             })
             .collect();
-        let more = files.len().saturating_sub(20);
-        let more = if more > 0 { format!(" and {more} more") } else { String::new() };
-        let shown = files.iter().take(20).cloned().collect::<Vec<_>>().join(", ");
-        (!files.is_empty())
-            .then(|| format!("Files changed since your last turn, outside this conversation: {shown}{more}"))
+        (!files.is_empty()).then_some(files)
     }
 
     /// The model profile's `fallback = "provider:model"`, when it names a configured provider other than the current one.
@@ -786,7 +794,8 @@ impl Agent {
         let (seen, estimate) = (self.session.last_prompt_tokens(), self.upcoming());
         // A fifth stays free: the reply needs room too, and the estimate counts bytes, not tokens.
         self.compact_at = self.compact_at.min(window.unwrap_or(estimate) * 4 / 5);
-        self.compact_to(self.compact_at as usize / 5, true)?;
+        let done = self.compact_to(self.compact_at as usize / 5, true)?;
+        ui::record("note", &done, Value::Null);
         self.compact_at = self.compact_at.max(self.sent());
         let extra = json!({"seen": seen, "estimate": estimate, "window": window, "compact_at": self.compact_at});
         ui::event("overflow", "context window exceeded; compacted and retrying", extra);
@@ -802,7 +811,7 @@ impl Agent {
     /// Asks again after a reply that came back unusable: lost, empty, or cut off at the output limit.
     fn retry(&mut self, what: &str) -> Result<()> {
         let content = format!("Your last reply {what}. {RETRY}");
-        ui::event("nudge", &content, Value::Null);
+        ui::record("nudge", &content, Value::Null);
         self.session.push(json!({"role": "user", "content": content, "meta": {"host": true, "nudge": true}}))
     }
 
@@ -1064,12 +1073,12 @@ impl Agent {
         if !inputs.is_empty() {
             rows.push(("inputs", format!("check inputs changed: {}", inputs.join(", "))));
         }
-        rows.push(("changes", if changes.is_empty() { "none".into() } else { changes.join("\n") }));
+        rows.push(("changes", if changes.is_empty() { "none".into() } else { capped(&changes, "\n") }));
         if elsewhere > 0 {
             rows.push(("elsewhere", format!("{elsewhere} more changed by another writer in this tree, left out")));
         }
         if !outside.is_empty() {
-            let text = format!("not through low's edit()/write(), maybe outside low: {}", outside.join(", "));
+            let text = format!("not through low's edit()/write(), maybe outside low: {}", capped(&outside, ", "));
             rows.push(("outside", text));
         }
         if changed && !self.repo {
@@ -1243,21 +1252,25 @@ impl Agent {
         markdown.finish();
     }
 
+    /// /compact: compacts the context now and says what it did.
     pub fn compact(&mut self) -> Result<()> {
-        self.compact_to(self.compact_at as usize / 5, false)
+        let done = self.compact_to(self.compact_at as usize / 5, false)?;
+        ui::note(&done);
+        self.session.flush()
     }
 
-    fn compact_to(&mut self, keep_tokens: usize, whole: bool) -> Result<()> {
+    /// Compacts the context and returns what it did, for /compact to show and for a compaction low decided on to log.
+    fn compact_to(&mut self, keep_tokens: usize, whole: bool) -> Result<String> {
         let prev = self.session.keep();
         let keep = compact::cut(&self.session.entries, prev, keep_tokens, whole);
         if keep <= prev {
             let kept = ui::tokens(keep_tokens as u64);
-            ui::note(&format!("nothing to compact: the conversation fits in the {kept} compaction keeps"));
-            return Ok(());
+            return Ok(format!("nothing to compact: the conversation fits in the {kept} compaction keeps"));
         }
         let summary = compact::summary(&self.session.entries, keep);
-        ui::note(&format!("compacted entries #1-#{} into a {} byte summary", keep - 1, summary.len()));
-        self.session.push(json!({"compact": {"keep": keep, "summary": summary, "at": self.compact_at}}))
+        let done = format!("compacted entries #1-#{} into a {} byte summary", keep - 1, summary.len());
+        self.session.push(json!({"compact": {"keep": keep, "summary": summary, "at": self.compact_at}}))?;
+        Ok(done)
     }
 }
 
@@ -1415,7 +1428,8 @@ impl std::fmt::Display for Outcome {
     }
 }
 
-/// What a turn's report gives a result: the verdict, the final answer or question, and the rows low printed.
+/// What a turn's report gives a result: the verdict, the final answer or question, and the report's rows, including
+/// the ones the screen leaves out because the turn already showed them.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TurnReport {
     pub session: PathBuf,
@@ -1477,6 +1491,13 @@ impl Report {
     pub fn of(entry: &Value) -> Option<Self> {
         Self::deserialize(entry.get("report")?).ok()
     }
+}
+
+/// The first LISTED items joined by `sep`, then how many more there are.
+fn capped(items: &[String], sep: &str) -> String {
+    let more = items.len().saturating_sub(LISTED);
+    let shown = items[..items.len() - more].join(sep);
+    if more > 0 { format!("{shown}{sep}and {more} more") } else { shown }
 }
 
 /// A turn report's check row and verdict.
@@ -1744,7 +1765,7 @@ fn system_prompt(root: &Path, yolo: bool, check: Option<&str>, repo: bool, web: 
 
 /// The tracked files for the system prompt: a path and size per line within LISTING bytes, else a line per folder
 /// within TREE bytes; past both, a repo of over FILES files shows its first FILES two-level folders with file counts.
-/// Tells the user which form the model got and its size.
+/// Logs which form the model got and its size.
 fn listing(root: &Path) -> String {
     let tracked = git(root, None, &["ls-files"]).unwrap_or_default();
     let files: Vec<&str> = tracked.lines().collect();
@@ -1755,7 +1776,7 @@ fn listing(root: &Path) -> String {
         let (n, bytes) = (files.len(), text.len());
         let size = format!("{:.1} KB, ~{}", bytes as f64 / 1024.0, ui::tokens(bytes as u64 / 4));
         let extra = json!({"files": n, "form": form, "bytes": bytes});
-        ui::event("listing", &format!("repo map for the model: {n} tracked files as {form} ({size})"), extra);
+        ui::record("listing", &format!("repo map for the model: {n} tracked files as {form} ({size})"), extra);
         text
     };
     if files.is_empty() {

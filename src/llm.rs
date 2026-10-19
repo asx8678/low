@@ -329,8 +329,11 @@ impl Llm {
                         crate::ui::event("interrupted", &e.to_string(), extra);
                         return Err(e);
                     }
-                    crate::ui::event("interrupted", &format!("{e}; retrying from the start"), extra);
-                    tokio::time::sleep(Duration::from_secs(2 << attempt)).await;
+                    // On the status bar only while low waits; the event above shows it if low gives up.
+                    let wait = 2 << attempt;
+                    crate::ui::record("interrupted", &format!("{e}; retrying from the start"), extra);
+                    let _busy = crate::ui::busy(&format!("{e}; retrying from the start in {wait}s"));
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
                 }
                 Ok(mut message) => {
                     message["meta"]["timing"]["ms"] = crate::ui::ms(start).into();
@@ -491,7 +494,9 @@ impl Llm {
             let wait = wait.unwrap_or(2 << attempt).clamp(1, 300);
             let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             let extra = json!({"status": problem, "attempt": attempt, "wait_s": wait});
-            crate::ui::event("retry", &format!("{problem}; retrying"), extra);
+            // On the status bar only while low waits; if it gives up, the error says what failed.
+            crate::ui::record("retry", &format!("{problem}; retrying"), extra);
+            let _busy = crate::ui::busy(&format!("{problem}; retrying in {wait}s"));
             tokio::time::sleep(Duration::from_secs(wait) + Duration::from_millis(jitter.subsec_millis() as u64)).await;
         }
         unreachable!()

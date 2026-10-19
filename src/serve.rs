@@ -101,7 +101,10 @@ async fn answer(agent: &mut Agent, task: &str) -> Value {
         }
         task => match crate::unknown(task) {
             Some(why) => refused(why),
-            None => json!(agent.task(task).await),
+            None => {
+                crate::ui::task(task);
+                json!(agent.task(task).await)
+            }
         },
     }
 }

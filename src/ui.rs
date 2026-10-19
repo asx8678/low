@@ -13,7 +13,6 @@ struct Bar {
     cols: u16,
     started: Instant,
     activity: String,
-    plan: String,
     tokens: (u64, u64),
 }
 
@@ -70,14 +69,8 @@ impl Turn {
         let Some((rows, cols)) = size().filter(|_| styled()) else { return Turn(None) };
         reserve(rows);
         let started = Instant::now();
-        *BAR.lock().unwrap() = Some(Bar {
-            rows,
-            cols,
-            started,
-            activity: "waiting for the model".into(),
-            plan: String::new(),
-            tokens: (0, 0),
-        });
+        *BAR.lock().unwrap() =
+            Some(Bar { rows, cols, started, activity: "waiting for the model".into(), tokens: (0, 0) });
         draw();
         BARRED.store(true, Ordering::Relaxed);
         Turn(Some(tokio::spawn(async {
@@ -149,8 +142,7 @@ fn draw() {
     let secs = bar.started.elapsed().as_secs();
     let (prompt, cached) = bar.tokens;
     let cache = (cached * 100).checked_div(prompt).map(|p| format!(" · {p}% cached")).unwrap_or_default();
-    let lead = if bar.plan.is_empty() { bar.activity.clone() } else { format!("{} · {}", bar.plan, bar.activity) };
-    let line = format!(" ▸ {lead} │ {}{cache} │ {} ", tokens(prompt), minutes(secs));
+    let line = format!(" ▸ {} │ {}{cache} │ {} ", bar.activity, tokens(prompt), minutes(secs));
     let line = fit(&line, bar.cols.saturating_sub(1) as usize);
     print!("\x1b7\x1b[{};1H\x1b[2K\x1b[7m{line}\x1b[0m\x1b8", bar.rows);
     let _ = std::io::stdout().flush();
@@ -229,6 +221,18 @@ pub fn width() -> usize {
 fn flat(text: &str, max: usize) -> String {
     let flat = printable(text).split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.width() <= max { flat } else { format!("{}…", fit(&flat, max)) }
+}
+
+/// A note cut to one line of the terminal.
+pub fn line(text: &str) -> String {
+    flat(text, width().saturating_sub(3).max(20))
+}
+
+/// Shows a task that wasn't typed here (a --tasks checklist line, a task from low --send) as the REPL's prompt shows a
+/// typed one, on one line.
+pub fn task(text: &str) {
+    let cols = size().map_or(120, |(_, cols)| cols as usize);
+    println!("› {}", flat(text, cols.saturating_sub(3).max(20)));
 }
 
 /// The first line of code that says what it does: not blank, a comment or an import.
@@ -435,42 +439,49 @@ pub fn ran(meta: &Value, out: &str) {
     if let Some(criteria) = meta["accepted"].as_str() {
         rows.push(format!("{} {}", paint("35", "◆ criteria"), flat(criteria, room.saturating_sub(11))));
     }
+    // What failed in a run is dim: the model reads it and goes on, and what is left failing at the end shows in red in
+    // the report.
     let mut failed = false;
-    for act in actions {
+    for (i, act) in actions.iter().enumerate() {
         let (tool, ok) = (flat(act["tool"].as_str().unwrap_or_default(), 20), act["ok"] == true);
-        let mark = if ok { paint("32", "✓") } else { paint("31", "✗") };
+        // One row per file: the run's later edits and writes of it add to its first row.
+        let same = |other: &&Value| other["ok"] == true && other["path"] == act["path"];
         match act["path"].as_str().map(|p| flat(p, 120)) {
+            Some(_) if ok && actions[..i].iter().any(|other| same(&other)) => {}
             Some(path) if ok => {
-                let (a, r) = (act["added"].as_u64().unwrap_or(0), act["removed"].as_u64().unwrap_or(0));
-                let (a, r) = (paint("32", &format!("+{a}")), paint("31", &format!("−{r}")));
-                rows.push(format!("{mark} {tool} {path}  {a} {r}"));
+                let sum =
+                    |key: &str| actions[i..].iter().filter(same).map(|a| a[key].as_u64().unwrap_or(0)).sum::<u64>();
+                let (a, r) = (paint("32", &format!("+{}", sum("added"))), paint("31", &format!("−{}", sum("removed"))));
+                rows.push(format!("{} {tool} {path}  {a} {r}", paint("32", "✓")));
             }
             Some(path) => {
                 let error = flat(act["error"].as_str().unwrap_or_default(), room.saturating_sub(20));
-                rows.push(format!("{mark} {tool} {path}: {error}"));
+                rows.push(paint("2", &format!("✗ {tool} {path}: {error}")));
             }
             None => {
-                rows.push(format!("{mark} check {}", if ok { "passed" } else { "FAILED" }));
+                rows.push(if ok {
+                    format!("{} check passed", paint("32", "✓"))
+                } else {
+                    paint("2", "✗ check FAILED")
+                });
                 (timed, failed) = (Some(rows.len() - 1), failed || !ok);
             }
         }
     }
     if failed {
-        rows.extend(
-            lines[lines.len().saturating_sub(3)..].iter().map(|l| paint("31", &format!("  {}", flat(l, room)))),
-        );
+        rows.extend(lines[lines.len().saturating_sub(3)..].iter().map(|l| paint("2", &format!("  {}", flat(l, room)))));
     }
     for (i, (cmd, exit)) in cmds.iter().enumerate() {
         if i == 3 {
             rows.push(paint("2", &format!("  +{} more commands", cmds.len() - 3)));
             break;
         }
-        let status = match exit.as_i64() {
-            Some(0) => paint("32", "✓"),
-            Some(code) => paint("31", &format!("✗ exit {code}")),
-            None => paint("31", &format!("✗ {}", flat(exit.as_str().unwrap_or("failed"), 40))),
-        };
-        rows.push(format!("{} {}  {status}", paint("36", "$"), flat(cmd, room.saturating_sub(14))));
+        let cmd = flat(cmd, room.saturating_sub(14));
+        rows.push(match exit.as_i64() {
+            Some(0) => format!("{} {cmd}  {}", paint("36", "$"), paint("32", "✓")),
+            Some(code) => paint("2", &format!("$ {cmd}  ✗ exit {code}")),
+            None => paint("2", &format!("$ {cmd}  ✗ {}", flat(exit.as_str().unwrap_or("failed"), 40))),
+        });
         timed = Some(rows.len() - 1);
     }
     if meta["plan"].is_object() {
@@ -478,7 +489,7 @@ pub fn ran(meta: &Value, out: &str) {
     }
     if let Some(name) = meta["exception"].as_str().filter(|_| actions.iter().all(|a| a["ok"] == true)) {
         let message = lines.iter().rev().find(|l| l.split(':').next().is_some_and(|head| head.ends_with(name)));
-        rows.push(paint("31", &format!("✗ {}", flat(message.unwrap_or(&name), room))));
+        rows.push(paint("2", &format!("✗ {}", flat(message.unwrap_or(&name), room))));
     }
     if let (Some(i), Some(secs)) = (timed, took) {
         rows[i] += &paint("2", &format!(" {secs:.1}s"));
@@ -506,11 +517,6 @@ fn plan(plan: &Value) -> Vec<String> {
         .collect();
     let done: Vec<u64> = plan["done"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
     let current = (1..=steps.len() as u64).find(|i| !done.contains(i));
-    let progress = match current {
-        Some(i) => format!("{}/{} {}", done.len(), steps.len(), steps[i as usize - 1]),
-        None => format!("{}/{} done", done.len(), steps.len()),
-    };
-    update(|bar| bar.plan = progress);
     let mut shown = PLAN.lock().unwrap();
     let rows = if shown.0 == steps {
         let fresh = (1u64..).zip(&steps).filter(|(i, _)| done.contains(i) && !shown.1.contains(i));
@@ -543,9 +549,14 @@ pub fn ms(start: Instant) -> u64 {
 }
 
 pub fn event(kind: &str, text: &str, extra: Value) {
+    show(text);
+    record(kind, text, extra);
+}
+
+/// Prints a line as an event shows, without logging it.
+pub fn show(text: &str) {
     settle();
     println!("{}", paint("33", &format!("· {}", printable(text))));
-    record(kind, text, extra);
 }
 
 /// Logs an event to the session without showing it.
@@ -586,12 +597,17 @@ impl Drop for Quiet {
     }
 }
 
+/// Prints a turn's report, without the rows the turn already showed: the task, the criteria, the plan's progress, and
+/// the check that VERIFIED stands for. A --json result keeps them all.
 pub fn report(rows: &[(impl AsRef<str>, String)], verdict: &str, good: bool) {
     settle();
     let head = format!("── {verdict} ") + &"─".repeat(36);
     println!("\n{}", paint(if good { "1;32" } else { "1;31" }, &head));
     let room = width().saturating_sub(12).max(30);
-    for (label, value) in rows.iter().filter(|(_, value)| !matches!(value.as_str(), "-" | "none")) {
+    let shown =
+        |label: &str| !matches!(label, "task" | "criteria" | "plan") && (label != "check" || verdict != "VERIFIED");
+    let rows = rows.iter().filter(|(label, value)| shown(label.as_ref()) && !matches!(value.as_str(), "-" | "none"));
+    for (label, value) in rows {
         println!("{} {}", paint("2", &format!("{:<9}", label.as_ref())), wrap(value, room).join("\n          "));
     }
 }

@@ -153,6 +153,7 @@ pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
                 None => next.text.clone(),
             },
         };
+        crate::ui::task(&next.text);
         let result = agent.task(&prompt).await;
         let mark = match result.status.as_str() {
             "done" => 'x',
