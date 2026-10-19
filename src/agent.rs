@@ -43,6 +43,19 @@ const LISTED: usize = 10;
 const GATE: &str = "The project check failed on the current tree. Fix what fails, run check(), then finish again. \
                     If it cannot pass, say why in one line. The check output ended with:";
 const RETRY: &str = "Send one run() now with the next step, or a shorter answer.";
+/// Told to the model once a turn, when it has spent three quarters of its budget (turn_budget's tokens or
+/// MAX_REQUESTS). It asks for focus, never for the turn to end: in a repository with no check an early reply is done,
+/// and a --tasks task would lose the turns a limit gives one that is still changing files. In the session logs
+/// (2026-10-19), 81 of 709 real turns hit the token budget, at a median of 101 runs, most of them still reading files.
+const WARN: &str = "This turn has used three quarters of its budget";
+const WARN_END: &str = "Spend them on the change itself: read only what the next edit needs, put several steps in each \
+                        run, and verify what you changed.";
+/// Asked once a turn-scoped limit stops a turn, so its last reply says where the work stands: the next turn, a --tasks
+/// continuation or the user's, starts from it instead of from what the cut left.
+const HANDOFF: &str = "This turn has reached its limit, so low runs no more code in it. Reply now in prose, without \
+                       run(): what you changed and how far you verified it, what is left to do, and the next step, so \
+                       the next turn can pick up from here.";
+const NOT_RUN: &str = "not run: this turn had reached its limit";
 const STRAY: &str = "This turn changed files without edit() or write():";
 const STRAY_END: &str = "Delete the ones that are scratch output from running code, keep any that are part of your answer, \
                          then finish again.";
@@ -489,7 +502,10 @@ impl Agent {
         let ceiling = self.compact_at * budget;
         let rule = "cached input counts a quarter";
         let mut limit = format!("stopped after {MAX_REQUESTS} model requests in one turn");
-        for _ in 0..MAX_REQUESTS {
+        // Whether the limit that stops the turn is the turn's own, which the model is asked to hand off from. Not the
+        // session's budget, a cap on spending, nor a model that is stuck or keeps sending unusable replies.
+        let mut handoff = true;
+        for made in 1..=MAX_REQUESTS {
             if state.spent >= ceiling {
                 limit =
                     format!("stopped after {} in one turn ({budget} × compact_at; {rule})", ui::tokens(state.spent));
@@ -498,6 +514,7 @@ impl Agent {
             if let Some(total) = self.over_budget() {
                 let spent = ui::tokens(self.spent());
                 limit = format!("stopped: the session has spent {spent} (session_budget {total} × compact_at; {rule})");
+                handoff = false;
                 break;
             }
             // What the user sent from the REPL during the turn goes in between requests, where every run has its result.
@@ -512,7 +529,9 @@ impl Agent {
                 let done = self.compact_to(self.compact_at as usize / 5, false)?;
                 ui::record("note", &done, Value::Null);
             }
+            let before = state.spent;
             let Some(message) = self.request(&mut state).await? else { continue };
+            let cost = state.spent - before;
             let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
             self.session.push(message)?;
             let (finished, asked) = self.act(&mut state, began, &calls).await?;
@@ -526,11 +545,13 @@ impl Agent {
             }
             if finished.is_none() && state.repeats >= REPEATS {
                 limit = format!("stopped: the model ran the same code to the same result {REPEATS} times in a row");
+                handoff = false;
                 break;
             }
             if let Some(report) = finished {
                 self.reply(&report, "finish()")?;
             } else if !calls.is_empty() {
+                self.warn(&mut state, ceiling, made, cost)?;
                 ui::activity("waiting for the model");
                 continue;
             }
@@ -539,7 +560,12 @@ impl Agent {
             return self.report(Some(changed), checked, state.stalled && !changed, began, clock).await;
         }
         ui::event("limit", &limit, Value::Null);
-        (self.current, self.limit) = (None, Some(limit));
+        // The limit is set first, so a Ctrl-C during the handoff still reports it.
+        self.limit = Some(limit);
+        if handoff {
+            self.handoff(&mut state).await?;
+        }
+        self.current = None;
         let changed = self.changed(&start, began).await;
         self.report(Some(changed), false, true, began, clock).await
     }
@@ -1024,6 +1050,55 @@ impl Agent {
         let content = format!("Your last reply {what}. {RETRY}");
         ui::record("nudge", &content, Value::Null);
         self.session.push(json!({"role": "user", "content": content, "meta": {"host": true, "nudge": true}}))
+    }
+
+    /// Once a turn, after the reply whose request brought it to three quarters of its token ceiling or of MAX_REQUESTS,
+    /// tells the model about how many requests it has left: the tokens left over the last request's `cost`, since each
+    /// costs more as the context grows. Not when that reply reached the limit itself: the handoff follows instead. If a
+    /// compaction drops the note, it is not sent again.
+    fn warn(&mut self, state: &mut TurnState, ceiling: u64, made: usize, cost: u64) -> Result<()> {
+        let near = state.spent * 4 >= ceiling * 3 || made * 4 >= MAX_REQUESTS * 3;
+        if state.warned || !near || state.spent >= ceiling || made >= MAX_REQUESTS {
+            return Ok(());
+        }
+        state.warned = true;
+        let left = (ceiling - state.spent).div_ceil(cost.max(1)).min((MAX_REQUESTS - made) as u64);
+        let s = if left == 1 { "" } else { "s" };
+        let text = format!("{WARN}: low stops it after about {left} more request{s} at the current size. {WARN_END}");
+        let extra = json!({"left": left, "spent": state.spent, "ceiling": ceiling, "requests": made});
+        ui::event("budget", &format!("three quarters of the turn's budget used, about {left} request{s} left"), extra);
+        self.session.push(json!({"role": "user", "content": text, "meta": {"host": true, "budget": true}}))
+    }
+
+    /// Asks the model, once, where the work stands after a turn-scoped limit stopped the turn, and keeps its reply as
+    /// the turn's answer. No code runs: a run() in the reply gets NOT_RUN for its result. An unusable reply or an error
+    /// leaves the turn without a handoff, as it was before low asked for one; an empty one leaves request()'s nudge to
+    /// act behind it. Its request counts toward session_budget, so a session that had only that much left gives a
+    /// --tasks task no extra turn.
+    async fn handoff(&mut self, state: &mut TurnState) -> Result<()> {
+        ui::show("asking the model where the work stands; no more code runs this turn");
+        self.host(HANDOFF.into())?;
+        let message = match self.request(state).await {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                ui::note("no handoff: the reply was unusable");
+                return Ok(());
+            }
+            Err(e) => {
+                ui::note(&format!("no handoff: {}", error_text(&e)));
+                return Ok(());
+            }
+        };
+        let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
+        self.session.push(message)?;
+        if !calls.is_empty() {
+            ui::event("handoff", "the model called run() after the limit; not run", Value::Null);
+        }
+        for call in calls {
+            self.session.push(json!({"role": "tool", "tool_call_id": call["id"], "content": NOT_RUN,
+                                     "meta": {"not_run": "limit"}}))?;
+        }
+        Ok(())
     }
 
     async fn call(&mut self, call: &Value) -> (String, Value) {
@@ -1862,6 +1937,8 @@ struct TurnState {
     failed_over: bool,
     /// Tokens spent, cached input counting a quarter.
     spent: u64,
+    /// The model was told the turn has used three quarters of its budget.
+    warned: bool,
     /// The last run's code and result, hashed, and how many runs in a row had the same.
     last_run: u64,
     repeats: usize,
