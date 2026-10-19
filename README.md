@@ -105,7 +105,7 @@ In the REPL:
 | `/think` | shows the model's last reasoning |
 | `/compact` | compacts the context now |
 
-While a turn runs, what you type shows on the row above the status bar, and Enter sends it to the model with its next request, once the runs in flight have their results: it steers the turn without stopping it. ↑ takes back the last line while no request has taken it. What the turn doesn't take (a line sent as the model writes its final reply, or a command such as `/cost`) runs when the turn ends, and a line not yet sent starts the next prompt. Ctrl-C still stops the turn, and puts what wasn't taken back at the prompt instead of running it.
+While a turn runs, what you type shows on the row above the status bar, and Enter sends it to the model with its next request, once the runs in flight have their results: it steers the turn without stopping it. A paste stays whole: Enter sends its lines as one message, with the indentation and blank lines inside it, and the row shows its line breaks as ⏎. ↑ takes back the last line while no request has taken it. What the turn doesn't take (a line sent as the model writes its final reply, or a command such as `/cost`) runs when the turn ends, and a line not yet sent starts the next prompt. Ctrl-C still stops the turn, and puts what wasn't taken back at the prompt instead of running it.
 
 ## Configuration
 

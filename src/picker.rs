@@ -34,6 +34,8 @@ pub enum Key {
     Backspace,
     Clear,
     Char(char),
+    /// What the terminal marked as pasted, whole: lines end in \n.
+    Paste(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -135,11 +137,12 @@ impl State {
             Key::Right => self.effort = (self.effort + 1).min(EFFORTS.len()),
             Key::Enter => return (self.len() > 0).then_some(true),
             Key::Esc => return Some(false),
-            Key::Backspace | Key::Clear | Key::Char(_) => {
+            Key::Backspace | Key::Clear | Key::Char(_) | Key::Paste(_) => {
                 match key {
                     Key::Backspace => drop(self.filter.pop()),
                     Key::Clear => self.filter.clear(),
                     Key::Char(c) => self.filter.push(c),
+                    Key::Paste(text) => self.filter.extend(text.chars().filter(|c| !c.is_control())),
                     _ => {}
                 }
                 self.refilter();
@@ -232,7 +235,8 @@ pub fn render(state: &State, cols: usize) -> Vec<String> {
     lines
 }
 
-/// The keys in what one read of the terminal brought. Escape sequences low has no use for are skipped.
+/// The keys in what one read of the terminal brought. Escape sequences low has no use for are skipped; a bracketed paste
+/// is one key, its text as pasted.
 pub fn keys(bytes: &[u8]) -> Vec<Key> {
     let mut out = vec![];
     let mut i = 0;
@@ -246,6 +250,14 @@ pub fn keys(bytes: &[u8]) -> Vec<Key> {
                     let Some(end) = bytes[start..].iter().position(|b| (0x40..=0x7e).contains(b)) else { break };
                     let (params, last) = (&bytes[start..start + end], bytes[start + end]);
                     i = start + end + 1;
+                    if (last, params) == (b'~', b"200") {
+                        let body = &bytes[i..];
+                        let end = body.windows(PASTE_END.len()).position(|w| w == PASTE_END).unwrap_or(body.len());
+                        let text = String::from_utf8_lossy(&body[..end]).replace("\r\n", "\n").replace('\r', "\n");
+                        out.push(Key::Paste(ui::printable(&text)));
+                        i += (end + PASTE_END.len()).min(body.len());
+                        continue;
+                    }
                     out.extend(match (last, params) {
                         (b'A', _) => Some(Key::Up),
                         (b'B', _) => Some(Key::Down),
@@ -285,8 +297,20 @@ pub fn keys(bytes: &[u8]) -> Vec<Key> {
     out
 }
 
-/// Whether the bytes end inside an escape sequence, so the rest is still on its way.
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Whether the bytes hold the start of a paste and not its end.
+pub fn pasting(bytes: &[u8]) -> bool {
+    let last = |what: &[u8]| bytes.windows(what.len()).rposition(|w| w == what);
+    last(PASTE_START).is_some_and(|start| last(PASTE_END).is_none_or(|end| end < start))
+}
+
+/// Whether the bytes end inside an escape sequence or a paste, so the rest is still on its way.
 pub fn incomplete(bytes: &[u8]) -> bool {
+    if pasting(bytes) {
+        return true;
+    }
     let Some(at) = bytes.iter().rposition(|&b| b == 0x1b) else { return false };
     match &bytes[at + 1..] {
         [] => true,
@@ -454,7 +478,7 @@ mod tests {
         assert_eq!(keys(b"\x1b"), [Key::Esc]);
         assert_eq!(keys(b"\x03"), [Key::Esc]);
         assert_eq!(keys(b"g\xc3\xa9\x7f\n"), [Key::Char('g'), Key::Char('é'), Key::Backspace, Key::Enter]);
-        assert_eq!(keys(b"\x1b[200~x\x1b[201~"), [Key::Char('x')]);
+        assert_eq!(keys(b"\x1b[200~x\x1b[201~"), [Key::Paste("x".into())]);
         assert_eq!(keys(b"\x15\x01"), [Key::Clear]);
     }
 
@@ -466,6 +490,18 @@ mod tests {
         assert!(incomplete(b"\x1bO"));
         assert!(!incomplete(b"\x1b[A"));
         assert!(!incomplete(b"abc"));
+    }
+
+    #[test]
+    fn a_paste_is_one_key_and_waits_for_its_end() {
+        let paste = b"a\x1b[200~fn f() {\r\n\tx\r\n\r\n/cost\x1b[2J\x1b[201~\r";
+        let text = "fn f() {\n\tx\n\n/cost[2J".to_string();
+        assert_eq!(keys(paste), [Key::Char('a'), Key::Paste(text), Key::Enter]);
+        for cut in [9, 20, paste.len() - 4] {
+            assert!(incomplete(&paste[..cut]) && pasting(&paste[..cut]), "{cut}");
+        }
+        assert!(!incomplete(paste) && !pasting(paste));
+        assert!(pasting(b"\x1b[200~a\x1b[201~\x1b[200~b"));
     }
 
     #[test]

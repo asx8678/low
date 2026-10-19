@@ -125,12 +125,15 @@ impl Steer {
     fn key(&mut self, key: Key) {
         match key {
             Key::Char(c) => self.typing.push(c),
+            Key::Paste(text) => self.typing.push_str(&text),
             Key::Backspace => drop(self.typing.pop()),
             Key::Clear => self.typing.clear(),
             Key::Enter => {
-                let line = std::mem::take(&mut self.typing);
-                if !line.trim().is_empty() {
-                    self.sent.push(line.trim().to_string());
+                let text = std::mem::take(&mut self.typing);
+                // Blank lines around it go, but a paste's first line keeps its indentation, as the lines after it do.
+                let start = text.find(|c: char| !c.is_whitespace()).map(|i| text[..i].rfind('\n').map_or(0, |n| n + 1));
+                if let Some(start) = start {
+                    self.sent.push(text[start..].trim_end().to_string());
                 }
             }
             // Takes back the last line sent, while no request has taken it.
@@ -157,15 +160,21 @@ impl Steer {
             return paint("2", fit(&format!("› {hint}"), room));
         }
         let queued = if self.sent.is_empty() { String::new() } else { format!("  {} queued", self.sent.len()) };
-        let typed = printable(&self.typing);
+        let typed = printable(&self.typing).replace('\n', "⏎").replace('\t', " ");
         let shown = ending(&typed, room.saturating_sub(3 + queued.width()));
         format!("{} {shown}▏{}", paint("36", "›"), paint("2", &queued))
     }
 }
 
-/// A line the REPL takes as a command, or as a typo of one: its first word is /name. A path such as /src/main.rs is not.
+/// A line the REPL takes as a command, or as a typo of one: its first word is /name. A path such as /src/main.rs is not,
+/// and nor is a pasted block of lines.
 fn command(line: &str) -> bool {
-    line.split_whitespace().next().and_then(|word| word.strip_prefix('/')).is_some_and(|name| !name.contains('/'))
+    !line.contains('\n')
+        && line
+            .split_whitespace()
+            .next()
+            .and_then(|word| word.strip_prefix('/'))
+            .is_some_and(|name| !name.contains('/'))
 }
 
 /// The longest end of `text` that fits in `cols` terminal columns.
@@ -199,6 +208,9 @@ impl Keys {
         quiet.special_codes[SpecialCodeIndex::VMIN] = 1;
         quiet.special_codes[SpecialCodeIndex::VTIME] = 0;
         tcsetattr(stdin(), OptionalActions::Now, &quiet).ok()?;
+        // The terminal marks what is pasted, so a block of lines arrives as one message instead of a line each.
+        print!("\x1b[?2004h");
+        let _ = std::io::stdout().flush();
         let stop = Arc::new(AtomicBool::new(false));
         let thread = std::thread::spawn({
             let stop = stop.clone();
@@ -214,33 +226,38 @@ impl Drop for Keys {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        print!("\x1b[?2004l");
+        let _ = std::io::stdout().flush();
         let _ = tcsetattr(stdin(), OptionalActions::Now, &self.saved);
     }
 }
 
 fn listen(stop: &AtomicBool) {
+    let mut buf = vec![];
+    let mut more = [0; 4096];
     while !stop.load(Ordering::Relaxed) {
         // Waking now and then notices the turn ended.
         if !picker::ready(100) {
             continue;
         }
-        let mut buf = vec![0; 256];
-        let n = match rustix::io::read(stdin(), &mut buf[..]) {
+        match rustix::io::read(stdin(), &mut more[..]) {
             Ok(0) => return,
-            Ok(n) => n,
+            Ok(n) => buf.extend_from_slice(&more[..n]),
             Err(rustix::io::Errno::INTR) => continue,
             Err(_) => return,
-        };
-        buf.truncate(n);
+        }
         while picker::incomplete(&buf) && picker::ready(50) {
-            let mut more = [0; 64];
             match rustix::io::read(stdin(), &mut more[..]) {
                 Ok(n @ 1..) => buf.extend_from_slice(&more[..n]),
                 _ => break,
             }
         }
+        // A paste waits for its end however slowly the rest comes, so none of its lines is sent on its own.
+        if picker::pasting(&buf) {
+            continue;
+        }
         let mut steer = STEER.lock().unwrap();
-        for key in picker::keys(&buf) {
+        for key in picker::keys(&std::mem::take(&mut buf)) {
             steer.key(key);
         }
         drop(steer);
@@ -308,7 +325,7 @@ pub fn guard() {
 extern "C" fn quit(signal: libc::c_int) {
     let group = CHECK.load(Ordering::Relaxed);
     let reset: &[u8] = match (BARRED.load(Ordering::Relaxed), STEERING.load(Ordering::Relaxed)) {
-        (true, true) => b"\x1b7\x1b[999;1H\x1b[2K\x1b[1A\x1b[2K\x1b[r\x1b8\n",
+        (true, true) => b"\x1b[?2004l\x1b7\x1b[999;1H\x1b[2K\x1b[1A\x1b[2K\x1b[r\x1b8\n",
         (true, false) => b"\x1b7\x1b[999;1H\x1b[2K\x1b[r\x1b8\n",
         _ => b"",
     };
@@ -875,6 +892,18 @@ mod tests {
         assert_eq!(steer.take().as_deref(), Some("one\n/src/main.rs too"));
         assert_eq!(steer.take(), None);
         assert_eq!(steer.sent, ["/cost", "three"]);
+    }
+
+    #[test]
+    fn a_paste_is_one_message_however_many_lines() {
+        let mut steer = typed(b"\x1b[200~fix this:\r\n\tfn f() {\r\n\r\n/cost\x1b[201~");
+        let row = steer.row(60);
+        assert!(row.ends_with("fix this:⏎ fn f() {⏎⏎/cost▏") && !row.contains(['\n', '\t']), "{row:?}");
+        steer.key(Key::Enter);
+        assert_eq!(steer.take().as_deref(), Some("fix this:\n\tfn f() {\n\n/cost"));
+        // Only the blank lines around it go: the first line keeps its indentation, as the others do.
+        let mut steer = typed(b"\x1b[200~\r\n  \r\n    def f():\r\n        pass\r\n\r\n\x1b[201~\r");
+        assert_eq!(steer.take().as_deref(), Some("    def f():\n        pass"));
     }
 
     #[test]
