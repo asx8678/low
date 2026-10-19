@@ -178,9 +178,11 @@ Every turn ends with one of four verdicts:
 
 **Outside a git repository** low still runs, but it can't undo: the turn report lists what `edit` and `write` changed and says so. In your home directory, or above it, low can read files but not change them (your account's home counts even when `HOME` names another folder), because writes there could reach shell startup files and launch agents outside the sandbox.
 
-**Turn limits:** a turn stops at its token budget (`turn_budget`) or after 200 requests. Once it has used three quarters of either, the model is told about how many requests it has left and asked to spend them on the change rather than on reading; it is not asked to stop early, so a `--tasks` task cut off while it is still changing files keeps its extra turns. At the stop, low asks the model once more, running no code, where the work stands: what changed, what is left and the next step. That reply is the turn's answer, and the next turn starts from it. The session's budget (`session_budget`) caps spending, so it stops without asking.
-
 **Sessions** are JSONL files in `~/.low/sessions`. Each task the model gets ends with the date it was given on, in your time zone, so the system prompt stays the same and cached. When the context reaches `compact_at`, low compacts it without an LLM call: it keeps the task, the latest messages and a summary rebuilt from the log. The summary cites what it replaced as entries (`#412`), and `recall(412)` opens one as it was; the summary says so too, so a session started before `recall` existed learns of it at its next compaction.
+
+**Requests** carry the session's id in an `x-session-affinity` header. A gateway that spreads a model over several replicas can route by it, so the session keeps reaching the one that has its prompt cached; a server that doesn't know the header ignores it.
+
+**Turn limits:** a turn stops at its token budget (`turn_budget`) or after 200 requests. Once it has used three quarters of either, the model is told about how many requests it has left and asked to spend them on the change rather than on reading; it is not asked to stop early, so a `--tasks` task cut off while it is still changing files keeps its extra turns. At the stop, low asks the model once more, running no code, where the work stands: what changed, what is left and the next step. That reply is the turn's answer, and the next turn starts from it. The session's budget (`session_budget`) caps spending, so it stops without asking.
 
 ## Development
 

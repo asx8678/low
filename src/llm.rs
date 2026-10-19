@@ -191,6 +191,10 @@ pub struct Llm {
     model: String,
     params: Value,
     session: Option<String>,
+    /// The session's id, sent as x-session-affinity: a gateway that spreads a model over replicas can route by it,
+    /// so the session keeps reaching the one that has its prompt cached (pi-ai sends it for Fireworks). A server that
+    /// doesn't know the header ignores it.
+    affinity: Option<String>,
     field: Cell<&'static str>,
     /// The provider refused stream_options, so requests go without it and the usage is estimated.
     plain: Cell<bool>,
@@ -214,6 +218,7 @@ impl Llm {
             model: header["model"].as_str().unwrap_or_default().into(),
             params: params(header),
             session: session_id(base_url, header),
+            affinity: header["id"].as_str().filter(|id| !id.is_empty()).map(String::from),
             field: Cell::new(FIELDS[0]),
             plain: Default::default(),
         }
@@ -231,8 +236,12 @@ impl Llm {
         }
     }
 
-    /// What every request carries besides the user agent: OpenCode's session id and the API key.
+    /// What every request carries besides the user agent: the session's id to route by, as OpenCode's too, and the
+    /// API key.
     fn authorized(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(id) = &self.affinity {
+            request = request.header("x-session-affinity", id.as_str());
+        }
         if let Some(id) = &self.session {
             request = request.header("x-opencode-session", id.as_str());
         }

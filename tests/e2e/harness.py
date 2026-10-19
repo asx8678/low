@@ -77,8 +77,8 @@ class Env:
                 'asides': [e['body'] for e in self.asides()[looked:]]}
 
     def entries(self):
-        """What the mock recorded of every request: i, at, auth, body (parsed) and raw (the bytes sent). A second
-        look's requests are in asides() instead."""
+        """What the mock recorded of every request: i, at, auth, headers, body (parsed) and raw (the bytes sent). A
+        second look's requests are in asides() instead."""
         return [x for x in self._recorded() if not x.get('aside')]
 
     def asides(self):

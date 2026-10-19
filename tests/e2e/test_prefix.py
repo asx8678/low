@@ -1,6 +1,7 @@
 """The prompt cache golden check: in a session without compaction or a model or effort switch, every request's
 messages start the next one's unchanged (each compared as sent, key order included), across turns and a --resume,
-with the same tools and parameters; reasoning goes back whole, however long."""
+with the same tools and parameters and the session's id in x-session-affinity; reasoning goes back whole, however
+long."""
 import datetime, json
 from harness import Env, check, done
 
@@ -33,6 +34,8 @@ for k, (a, b) in enumerate(zip(raws, raws[1:])):
 check(f'each of {len(raws)} requests starts the next one', len(raws) == 7 and not broken, broken or len(raws))
 echoed = [m.get('reasoning_content', '') for m in raws[2]['messages'] if m['role'] == 'assistant']
 check('a 21 KB reasoning goes back whole', LONG in echoed, [len(x) for x in echoed])
+ids = {x['headers'].get('x-session-affinity') for x in e.entries()}
+check('every request carries the session id in x-session-affinity', ids == {e.log()[0]['id']}, ids)
 today = f'\n\n[Today is {datetime.date.today().isoformat()}]'
 tasks = [m['content'] for m in raws[-1]['messages'] if m['role'] == 'user']
 check('each task ends with the date it was given on',

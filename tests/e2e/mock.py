@@ -21,9 +21,9 @@ own index. A reply has any of:
   touch, after            [path, text] written into REPO before answering (another writer), then `after` s more
   prompt, cached          usage numbers to report instead of the simulated ones
 
-Every request is appended to REQUESTS.jsonl: its index, time, Authorization header, parsed body and raw body. Usage
-is simulated with a perfect prefix cache: cached = the longest common prefix of the messages' JSON with any earlier
-request's, / 4, floored to 64-token blocks; prompt = the messages' JSON bytes / 4.
+Every request is appended to REQUESTS.jsonl: its index, time, Authorization header, headers (names lowercased), parsed
+body and raw body. Usage is simulated with a perfect prefix cache: cached = the longest common prefix of the messages'
+JSON with any earlier request's, / 4, floored to 64-token blocks; prompt = the messages' JSON bytes / 4.
 
 POST /v1/tools/search and /v1/tools/fetch answer as DeepSeek's tools API does, from PAGES: search returns every page
 not on an open host, its URL with DeepSeek's #1 and the query in its title; fetch returns a page's text with a
@@ -121,7 +121,8 @@ class H(BaseHTTPRequestHandler):
                                  script.get('default', {'content': 'Done.'}))
             with open(logfile, 'a') as f:
                 f.write(json.dumps({'i': i, **({'aside': True} if aside else {}), 'at': time.time(),
-                                    'auth': self.headers.get('authorization'), 'body': req,
+                                    'auth': self.headers.get('authorization'),
+                                    'headers': {k.lower(): v for k, v in self.headers.items()}, 'body': req,
                                     'raw': raw.decode()}) + '\n')
         time.sleep(reply.get('delay', 0))
         if 'touch' in reply:
