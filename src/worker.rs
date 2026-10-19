@@ -584,9 +584,13 @@ fn newest_python(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
 mod tests {
     use serde_json::{Value, json};
 
-    /// Runs code the way the agent does, answering check() with a pass.
     async fn run(worker: &mut super::Worker, code: &str) -> Value {
-        let mut reply = worker.run(code, &json!({})).await.unwrap();
+        run_with(worker, code, &json!({})).await
+    }
+
+    /// Runs code the way the agent does, answering check() with a pass.
+    async fn run_with(worker: &mut super::Worker, code: &str, state: &Value) -> Value {
+        let mut reply = worker.run(code, state).await.unwrap();
         while reply["needs_check"] == true {
             reply = worker.resume(true, "[check passed: true]").await.unwrap();
         }
@@ -889,6 +893,51 @@ mod tests {
         let mut worker = super::Worker::reader(&dir, true).unwrap();
         let reply = worker.run("show('pkg/sub/m.py')", &json!({})).await.unwrap();
         assert!(!reply["out"].as_str().unwrap().contains("RULES") && reply["guides"].is_null(), "{reply}");
+        drop(worker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// show(path, regex) prints each definition with a line that matches; undo() puts back what this turn's edit() and
+    /// write() changed, from the snapshot the turn began with, and removes the files its write() created.
+    #[tokio::test]
+    async fn blocks_and_undo() {
+        let dir = std::env::temp_dir().join(format!("low-worker-undo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut worker = super::Worker::start(&dir, true, Some("true"), None).unwrap();
+        let file = "import os\\n\\n\\ndef first():\\n    x = 1\\n    return x\\n\\n\\nclass K:\\n    def method(self):\\n        y = 2\\n        return y\\n";
+        for (code, out) in [
+            (
+                format!("write('b.py', '{file}')\nshow('b.py', r'return y')"),
+                "write b.py: ok\n[b.py: the blocks with a line matching 'return y', lines 10-12 of 12]\n10:     def method(self):\n11:         y = 2\n12:         return y\n",
+            ),
+            (
+                "show('b.py', r'x = 1|y = 2')".into(),
+                "[b.py: the blocks with a line matching 'x = 1|y = 2', lines 4-6, 10-12 of 12]\n4: def first():\n5:     x = 1\n6:     return x\n…\n10:     def method(self):\n11:         y = 2\n12:         return y\n",
+            ),
+            ("show('b.py', 'zzz')".into(), "[b.py: no line matches 'zzz']\n"),
+        ] {
+            assert_eq!(run(&mut worker, &code).await["out"], out, "{code}");
+        }
+        let git =
+            |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&dir).output().unwrap().stdout;
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        let tree = String::from_utf8_lossy(&git(&["write-tree"])).trim().to_string();
+        let state = json!({"turn": 7, "snapshot": tree});
+        let changed = "edit('b.py', 'x = 1', 'x = 9')\nwrite('c.py', 'z = 1\\n')";
+        assert_eq!(run_with(&mut worker, changed, &state).await["out"], "edit b.py: ok\nwrite c.py: ok\n");
+        assert_eq!(run_with(&mut worker, "undo()", &state).await["out"], "undo b.py: ok\nundo c.py: removed\n");
+        assert!(std::fs::read_to_string(dir.join("b.py")).unwrap().contains("x = 1") && !dir.join("c.py").exists());
+        let reply = run_with(&mut worker, "undo('nope.py')", &state).await;
+        assert!(reply["out"].as_str().is_some_and(|out| out.contains("nope.py was not in the snapshot")), "{reply}");
+        let next = json!({"turn": 8, "snapshot": tree});
+        let reply = run_with(&mut worker, "undo()", &next).await;
+        assert_eq!(reply["out"], "[undo: edit() and write() changed nothing this turn]\n", "{reply}");
+        let reply = run(&mut worker, "undo()").await;
+        assert!(
+            reply["out"].as_str().is_some_and(|out| out.contains("takes none outside a git repository")),
+            "{reply}"
+        );
         drop(worker);
         let _ = std::fs::remove_dir_all(&dir);
     }

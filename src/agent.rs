@@ -93,8 +93,13 @@ const REFUTED_END: &str = "Fix the code or correct the report, then finish again
                            line.";
 /// DeepSeek's own tool-call markup, which leaks into a run()'s code at times: what follows it is no Python.
 const MARKUP: &[&str] = &["<｜end▁of▁thinking｜>", "｜DSML｜"];
-const HELPERS: &[&str] =
-    &["sh", "show", "accept", "edit", "write", "check", "plan", "done", "finish", "ask", "search", "fetch", "recall"];
+const HELPERS: &[&str] = &[
+    "sh", "show", "accept", "edit", "write", "undo", "check", "plan", "done", "finish", "ask", "search", "fetch",
+    "recall",
+];
+/// The undo() line, in the prompt only inside a git repository, where a turn has a snapshot to restore from.
+const UNDO: &str = "undo(*paths)                  # put files back as they were when this turn began (default: all this \
+                    turn changed); files write() created are removed\n";
 /// The helpers that reach the web, in the prompt only when config.toml's search names a provider.
 const WEB: &str = "search(query, count=10) -> list  # web search: [{title, url, summary, date, site_name}]; site:, \"phrase\", \
                    after:2025 work; query up to 128 chars, count up to 50\nfetch(url) -> str             # a web page \
@@ -1155,8 +1160,12 @@ impl Agent {
 
     async fn run_code(&mut self, code: &str) -> (String, Value) {
         ui::run(code);
-        let state = self.session.state();
-        let state = json!({"accepted": state.accepted, "plan": state.plan, "guides": self.session.guides()});
+        let (state, turn) = (self.session.state(), self.current.map(|(began, _)| began));
+        // undo() restores from the snapshot this turn began with.
+        let snapshot =
+            turn.and_then(|began| self.session.entries[began]["meta"]["snapshot"].as_str()).unwrap_or_default();
+        let state = json!({"accepted": state.accepted, "plan": state.plan, "guides": self.session.guides(), "turn": turn,
+                           "snapshot": snapshot});
         let clock = Instant::now();
         let ran = async {
             let mut reply = self.worker()?.run(code, &state).await?;
@@ -2285,6 +2294,9 @@ fn system_prompt(root: &Path, yolo: bool, config: &Config, repo: bool, web: bool
     if !web {
         prompt = prompt.replace(WEB, "");
     }
+    if !repo {
+        prompt = prompt.replace(UNDO, "");
+    }
     let from = config.detected.as_ref().map(|d| d.from.as_str());
     prompt += &match (config.check.as_deref(), from) {
         (Some(check), Some(from)) => {
@@ -2421,10 +2433,12 @@ fn tools() -> Value {
 
 #[cfg(test)]
 mod tests {
-    /// The prompt names the web helpers in exactly the text WEB removes when search is off, and every OPEN host in it.
+    /// The prompt names the web helpers in exactly the text WEB removes when search is off, and every OPEN host in it;
+    /// undo() in the text UNDO removes outside a git repository.
     #[test]
     fn web_lines_match_the_prompt() {
         assert_eq!(include_str!("prompt.md").matches(super::WEB).count(), 1);
+        assert_eq!(include_str!("prompt.md").matches(super::UNDO).count(), 1);
         for host in super::OPEN {
             assert!(super::WEB.contains(host), "{host} is open but the prompt doesn't name it");
         }

@@ -13,6 +13,9 @@ OUT_CAP = 64 << 20  # what a run's own printing may put on disk; past it, output
 RUN_CAP = 570
 GUIDES = ("AGENTS.md", "CLAUDE.md")  # a folder's instructions: the first of these it has
 GUIDE_CAP = 8 << 10  # characters of one folder's instructions a run shows; show() reads the rest
+DEFINITION = re.compile(r"\s*(?:(?:pub(?:\([^)]*\))?|async|export|default|static|public|private|protected|final|"
+                        r"abstract|override|unsafe|extern|const|inline|virtual)\s+)*(?:def|class|fn|func|function|impl|"
+                        r"struct|enum|trait|interface|module|mod|object|record|type)\b")
 IGNORABLE = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r(?!\n)")
 ESCAPED = re.compile(r"\\([!-/:-@\[-`{-~])")  # markdown's backslash before ASCII punctuation, as DeepSeek's fetch writes it
@@ -25,6 +28,7 @@ _report = {}
 _state = {}
 _checked = None
 _said = 0  # bytes this run printed through edit, write and check, the output the model can predict
+_turn = {}  # what this turn's edit() and write() changed and created, for undo()
 _groups = set()
 _spawned = []  # the commands this run's code started with subprocess, each with its Popen, for their exit status
 _Popen, _os_system = subprocess.Popen, os.system  # low's own commands; the run's code gets _Seen and _system
@@ -213,7 +217,7 @@ def _guide(path):
         print(f"[{rel}: instructions for the files in {folder}/, shown once{more}]\n{text.rstrip()}\n[end of {rel}]")
 
 
-def _change(tool, path, make):
+def _change(tool, path, make, fmt=True):
     rel = _rel(path)
     real = os.path.realpath(os.path.join(ROOT, rel))
     signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
@@ -242,17 +246,23 @@ def _change(tool, path, make):
         if notes:
             action["reindented"] = len(notes)
         _report.setdefault("actions", []).append(action)
+        _turn.setdefault("touched", set()).add(rel)
+        if tool == "write" and not st:
+            _turn.setdefault("created", set()).add(rel)
     except Exception as e:
         _report.setdefault("actions", []).append({"tool": tool, "path": rel, "ok": False, "error": str(e)})
         raise
     finally:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
     _forget()
+    if not os.path.lexists(os.path.join(ROOT, rel)):
+        _say(f"{tool} {rel}: removed")
+        return
     note = "".join(f"; {n}" for n in notes)
-    if FMT:
+    if FMT and fmt:
         out, code = _exec(f"{FMT} {shlex.quote('./' + rel if rel.startswith('-') else rel)}", 60)
         note = f"; fmt failed: {out.strip().splitlines()[0] if out.strip() else code}" if code else ""
-    with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+    with open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace") as f:
         after = f.read()
     written = written.replace("\r\n", "\n")
     if after != written:
@@ -485,6 +495,38 @@ def write(path, content):
     _change("write", path, make)
 
 
+def undo(*paths):
+    tree = str(_state.get("snapshot") or "").split(" ")[0]
+    if not tree:
+        raise ValueError("undo() needs the snapshot low takes when a turn begins, and it takes none outside a git repository")
+    paths = paths or sorted(_turn.get("touched", ()))
+    if not paths:
+        _say("[undo: edit() and write() changed nothing this turn]")
+    for path in paths:
+        rel = _rel(path)
+        p = _Popen(["git", "cat-file", "blob", f"{tree}:{rel}"], cwd=ROOT, stdout=subprocess.PIPE,
+                   stderr=subprocess.DEVNULL)
+        blob = p.communicate()[0]
+        if p.returncode and rel not in _turn.get("created", ()):
+            raise ValueError(f"{rel} was not in the snapshot taken when this turn began, and write() did not create it")
+        _change("undo", rel, lambda full, rel: _put(full, None if p.returncode else blob), fmt=False)
+
+
+def _put(full, data):
+    """Writes data (bytes) to full, or removes it when data is None; returns the text before and after."""
+    before = ""
+    if os.path.lexists(full):
+        with open(full, encoding="utf-8", errors="replace") as f:
+            before = f.read()
+    if data is None:
+        os.remove(full)
+        return before, ""
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "wb") as f:
+        f.write(data)
+    return before, data.decode("utf-8", "replace")
+
+
 def _commands(cmd):
     """The commands a shell line runs, each as its name and arguments; none when it does not parse."""
     lexer = shlex.shlex(str(cmd), posix=True, punctuation_chars=True)
@@ -606,6 +648,65 @@ def _system(command):
     return status
 
 
+def _block(lines, i):
+    """Lines (0-based, inclusive) of the definition around line i: the nearest def/fn/class/... line at or above it and
+    less indented, else the top-level statement it is in, down to the line before the next one at that indentation (a
+    closing bracket line included). Past 200 lines, the 10 lines above i and the 40 below instead."""
+    width = lambda s: len(s) - len(s.lstrip())  # noqa: E731
+    k = width(lines[i])
+    start = next((j for j in range(i, -1, -1)
+                  if lines[j].strip() and DEFINITION.match(lines[j]) and (j == i or width(lines[j]) < k)), None)
+    if start is None:
+        start = next((j for j in range(i, -1, -1) if lines[j].strip() and not width(lines[j])), i)
+    end, k = len(lines) - 1, width(lines[start])
+    for j in range(start + 1, len(lines)):
+        text = lines[j].strip()
+        if text and width(lines[j]) <= k and not (text[0] in ")]}" and text.endswith(("{", ":", "(", "[", "=>"))):
+            end = j if text[0] in ")]}" or re.match(r"end\b", text) else j - 1
+            break
+    while end > start and not lines[end].strip():
+        end -= 1
+    if start == end:  # no structure around it, as in prose: its paragraph
+        while start > 0 and lines[start - 1].strip():
+            start -= 1
+        while end + 1 < len(lines) and lines[end + 1].strip():
+            end += 1
+    while start > 0 and lines[start - 1].lstrip().startswith(("@", "#[", "///", "//!")):
+        start -= 1
+    return (start, end) if end - start < 200 else (max(0, i - 10), min(len(lines) - 1, i + 40))
+
+
+def _blocks(path, full, pattern):
+    """show(path, regex): each definition with a line matching pattern, numbered, a gap between them marked."""
+    rel = _rel(path)
+    with open(full, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    spans = []
+    for a, b in sorted(_block(lines, i) for i, line in enumerate(lines) if re.search(pattern, line)):
+        if spans and a <= spans[-1][1] + 1:
+            spans[-1][1] = max(spans[-1][1], b)
+        else:
+            spans.append([a, b])
+    if not spans:
+        print(f"[{rel}: no line matches {pattern!r}]")
+        return
+    numbers = [n for a, b in spans for n in range(a + 1, b + 2)]
+    sys.stdout.flush()
+    room, rows, shown = 2 * HALF - os.fstat(1).st_size - 2000, [], 0
+    for n in numbers:
+        room -= len(lines[n - 1]) + len(str(n)) + 3
+        if room < 0 and shown:
+            break
+        if shown and n != numbers[shown - 1] + 1:
+            rows.append("…")
+        rows.append(f"{n}: {lines[n - 1]}")
+        shown += 1
+    where = ", ".join(f"{a + 1}-{b + 1}" if b > a else f"{a + 1}" for a, b in spans)
+    rest = f"; output limit: show({rel!r}, {numbers[shown]}) continues" if shown < len(numbers) else ""
+    print(f"[{rel}: the blocks with a line matching {pattern!r}, lines {where} of {len(lines)}{rest}]")
+    print("\n".join(rows))
+
+
 def show(path, start=1, end=None):
     full = os.path.join(ROOT, path)
     with open(full, "rb") as f:
@@ -614,6 +715,8 @@ def show(path, start=1, end=None):
         if b"\0" in f.read(8192):
             print(f"[{_rel(path)}: binary, {os.fstat(f.fileno()).st_size} bytes]")
             return
+    if isinstance(start, str):
+        return _blocks(path, full, start)
     asked, start = end, max(start, 1)
     sys.stdout.flush()
     room, rows, total = 2 * HALF - os.fstat(1).st_size - 2000, [], 0
@@ -763,8 +866,8 @@ def fetch(url):
     return _each(url, lambda u: {"fetch": str(u)}, text)
 
 
-TOOLS = {"sh": sh, "show": show, "edit": edit, "write": write, "accept": accept, "plan": plan, "done": done, "check": check,
-         "finish": finish, "ask": ask, "search": search, "fetch": fetch, "recall": recall}
+TOOLS = {"sh": sh, "show": show, "edit": edit, "write": write, "undo": undo, "accept": accept, "plan": plan, "done": done,
+         "check": check, "finish": finish, "ask": ask, "search": search, "fetch": fetch, "recall": recall}
 G = {"__name__": "__main__", **TOOLS}
 HELPERS = tuple(f"{name}()" for name in TOOLS)
 
@@ -792,6 +895,8 @@ _outbox.flush()
 for n, request in enumerate(_inbox, 1):
     request = json.loads(request)
     code, _state = request["code"], request.get("state") or {}
+    if _state.get("turn") != _turn.get("turn"):
+        _turn = {"turn": _state.get("turn")}
     _deadline = time.monotonic() + RUN_CAP
     _report.clear()
     _said = 0

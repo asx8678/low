@@ -141,7 +141,7 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
             let action = path.map_or_else(|| tool.to_string(), |p| format!("{tool} {p}"));
             match path {
                 Some(p) if ok => {
-                    touch(&mut files, p, if tool == "edit" || act["replaced"] == true { 1 } else { 2 }, i);
+                    touch(&mut files, p, if tool != "write" || act["replaced"] == true { 1 } else { 2 }, i);
                     status.retain(|s: &String| !s.starts_with("last change"));
                     status.push(format!("last change: #{i} {action}"));
                 }

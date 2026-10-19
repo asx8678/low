@@ -144,16 +144,17 @@ Inside `run(code)`, the model has a few helpers:
 | helper | does |
 |---|---|
 | `sh(cmd)` | runs a shell command; returns stdout and stderr, with `[exit N]` on failure. A command the run's code starts with `subprocess` or `os.system` instead is listed and refused as `sh()`'s are |
-| `show(path, start, end)` | prints numbered lines, paging long files |
+| `show(path, start, end)` | prints numbered lines, paging long files; `show(path, regex)` prints each `def`/`fn`/`class` block with a line that matches, so finding code and reading it take one call |
 | `recall(n, start, end)` | prints entry `#n` of the session, one a compaction's summary cites but replaced, as it was: a message, or a run's code, its result and the model's reasoning; it pages like `show`. low reads it from the session log, which the sandbox hides, and makes no LLM call; entries the context still holds are refused |
 | `edit(path, old, new)` | replaces exactly one occurrence, or several pairs all-or-none, then runs `fmt`; an `old` whose lines are all indented too deep or too shallow by the same amount still matches when that finds one place, and `new` is indented the same way |
 | `write(path, content)` | creates a file, or replaces one |
+| `undo(*paths)` | puts files back as they were when the turn began, from its snapshot (by default every file the turn's `edit` and `write` changed), and removes the ones `write` created; inside a git repository only, since the sandbox blocks `git checkout` and `restore` |
 | `check()` | runs the repository's `check` (low.toml's, or the one low detected) inside the sandbox; with none it runs nothing and returns `True` |
 | `accept(criteria)` · `plan(steps)` · `done()` | record what done means and track the turn's steps: shown as the turn runs, and in a `--json` result |
 | `finish(report)` · `ask(question)` | end the turn with the final report, or with a question for you that the next task answers |
 | `search(query)` · `fetch(url)` | web search and a page as markdown (JSON, code and other text files as their text, less some blank lines), through [DeepSeek's search API](https://api-docs.deepseek.com/guides/search/); low makes the request, since the sandbox has no network. A list of up to 50 queries or URLs goes out at once, 10 requests at a time, and comes back as a list in the same order, with the error in place of each one that failed. Only when a provider is set up for it (below). `fetch` takes a URL that a `search` returned or the task gives, or any https URL on a package registry, CDN or docs host that shows no one the URLs asked of it (npm, PyPI, crates.io, docs.rs, GitHub's API and raw files, jsDelivr, unpkg, cdnjs, and the Rust, Python and MDN docs; jsDelivr's public hit counts per file are the nearest thing); both refuse an argument that looks like a secret, so code in a run can't send what it read to someone who would see it |
 
-Repository files change only through `edit` and `write`, so low knows exactly what the model touched. A turn that changed files without using either is asked once to clean up its scratch output.
+Repository files change only through `edit`, `write` and `undo`, so low knows exactly what the model touched. A turn that changed files without using either is asked once to clean up its scratch output.
 
 Every turn ends with one of four verdicts:
 
