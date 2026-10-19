@@ -118,7 +118,7 @@ While a turn runs, what you type shows on the row above the status bar, and Ente
 | `low.toml` (repo root) | `check`, `fmt` and `protect` for that repository (config.toml refuses them, since they belong to one repository) |
 | `AGENTS.md` (repo root) | instructions for the model, which low puts in its system prompt (the first 32 KB); `CLAUDE.md` when there is no `AGENTS.md` |
 | `AGENTS.md` (a folder) | instructions for the files in that folder: the first time a run shows, edits or writes a file under it, the worker prints them (the first 8 KB), outermost folder first, and not again while the context still holds them; `CLAUDE.md` when the folder has no `AGENTS.md` |
-| `.agents/skills/`, `.claude/skills/` (repo root or `~`) | skills: a folder each, with a `SKILL.md` whose frontmatter gives a `name` and `description`. The system prompt lists them (up to 50, the repository's first), and the model reads the `SKILL.md` of one that fits the task |
+| `.agents/skills/`, `.claude/skills/` (repo root or `~`) | skills: a folder each, with a `SKILL.md` whose frontmatter gives a `name`. None is in the system prompt; a task that names one next to the word skill ("use the gsearch skill", "the gsearch and gnews skills") gets its `SKILL.md` (the first 32 KB) along with it, the repository's on a name both have |
 
 A `config.toml` example:
 

@@ -515,6 +515,23 @@ impl Agent {
         // The push first writes what the snapshot logged, so the turn begins at the task itself.
         let began = self.session.entries.len() - 1;
         self.current = Some((began, clock));
+        // A skill the task asks for by name comes with it: the model needs it, and reading it would take a request.
+        for skill in crate::skills::named(task, &self.root) {
+            let Some((text, size)) = file_text(&skill.real, AGENTS_MAX) else { continue };
+            let (name, path) = (&skill.name, &skill.path);
+            let mut content = format!(
+                "[The task asks for the {name} skill. Its SKILL.md ({path}) follows; do as it says, and find the files it \
+                 names in its folder.]\n\n{}",
+                text.trim_end()
+            );
+            if size > AGENTS_MAX as u64 {
+                let (kept, all) = (AGENTS_MAX / 1024, size.div_ceil(1024));
+                content +=
+                    &format!("\n\n[SKILL.md clipped to its first {kept} KB of {all} KB; read the file for the rest]");
+            }
+            ui::event("skill", &format!("the {name} skill goes with the task: {path}"), Value::Null);
+            self.session.push(json!({"role": "user", "content": content, "meta": {"host": true, "skill": name}}))?;
+        }
         if let Some(files) = self.moved_since(&start).await {
             let more = files.len().saturating_sub(20);
             let more = if more > 0 { format!(" and {more} more") } else { String::new() };
@@ -2415,7 +2432,6 @@ fn system_prompt(root: &Path, yolo: bool, config: &Config, repo: bool, search: b
             ui::note(&format!("left out of the prompt ({why}): {name}"));
         }
     }
-    prompt += &crate::skills::section(root);
     prompt += &listing(root);
     prompt
 }
@@ -2491,6 +2507,11 @@ fn listing(root: &Path) -> String {
 /// paths: at most `max` bytes, not ending mid-character, with the file's full size.
 fn repo_text(root: &Path, rel: &str, max: usize) -> Option<(String, u64)> {
     let path = root.join(rel).canonicalize().ok().filter(|p| p.starts_with(root) && !worker::secret(p))?;
+    file_text(&path, max)
+}
+
+/// A resolved regular file's first `max` bytes, cut at a character, and its size; not through a link at the file itself.
+fn file_text(path: &Path, max: usize) -> Option<(String, u64)> {
     let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
     let file = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path).ok()?;
     let size = file.metadata().ok().filter(std::fs::Metadata::is_file)?.len();

@@ -1,40 +1,49 @@
-//! Skills: folders of instructions for one kind of task, each with a SKILL.md whose frontmatter gives its name and what
-//! it is for, kept in the repository and in the home directory as other coding agents keep them. The system prompt
-//! lists them; the model reads the SKILL.md of one that fits the task with show(), as it reads any file.
+//! Skills: folders of instructions for one kind of task, each with a SKILL.md whose frontmatter gives its name, kept in
+//! the repository and in the home directory as other coding agents keep them. None is in the system prompt, where every
+//! request would carry them all: a task that asks for one by name gets its SKILL.md, and the rest cost nothing.
 use crate::worker::{SKILLS, home, secret, skill_reads};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-/// The most skills the prompt lists, and the most it says of one's description.
+/// The most skills looked through.
 const MOST: usize = 50;
-const DESCRIPTION: usize = 200;
 /// The part of a SKILL.md read for its frontmatter.
 const HEAD: u64 = 16 * 1024;
 
 pub struct Skill {
     pub name: String,
-    pub description: String,
     /// The SKILL.md as show() takes it: from the repo root for the repository's, whole for the home directory's.
     pub path: String,
+    /// The SKILL.md resolved: one the worker can read.
+    pub real: PathBuf,
 }
 
-/// The system prompt's section on skills, or nothing when there are none.
-pub fn section(root: &Path) -> String {
+/// The skills a task asks for: each named next to the word skill, as in "use the gsearch skill", "skill gsearch" or "the
+/// gsearch and gnews skills". A name alone is not asking: a skill named low or review would come with every task that
+/// says the word.
+pub fn named(task: &str, root: &Path) -> Vec<Skill> {
+    let task = task.to_lowercase();
+    if !task.contains("skill") {
+        return vec![];
+    }
+    let words: Vec<&str> =
+        task.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')).filter(|w| !w.is_empty()).collect();
     let skills = find(root);
-    if skills.is_empty() {
-        return String::new();
-    }
-    let mut text =
-        "\n\n# Skills\n\nEach skill is a folder of instructions for one kind of task. When the task is one a \
-                    skill below is for, show() its SKILL.md before you start and follow it; the files it names are in \
-                    its folder.\n"
-            .to_string();
-    for skill in &skills {
-        text += &format!("- {} ({}): {}\n", skill.name, skill.path, skill.description);
-    }
-    text.truncate(text.trim_end().len());
-    text
+    let names: Vec<String> = skills.iter().map(|s| s.name.to_lowercase()).collect();
+    let asked: Vec<bool> = names.iter().map(|name| asked(&words, name, &names)).collect();
+    skills.into_iter().zip(asked).filter_map(|(skill, asked)| asked.then_some(skill)).collect()
+}
+
+/// Whether `name` is in `words` next to the word skill, or in a list of skill names that is, joined by and or or (the
+/// commas went with the other punctuation).
+fn asked(words: &[&str], name: &str, names: &[String]) -> bool {
+    let listed = |w: &&str| matches!(*w, "and" | "or") || names.iter().any(|n| n.as_str() == *w);
+    let skill = |w: Option<&str>| matches!(w, Some("skill" | "skills"));
+    words.iter().enumerate().filter(|(_, w)| **w == name).any(|(at, _)| {
+        skill(words[at + 1..].iter().copied().find(|w| !listed(w)))
+            || skill(words[..at].iter().rev().copied().find(|w| !listed(w)))
+    })
 }
 
 /// The skills in the repository's skills folders, then in $HOME's, by folder name; on a name both have, the
@@ -54,14 +63,12 @@ pub fn find(root: &Path) -> Vec<Skill> {
             let Some(real) = file.canonicalize().ok().filter(|real| readable(root, real, ours)) else { continue };
             let Some(head) = head(&real) else { continue };
             let folder_name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let (name, description) = frontmatter(&head);
-            let name = name.filter(|n| !n.is_empty()).unwrap_or(folder_name);
+            let name = frontmatter(&head, "name").filter(|n| !n.is_empty()).unwrap_or(folder_name);
             if found.iter().any(|s| s.name == name) || found.len() >= MOST {
                 continue;
             }
             let path = if ours { file.strip_prefix(root).unwrap_or(&file) } else { &file };
-            let description = clip(&description.unwrap_or_default());
-            found.push(Skill { name, description, path: path.to_string_lossy().into_owned() });
+            found.push(Skill { name, path: path.to_string_lossy().into_owned(), real });
         }
     }
     found
@@ -81,50 +88,63 @@ fn head(real: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// The name and description a SKILL.md's YAML frontmatter gives: plain, quoted, or a folded (>) or literal (|) block.
-fn frontmatter(text: &str) -> (Option<String>, Option<String>) {
+/// A field of a SKILL.md's YAML frontmatter: plain, quoted, or a folded (>) or literal (|) block.
+fn frontmatter(text: &str, key: &str) -> Option<String> {
     let mut lines = text.lines();
     if lines.next().map(str::trim_end) != Some("---") {
-        return (None, None);
+        return None;
     }
     let lines: Vec<&str> = lines.take_while(|l| l.trim_end() != "---").collect();
-    let field = |key: &str| -> Option<String> {
-        let at = lines.iter().position(|l| l.strip_prefix(key).is_some_and(|r| r.starts_with(':')))?;
-        let value = lines[at][key.len() + 1..].trim();
-        if value.starts_with(['>', '|']) {
-            let block = lines[at + 1..].iter().take_while(|l| l.trim().is_empty() || l.starts_with([' ', '\t']));
-            let words: Vec<&str> = block.map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
-            return Some(words.join(" "));
-        }
-        let quoted = value.len() >= 2
-            && (value.starts_with('"') && value.ends_with('"') || value.starts_with('\'') && value.ends_with('\''));
-        Some(if quoted { value[1..value.len() - 1].replace("\\\"", "\"").replace("''", "'") } else { value.into() })
-    };
-    (field("name"), field("description"))
-}
-
-/// A description on one line, at most DESCRIPTION characters, cut at a word.
-fn clip(text: &str) -> String {
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.chars().count() <= DESCRIPTION {
-        return text;
+    let at = lines.iter().position(|l| l.strip_prefix(key).is_some_and(|r| r.starts_with(':')))?;
+    let value = lines[at][key.len() + 1..].trim();
+    if value.starts_with(['>', '|']) {
+        let block = lines[at + 1..].iter().take_while(|l| l.trim().is_empty() || l.starts_with([' ', '\t']));
+        let words: Vec<&str> = block.map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        return Some(words.join(" "));
     }
-    let cut: String = text.chars().take(DESCRIPTION).collect();
-    format!("{}…", cut.rsplit_once(' ').map_or(cut.as_str(), |(kept, _)| kept))
+    let quoted = value.len() >= 2
+        && (value.starts_with('"') && value.ends_with('"') || value.starts_with('\'') && value.ends_with('\''));
+    Some(if quoted { value[1..value.len() - 1].replace("\\\"", "\"").replace("''", "'") } else { value.into() })
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn frontmatter() {
+        let field = |text: &str, key: &str| super::frontmatter(text, key);
         let folded = "---\nname: video\ndescription: >\n  Make a video,\n  or edit one.\n\nmetadata: x\n---\nbody";
-        assert_eq!(super::frontmatter(folded), (Some("video".into()), Some("Make a video, or edit one.".into())));
+        assert_eq!(
+            (field(folded, "name"), field(folded, "description")),
+            (Some("video".into()), Some("Make a video, or edit one.".into()))
+        );
         let quoted = "---\nname: 'it''s'\ndescription: \"Says \\\"hi\\\"\"\n---\n";
-        assert_eq!(super::frontmatter(quoted), (Some("it's".into()), Some("Says \"hi\"".into())));
-        assert_eq!(super::frontmatter("# no frontmatter\nname: x"), (None, None));
-        let long = "word ".repeat(100);
-        let clipped = super::clip(&long);
-        assert!(clipped.ends_with("word…") && clipped.chars().count() <= super::DESCRIPTION + 1, "{clipped}");
+        assert_eq!(
+            (field(quoted, "name"), field(quoted, "description")),
+            (Some("it's".into()), Some("Says \"hi\"".into()))
+        );
+        assert_eq!(field("# no frontmatter\nname: x", "name"), None);
+    }
+
+    #[test]
+    fn asked_for() {
+        let names: Vec<String> = ["gsearch", "gnews", "low", "find-skills"].map(String::from).into();
+        let asked = |task: &str| -> Vec<&str> {
+            let task = task.to_lowercase();
+            let words: Vec<&str> = task
+                .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+                .filter(|w| !w.is_empty())
+                .collect();
+            names.iter().filter(|n| super::asked(&words, n, &names)).map(String::as_str).collect()
+        };
+        assert_eq!(asked("Use the gsearch skill to find it"), ["gsearch"]);
+        assert_eq!(asked("skill: GNews, then summarize"), ["gnews"]);
+        assert_eq!(asked("with the gsearch, gnews and low skills"), ["gsearch", "gnews", "low"]);
+        assert_eq!(asked("skills gnews or gsearch"), ["gsearch", "gnews"]);
+        assert_eq!(asked("use find-skills skill"), ["find-skills"]);
+        // A name that isn't next to the word skill: low's own name, in a task about skills.
+        assert!(asked("load the skills only when I ask, I want really low entropy").is_empty());
+        assert!(asked("gsearch for it, then pick a skill").is_empty());
+        assert!(asked("search with gsearch").is_empty());
     }
 
     /// The repository's skills, then $HOME's, by folder name: one without a SKILL.md, or linked out of the repository,
@@ -144,18 +164,21 @@ mod tests {
         std::fs::write(outside.join("SKILL.md"), "---\nname: out\n---\n").unwrap();
         std::os::unix::fs::symlink(&outside, root.join(".claude/skills/linked")).unwrap();
         let root = root.canonicalize().unwrap();
-        let found: Vec<(String, String, String)> =
-            super::find(&root).into_iter().map(|s| (s.name, s.path, s.description)).collect();
+        let found: Vec<(String, String)> = super::find(&root).into_iter().map(|s| (s.name, s.path)).collect();
         let ours: Vec<_> = found.iter().filter(|s| !s.1.starts_with('/')).cloned().collect();
         assert_eq!(
             ours,
             [
-                ("b".into(), ".agents/skills/b-skill/SKILL.md".into(), "Does b.".into()),
-                ("a-skill".into(), ".claude/skills/a-skill/SKILL.md".into(), "Does a.".into()),
+                ("b".into(), ".agents/skills/b-skill/SKILL.md".into()),
+                ("a-skill".into(), ".claude/skills/a-skill/SKILL.md".into())
             ]
         );
-        let section = super::section(&root);
-        assert!(section.contains("\n- b (.agents/skills/b-skill/SKILL.md): Does b.\n"), "{section}");
+        let named = super::named("Use the b skill", &root);
+        assert_eq!(
+            named.iter().map(|s| (s.name.as_str(), s.real.clone())).collect::<Vec<_>>(),
+            [("b", root.join(".agents/skills/b-skill/SKILL.md"))]
+        );
+        assert!(super::named("b", &root).is_empty());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
     }
