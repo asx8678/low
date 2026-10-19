@@ -266,9 +266,8 @@ impl Session {
             if role == "user"
                 && let Some(prev) = out.last_mut().filter(|m| m["role"] == "user")
             {
-                let label = if entry["meta"]["steer"] == true {
-                    format!("[Steered by the user, entry #{i}]\n")
-                } else if entry["meta"]["host"].is_null() {
+                // A steer carries its own label (compact::wire), and low's messages need none.
+                let label = if crate::compact::task(entry) {
                     format!("[Next user message, entry #{i}]\n")
                 } else {
                     String::new()
@@ -428,9 +427,9 @@ mod tests {
         let messages = session.messages();
         assert_eq!((&messages[0]["content"], &messages[1]["role"]), (&json!("sys2"), &json!("user")));
         let joined = messages[1]["content"].as_str().unwrap();
-        assert!(joined.starts_with("SUMMARY") && joined.contains("[Steered by the user, entry #12]\nmore"), "{joined}");
+        assert!(joined.starts_with("SUMMARY") && joined.contains("[Steered by the user]\nmore"), "{joined}");
         // The task and its steers before the kept tail follow a summary written before them.
-        assert!(joined.contains("[Current task, entry #7]\nsecond task\n\n[Steered by the user, entry #9]\nuse tabs"));
+        assert!(joined.contains("[Current task, entry #7]\nsecond task\n\n[Steered by the user]\nuse tabs"));
         assert!(session.guides().is_empty());
         session
             .push(json!({"role": "tool", "tool_call_id": "y", "content": "", "meta": {"guides": ["lib/AGENTS.md"]}}))

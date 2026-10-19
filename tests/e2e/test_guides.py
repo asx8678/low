@@ -9,7 +9,7 @@ e = Env([{'code': "show('pkg/m.py')"}, {'code': "edit('pkg/m.py', 'a = 1', 'a = 
 r = e.low('--json', 'change a')
 tools = e.tools()
 check('the first run gets the folder\'s instructions', len(tools) >= 1 and
-      '[pkg/AGENTS.md: instructions for the files in pkg/, shown once]\nPKG-RULES: run make pkg\n' in tools[0], tools)
+      '[pkg/AGENTS.md: follow it for the files in pkg/; shown once]\nPKG-RULES: run make pkg\n' in tools[0], tools)
 check('the next run doesn\'t get them again', len(tools) >= 2 and 'PKG-RULES' not in tools[1], tools)
 check('the root\'s are in the system prompt, not a run', 'ROOT-RULES' in r['requests'][0]['messages'][0]['content']
       and not any('ROOT-RULES' in t for t in tools), '')

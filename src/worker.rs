@@ -321,11 +321,6 @@ fn sandbox(root: &Path, yolo: bool, writes: bool, program: &str, args: &[&str]) 
         let subpaths = |dirs: &[PathBuf]| -> String { dirs.iter().map(|d| format!(" (subpath {d:?})")).collect() };
         let protected = subpaths(&[protected, frozen].concat());
         let (dirs, secrets) = (subpaths(&writable), subpaths(secrets));
-        // An allow with no path would allow every read.
-        let skills = match skill_reads() {
-            [] => String::new(),
-            found => format!("(allow file-read-data{})", subpaths(found)),
-        };
         let sockets = root.join("tmp");
         let profile = format!(
             "(version 1)(allow default)(deny network*)\
@@ -335,7 +330,7 @@ fn sandbox(root: &Path, yolo: bool, writes: bool, program: &str, args: &[&str]) 
               (local unix-socket (subpath {sockets:?})) (remote unix-socket (subpath {sockets:?})))\
              (deny file-write*)(allow file-write*{dirs} (subpath \"/dev\"))(deny file-write*{protected})\
              (deny file-write* (require-all (subpath {root:?}) (regex #\"/\\.[gG][iI][tT](/|$)\")))\
-             (deny file-read-data{secrets}){skills}\
+             (deny file-read-data{secrets})\
              (deny file-ioctl (regex #\"^/dev/tty\"))(deny file-write* (regex #\"^/dev/tty\"))(deny appleevent-send)\
              (deny process-exec (literal \"/usr/bin/osascript\") (literal \"/usr/bin/osacompile\") \
               (literal \"/usr/bin/open\") (literal \"/bin/launchctl\") (literal \"/usr/bin/automator\"))"
@@ -359,9 +354,6 @@ fn sandbox(root: &Path, yolo: bool, writes: bool, program: &str, args: &[&str]) 
             } else {
                 cmd.arg("--ro-bind").arg("/dev/null").arg(path);
             }
-        }
-        for dir in skill_reads() {
-            cmd.arg("--ro-bind").arg(dir).arg(dir);
         }
         for dir in protected.iter().chain(&nested(root)).filter(|d| d.exists()) {
             cmd.arg("--ro-bind").arg(dir).arg(dir);
@@ -399,45 +391,6 @@ fn secrets() -> &'static [PathBuf] {
             paths.push(path);
         }
         paths
-    })
-}
-
-/// Where skills are kept, in the repository and in the home directory: a folder per skill, with a SKILL.md.
-pub const SKILLS: [&str; 2] = [".agents/skills", ".claude/skills"];
-
-/// What the sandbox lets the worker read though it sits among what it hides: $HOME's skills folders, which ~/.claude
-/// holds, and the folders their skills link to, which hiding ~/.claude hides too. A skill is written for an agent to
-/// read; the rest of ~/.claude (credentials, transcripts, settings) stays hidden, and so does a skill linked into
-/// another secret path. Resolved, as the sandbox matches resolved paths.
-pub fn skill_reads() -> &'static [PathBuf] {
-    static FOUND: OnceLock<Vec<PathBuf>> = OnceLock::new();
-    FOUND.get_or_init(|| {
-        let home = home();
-        if home.as_os_str().is_empty() {
-            return vec![];
-        }
-        let hidden: Vec<PathBuf> =
-            SECRETS.split(',').map(|s| home.join(s.trim())).map(|p| p.canonicalize().unwrap_or(p)).collect();
-        let claude = home.join(".claude").canonicalize().ok();
-        // A folder that holds a hidden path, or the home directory, or one inside a hidden path but for `except`.
-        let hides = |p: &Path, except: Option<&PathBuf>| {
-            homes().iter().any(|h| h.starts_with(p))
-                || hidden.iter().any(|s| s.starts_with(p) || Some(s) != except && p.starts_with(s))
-        };
-        let mut found = vec![];
-        for dir in SKILLS.map(|s| home.join(s)).iter().filter_map(|d| d.canonicalize().ok()) {
-            if !dir.is_dir() || hides(&dir, claude.as_ref()) {
-                continue;
-            }
-            let entries = std::fs::read_dir(&dir).into_iter().flatten().flatten();
-            for target in entries.filter_map(|e| e.path().canonicalize().ok()) {
-                if !target.starts_with(&dir) && target.is_dir() && !hides(&target, None) && !found.contains(&target) {
-                    found.push(target);
-                }
-            }
-            found.push(dir);
-        }
-        found
     })
 }
 
@@ -885,8 +838,8 @@ mod tests {
         assert!(!out.contains("ROOT RULES") && !out.contains("NOT THIS ONE"), "{out}");
         assert!(
             out.contains(
-                "[pkg/AGENTS.md: instructions for the files in pkg/, shown once]\nPKG RULES\n[end of pkg/AGENTS.md]\n\
-                          [pkg/sub/CLAUDE.md: instructions for the files in pkg/sub/, shown once]\nSUB RULES\n\
+                "[pkg/AGENTS.md: follow it for the files in pkg/; shown once]\nPKG RULES\n[end of pkg/AGENTS.md]\n\
+                          [pkg/sub/CLAUDE.md: follow it for the files in pkg/sub/; shown once]\nSUB RULES\n\
                           [end of pkg/sub/CLAUDE.md]\n[pkg/sub/m.py: lines 1-1 of 1]"
             ),
             "{out}"
@@ -909,7 +862,7 @@ mod tests {
         let out = ran("show('big/b.py')", &[]).await["out"].as_str().unwrap().to_string();
         assert!(
             out.starts_with(
-                "[big/AGENTS.md: instructions for the files in big/, shown once; show('big/AGENTS.md', 222) \
+                "[big/AGENTS.md: follow it for the files in big/; shown once; show('big/AGENTS.md', 222) \
                                  has the rest]\n"
             ) && out.len() < 9000,
             "{out}"
@@ -956,6 +909,18 @@ mod tests {
         assert!(std::fs::read_to_string(dir.join("b.py")).unwrap().contains("x = 1") && !dir.join("c.py").exists());
         let reply = run_with(&mut worker, "undo('nope.py')", &state).await;
         assert!(reply["out"].as_str().is_some_and(|out| out.contains("nope.py was not in the snapshot")), "{reply}");
+        // A worker that restarted mid-turn undoes what low's log says the turn changed, and a second undo() passes over
+        // a created file that is gone.
+        assert_eq!(run_with(&mut worker, changed, &state).await["out"], "edit b.py: ok\nwrite c.py: ok\n");
+        drop(worker);
+        let mut worker = super::Worker::start(&dir, true, Some("true"), None).unwrap();
+        let logged = json!({"turn": 7, "snapshot": tree, "touched": ["b.py", "c.py"], "created": ["c.py"]});
+        let reply = run_with(&mut worker, "undo()\nundo()", &logged).await;
+        assert_eq!(
+            (&reply["out"], &reply["error"]),
+            (&json!("undo b.py: ok\nundo c.py: removed\nundo b.py: ok\n"), &json!(false))
+        );
+        assert!(std::fs::read_to_string(dir.join("b.py")).unwrap().contains("x = 1") && !dir.join("c.py").exists());
         let next = json!({"turn": 8, "snapshot": tree});
         let reply = run_with(&mut worker, "undo()", &next).await;
         assert_eq!(reply["out"], "[undo: edit() and write() changed nothing this turn]\n", "{reply}");

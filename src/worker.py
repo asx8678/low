@@ -29,7 +29,7 @@ _report = {}
 _state = {}
 _checked = None
 _said = 0  # bytes this run printed through edit, write and check, the output the model can predict
-_turn = {}  # what this turn's edit() and write() changed and created, for undo()
+_turn = {}  # what this turn's edit(), write() and undo() changed and write() created, for undo(); seeded from low's log
 _groups = set()
 _spawned = []  # the commands this run's code started with subprocess, each with its Popen, for their exit status
 _Popen, _os_system = subprocess.Popen, os.system  # low's own commands; the run's code gets _Seen and _system
@@ -241,7 +241,7 @@ def _guide(path):
         if len(text) > GUIDE_CAP:
             text = text[:text.rfind("\n", 0, GUIDE_CAP) + 1] or text[:GUIDE_CAP]
             more = f"; show({rel!r}, {text.count(chr(10)) + 1}) has the rest"
-        print(f"[{rel}: instructions for the files in {folder}/, shown once{more}]\n{text.rstrip()}\n[end of {rel}]")
+        print(f"[{rel}: follow it for the files in {folder}/; shown once{more}]\n{text.rstrip()}\n[end of {rel}]")
 
 
 def _change(tool, path, make, fmt=True):
@@ -536,6 +536,8 @@ def undo(*paths):
         blob = p.communicate()[0]
         if p.returncode and rel not in _turn.get("created", ()):
             raise ValueError(f"{rel} was not in the snapshot taken when this turn began, and write() did not create it")
+        if p.returncode and not os.path.lexists(os.path.join(ROOT, rel)):
+            continue  # created by write() and removed already
         _change("undo", rel, lambda full, rel: _put(full, None if p.returncode else blob), fmt=False)
 
 
@@ -924,7 +926,8 @@ for n, request in enumerate(_inbox, 1):
     request = json.loads(request)
     code, _state = request["code"], request.get("state") or {}
     if _state.get("turn") != _turn.get("turn"):
-        _turn = {"turn": _state.get("turn")}
+        _turn = {"turn": _state.get("turn"), "touched": set(_state.get("touched") or ()),
+                 "created": set(_state.get("created") or ())}
     _deadline = time.monotonic() + RUN_CAP
     _report.clear()
     _said = 0

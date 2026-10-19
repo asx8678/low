@@ -73,7 +73,7 @@ check('the row above the bar says how to steer, then what is queued',
 after = plain(r.until('requests · in'))
 sent = requests(2)[1]['body']['messages']
 check('the steer goes with the next request, after the run\'s result',
-      [m['role'] for m in sent[-2:]] == ['tool', 'user'] and sent[-1]['content'] == 'use tabs', sent[-3:])
+      [m['role'] for m in sent[-2:]] == ['tool', 'user'] and sent[-1]['content'] == '[Steered by the user]\nuse tabs', sent[-3:])
 check('it shows where the model got it, and the command runs when the turn ends',
       '› use tabs' in plain(r.out) and 'requests · in' in after, after[-600:])
 check('a steer is logged as one, and is no new task', ('use tabs', True) in users(), users())

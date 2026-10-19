@@ -10,7 +10,7 @@ use crate::{Config, compact, ui};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -108,11 +108,8 @@ const UNDO: &str = "undo(*paths)                  # put files back as they were 
 /// The helpers that reach the web, in the prompt only when config.toml's search names a provider.
 const WEB: &str = "search(query, count=10) -> list  # web search: [{title, url, summary, date, site_name}]; site:, \"phrase\", \
                    after:2025 work; query up to 128 chars, count up to 50\nfetch(url) -> str             # a web page \
-                   as markdown; JSON, code and other text files as their text, as served on the open hosts named here and \
-                   less some blank lines elsewhere; a URL a search() returned or the task gives, or any URL on \
-                   registry.npmjs.org, pypi.org, crates.io, docs.rs, api.github.com, raw.githubusercontent.com, \
-                   cdn.jsdelivr.net, data.jsdelivr.com, unpkg.com, cdnjs.cloudflare.com, doc.rust-lang.org, \
-                   docs.python.org, developer.mozilla.org\nsearch([query, ...]), fetch([url, ...]) -> list  # up to \
+                   as markdown, a text file (JSON, code) as text; a URL a search() returned or the task gives, or any \
+                   URL on HOSTS, where text comes exactly as served\nsearch([query, ...]), fetch([url, ...]) -> list  # up to \
                    50 at once, 10 at a time: the answers in order, a RuntimeError in place of each that failed\n";
 /// WEB's fetch() without a search provider: low reads the open hosts itself, and nothing else.
 const WEB_OPEN: &str = "fetch(url) -> str             # a URL's text as its host serves it: JSON, code and other text \
@@ -146,15 +143,12 @@ const OPEN: &[&str] = &[
     "docs.python.org",
     "developer.mozilla.org",
 ];
-const REGISTRIES: &str = " Package managers can't reach their registries; fetch() reads them: \
-                          json.loads(fetch(\"https://registry.npmjs.org/three/latest\"))[\"version\"] is three's latest \
-                          version.";
+const REGISTRIES: &str = " Package managers can't reach their registries; fetch() reads them.";
 const SANDBOX: &str = "\n\n## Sandbox\nYour code runs in a sandbox. Writes outside the repo and temp dirs fail, as do \
-                       writes into any .git directory and reads of credentials and private data in the home directory \
-                       (ssh and cloud keys, shell history, browser data, other tools' configs). Only a fixed set of \
-                       environment variables is passed through (env = [\"NAME\"] in ~/.config/low/config.toml adds more).";
-const MACOS: &str = " Internet and DNS are off (localhost works); nested sandbox-exec fails, and Unix sockets work only \
-                     under the repo's tmp/ directory.";
+                       writes into any .git directory and reads of credentials and private data in the home directory. \
+                       Only a fixed set of environment variables is passed through.";
+const MACOS: &str =
+    " Internet and DNS are off (localhost works); Unix sockets work only under the repo's tmp/ directory.";
 const LINUX: &str = " The network is fully isolated: Internet, DNS and the host's localhost services are off; only \
                      servers you start inside the sandbox are reachable on localhost.";
 const PERMANENT: &str = " These failures (Operation not permitted, EPERM, Read-only file system, DNS lookup errors) are \
@@ -515,23 +509,6 @@ impl Agent {
         // The push first writes what the snapshot logged, so the turn begins at the task itself.
         let began = self.session.entries.len() - 1;
         self.current = Some((began, clock));
-        // A skill the task asks for by name comes with it: the model needs it, and reading it would take a request.
-        for skill in crate::skills::named(task, &self.root) {
-            let Some((text, size)) = file_text(&skill.real, AGENTS_MAX) else { continue };
-            let (name, path) = (&skill.name, &skill.path);
-            let mut content = format!(
-                "[The task asks for the {name} skill. Its SKILL.md ({path}) follows; do as it says, and find the files it \
-                 names in its folder.]\n\n{}",
-                text.trim_end()
-            );
-            if size > AGENTS_MAX as u64 {
-                let (kept, all) = (AGENTS_MAX / 1024, size.div_ceil(1024));
-                content +=
-                    &format!("\n\n[SKILL.md clipped to its first {kept} KB of {all} KB; read the file for the rest]");
-            }
-            ui::event("skill", &format!("the {name} skill goes with the task: {path}"), Value::Null);
-            self.session.push(json!({"role": "user", "content": content, "meta": {"host": true, "skill": name}}))?;
-        }
         if let Some(files) = self.moved_since(&start).await {
             let more = files.len().saturating_sub(20);
             let more = if more > 0 { format!(" and {more} more") } else { String::new() };
@@ -906,7 +883,7 @@ impl Agent {
         let text = |e: &Value| e["content"].as_str().unwrap_or_default().to_string();
         let mut task = text(&turn[0]);
         for steer in turn.iter().filter(|e| e["meta"]["steer"] == true) {
-            task += &format!("\n\n[Steered by the user]\n{}", text(steer));
+            task += &format!("\n\n{}", text(&compact::wire(steer)));
         }
         let criteria = self.session.state().accepted.unwrap_or_else(|| "none set".into());
         let runs = turn.iter().filter(|e| e["role"] == "tool").enumerate();
@@ -1228,8 +1205,19 @@ impl Agent {
         // undo() restores from the snapshot this turn began with.
         let snapshot =
             turn.and_then(|began| self.session.entries[began]["meta"]["snapshot"].as_str()).unwrap_or_default();
+        // What this turn's edit(), write() and undo() changed, and the files its write() created, from the log: a worker
+        // that restarted mid-turn still undoes them.
+        let (mut touched, mut created) = (BTreeSet::new(), BTreeSet::new());
+        let actions = turn.map_or(&[][..], |began| &self.session.entries[began..]).iter();
+        for action in actions.filter_map(|e| e["meta"]["actions"].as_array()).flatten() {
+            let Some(path) = action["path"].as_str().filter(|_| action["ok"] == true) else { continue };
+            touched.insert(path);
+            if action["tool"] == "write" && action["replaced"] != true {
+                created.insert(path);
+            }
+        }
         let state = json!({"accepted": state.accepted, "plan": state.plan, "guides": self.session.guides(), "turn": turn,
-                           "snapshot": snapshot});
+                           "snapshot": snapshot, "touched": touched, "created": created});
         let clock = Instant::now();
         let ran = async {
             let mut reply = self.worker()?.run(code, &state).await?;
@@ -2386,21 +2374,19 @@ fn today() -> Option<String> {
 fn system_prompt(root: &Path, yolo: bool, config: &Config, repo: bool, search: bool) -> String {
     let mut prompt = include_str!("prompt.md").to_string();
     if !search {
-        prompt = prompt.replace(WEB, &WEB_OPEN.replace("HOSTS", &OPEN.join(", ")));
+        prompt = prompt.replace(WEB, WEB_OPEN);
     }
+    prompt = prompt.replace("HOSTS", &OPEN.join(", "));
     if !repo {
         prompt = prompt.replace(UNDO, "");
     }
-    let from = config.detected.as_ref().map(|d| d.from.as_str());
-    prompt += &match (config.check.as_deref(), from) {
-        (Some(check), Some(from)) => {
-            format!(
-                "\ncheck() runs `{}`, which low detected from {from}; it passed on the tree as found.",
-                redact(check).0
-            )
+    // A detected check ran on the tree as found, so a failure after an edit is the edit's.
+    prompt += &match config.check.as_deref() {
+        Some(check) if config.detected.is_some() => {
+            format!("\ncheck() runs `{}`, which passed on the tree as found.", redact(check).0)
         }
-        (Some(check), None) => format!("\ncheck() runs `{}`.", redact(check).0),
-        (None, _) => "\nNo check command is configured, so check() runs nothing.".into(),
+        Some(check) => format!("\ncheck() runs `{}`.", redact(check).0),
+        None => "\nNo check command is configured, so check() runs nothing.".into(),
     };
     let read_only = !yolo && worker::read_only(root);
     if read_only {
@@ -2413,8 +2399,8 @@ fn system_prompt(root: &Path, yolo: bool, config: &Config, repo: bool, search: b
     if !yolo {
         prompt += SANDBOX;
         prompt += if cfg!(target_os = "macos") { MACOS } else { LINUX };
-        prompt += PERMANENT;
         prompt += REGISTRIES;
+        prompt += PERMANENT;
     }
     // One that is there but can't be read is noted, and the next one tried.
     for name in INSTRUCTIONS {
@@ -2507,11 +2493,6 @@ fn listing(root: &Path) -> String {
 /// paths: at most `max` bytes, not ending mid-character, with the file's full size.
 fn repo_text(root: &Path, rel: &str, max: usize) -> Option<(String, u64)> {
     let path = root.join(rel).canonicalize().ok().filter(|p| p.starts_with(root) && !worker::secret(p))?;
-    file_text(&path, max)
-}
-
-/// A resolved regular file's first `max` bytes, cut at a character, and its size; not through a link at the file itself.
-fn file_text(path: &Path, max: usize) -> Option<(String, u64)> {
     let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
     let file = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path).ok()?;
     let size = file.metadata().ok().filter(std::fs::Metadata::is_file)?.len();
@@ -2533,15 +2514,14 @@ fn tools() -> Value {
 
 #[cfg(test)]
 mod tests {
-    /// The prompt names the web helpers in exactly the text WEB removes when search is off, and every OPEN host in it;
-    /// undo() in the text UNDO removes outside a git repository.
+    /// The prompt names the web helpers in exactly the text WEB removes when search is off, and both name the OPEN hosts
+    /// as HOSTS, which system_prompt() fills in; undo() in the text UNDO removes outside a git repository.
     #[test]
     fn web_lines_match_the_prompt() {
         assert_eq!(include_str!("prompt.md").matches(super::WEB).count(), 1);
         assert_eq!(include_str!("prompt.md").matches(super::UNDO).count(), 1);
-        for host in super::OPEN {
-            assert!(super::WEB.contains(host), "{host} is open but the prompt doesn't name it");
-        }
+        assert_eq!(include_str!("prompt.md").matches("HOSTS").count(), 1);
+        assert!(super::WEB.contains("HOSTS") && super::WEB_OPEN.contains("HOSTS"));
     }
 
     /// A second look's verdict lines count however they are marked up, and lines that name no verdict, or no claim,

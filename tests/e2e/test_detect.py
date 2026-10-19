@@ -22,7 +22,7 @@ e = Env([{'content': 'Nothing to change.'},
          {'code': "write('b.txt', 'hello\\n')"}, {'content': 'wrote b.txt'}], files=PASSES)
 r = e.low('--json', 'is there anything to change?')
 check('a passing Makefile target is adopted',
-      'check() runs `make check`, which low detected from Makefile; it passed on the tree as found.' in system(r),
+      'check() runs `make check`, which passed on the tree as found.' in system(r),
       system(r)[-300:])
 ran = baselines(e)
 check('its baseline ran once, in this low', [(b['check'], b['ok'], b['reused']) for b in ran] == [('make check', True, False)],

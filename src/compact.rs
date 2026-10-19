@@ -16,12 +16,9 @@ pub fn newest_task(entries: &[Value]) -> Option<usize> {
 
 /// What the user typed to steer task `u` before entry `keep`, in full, to follow the task wherever a summary carries it.
 pub fn steers(entries: &[Value], u: usize, keep: usize) -> String {
-    let steer = |i: &usize| entries[*i]["meta"]["steer"] == true;
     (u + 1..keep.min(entries.len()))
-        .filter(steer)
-        .map(|i| {
-            format!("\n\n[Steered by the user, entry #{i}]\n{}", entries[i]["content"].as_str().unwrap_or_default())
-        })
+        .filter(|&i| entries[i]["meta"]["steer"] == true)
+        .filter_map(|i| wire(&entries[i])["content"].as_str().map(|text| format!("\n\n{text}")))
         .collect()
 }
 
@@ -34,18 +31,25 @@ pub fn baked(u: usize) -> String {
 /// the provider streamed, so the prompt prefix stays cached through the reply. Earlier tasks keep their reasoning too,
 /// until a compaction summarizes them: dropping it at a new task broke the cache from the first earlier reply on
 /// (DeepSeek on OpenCode Go reused 34% of the prompt instead of 99%). A task ends with the date it was given on, kept
-/// in its meta, so its text stays the task's everywhere else.
+/// in its meta, so its text stays the task's everywhere else; a line the user typed during a turn starts with STEERED,
+/// which tells the model it steers the task rather than starting a new one.
 pub fn wire(entry: &Value) -> Value {
     let mut message = entry.clone();
     let date = entry["meta"]["date"].as_str().filter(|_| task(entry));
     if let Some(fields) = message.as_object_mut() {
         fields.remove("meta");
     }
+    let text = entry["content"].as_str().unwrap_or_default();
     if let Some(date) = date {
-        message["content"] = format!("{}\n\n[Today is {date}]", entry["content"].as_str().unwrap_or_default()).into();
+        message["content"] = format!("{text}\n\n[Today is {date}]").into();
+    } else if entry["meta"]["steer"] == true {
+        message["content"] = format!("{STEERED}\n{text}").into();
     }
     message
 }
+
+/// What a steer starts with wherever the model reads it: as it is sent, in a summary, and in a second look's brief.
+const STEERED: &str = "[Steered by the user]";
 
 /// The entry the kept tail starts at: the earliest reply from which the rest fits in `keep_tokens`, and without `whole`
 /// at least the last reply. Without `whole` it is `prev`, nothing to compact, when all of it fits: compaction keeps that
@@ -245,8 +249,8 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
     let events = events.split_off(events.len().saturating_sub(40));
 
     let footer = format!(
-        "\n[Entries #1-#{} are summarized here. recall(n) prints entry #n as it was; read a file again instead, since it \
-         may have changed. Continue the task.]",
+        "\n[Entries #1-#{} are summarized here. recall(n) prints entry #n as it was: a message, or a run's code, result \
+         and reasoning, paged like show(). Read a file again instead, since it may have changed. Continue the task.]",
         keep - 1
     );
     let mut out = String::from("[Summary of earlier work, rebuilt from the session log. Newer messages follow it.]\n");
@@ -295,12 +299,7 @@ pub fn recall(entries: &[Value], keep: usize, n: usize) -> Result<String, String
     let calls = |i: usize| entries[i]["tool_calls"].as_array().map_or(&[][..], Vec::as_slice);
     let reply = match role(n) {
         "user" => {
-            let meta = &entries[n]["meta"];
-            let who = match (meta["steer"] == true, meta["host"].is_null()) {
-                (true, _) => "the user, steering the turn",
-                (_, true) => "the user",
-                _ => "low",
-            };
+            let who = if entries[n]["meta"]["host"].is_null() { "the user" } else { "low" };
             let text = wire(&entries[n]);
             return Ok(format!("[#{n}: a message from {who}]\n{}", text["content"].as_str().unwrap_or_default()));
         }
@@ -456,8 +455,7 @@ mod tests {
         entries.push(json!({"role": "assistant", "content": "ok", "meta": {}}));
         assert_eq!(super::newest_task(&entries), Some(9));
         let summary = super::summary(&entries, entries.len() - 1);
-        let tail =
-            format!("{}\ntask 2: fix bug 2\n\n[Steered by the user, entry #13]\nuse tabs, not spaces", super::baked(9));
+        let tail = format!("{}\ntask 2: fix bug 2\n\n[Steered by the user]\nuse tabs, not spaces", super::baked(9));
         assert!(summary.ends_with(&tail), "{summary}");
         // A steer past the kept tail's start is sent as it is, not in the summary.
         assert!(!super::summary(&entries, 13).contains("[Steered by the user"));
@@ -477,12 +475,14 @@ mod tests {
     fn a_task_carries_its_date() {
         let task = json!({"role": "user", "content": "fix it", "meta": {"date": "2026-10-19", "snapshot": "t"}});
         assert_eq!(super::wire(&task), json!({"role": "user", "content": "fix it\n\n[Today is 2026-10-19]"}));
-        // A session from before dates, a steer and low's own messages are sent as they were.
+        // A session from before dates and low's own messages are sent as they were; a steer says it is one.
         let dated = |flag: &str| json!({"date": "2026-10-19", flag: true});
-        for meta in [json!({}), dated("steer"), dated("host")] {
+        for meta in [json!({}), dated("host")] {
             let entry = json!({"role": "user", "content": "fix it", "meta": meta});
             assert_eq!(super::wire(&entry), json!({"role": "user", "content": "fix it"}), "{meta}");
         }
+        let steer = json!({"role": "user", "content": "use tabs", "meta": dated("steer")});
+        assert_eq!(super::wire(&steer)["content"], "[Steered by the user]\nuse tabs");
     }
 
     #[test]

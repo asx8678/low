@@ -58,7 +58,7 @@ r.send('\r', wait='queued: fix this: indented /cost')
 r.until('done first')
 sent = e.entries()[1]['body']['messages'] if len(e.entries()) > 1 else []
 check('Enter sends it whole, as one steer after the run\'s result',
-      [m['role'] for m in sent[-2:]] == ['tool', 'user'] and sent[-1]['content'] == PASTED.strip(), sent[-2:])
+      [m['role'] for m in sent[-2:]] == ['tool', 'user'] and sent[-1]['content'] == '[Steered by the user]\n' + PASTED.strip(), sent[-2:])
 check('it is logged as a steer', (PASTED.strip(), True) in users(), users())
 
 at = r.out.rindex('queued: fix this')
