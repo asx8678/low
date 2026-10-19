@@ -559,6 +559,23 @@ mod tests {
                 "edit('a.py', [('return 2', 'return 3'), ('nope', 'x')])",
                 "old text not found in a.py (pair 2 of 2; nothing was changed)",
             ),
+            // A failed edit says where old is, or what is nearest to it.
+            (
+                "write('n.py', 'def g():\\n    x = 1\\n    return x\\n\\nx = 1\\ns = \"a\"\\n')\n\
+                 edit('n.py', 'def g():\\n  x = 1', 'pass')",
+                "[n.py: nearest to old is lines 1-2, it differs only in whitespace]\n1: def g():\n2:     x = 1\n",
+            ),
+            ("edit('n.py', 'x = 1', 'x = 2')", "[n.py: old occurs at lines 2, 5; add context so it matches once]"),
+            (
+                "edit('n.py', 'def g():\\n    x = 2\\n    return x', 'pass')",
+                "[n.py: nearest to old is lines 1-3, 2 of 3 lines alike]\n1: def g():\n2:     x = 1\n3:     return x\n",
+            ),
+            ("edit('n.py', 'retrun x', 'y')", "[n.py: nearest to old is line 3, the closest match]\n3:     return x\n"),
+            (
+                "edit('n.py', r's = \\\"a\\\"', 'y')",
+                "[n.py: old matches once without the backslashes before its quotes",
+            ),
+            ("edit('n.py', 'zzzz', 'y')", "[n.py: no line of old is in the file; show() it before editing]"),
             (
                 "edit('a.py', ['return 2', 'return 3'])",
                 "edit() takes (path, old, new) or (path, [(old, new), ...]) with string old and new",

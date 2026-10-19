@@ -256,6 +256,54 @@ def _forget():
             G.pop(key, None)
 
 
+def _near(text, old, rel):
+    """Where a failed edit's old text is: the line of each match, or the lines most like it, so the next run can fix
+    old without first showing the file again."""
+    if not old.strip():
+        return None
+    count, lead = text.count(old), len(old) - len(old.lstrip("\n"))
+    if count > 1:
+        at, i = [], text.find(old)
+        while i != -1 and len(at) < 10:
+            at.append(text.count("\n", 0, i + lead) + 1)
+            i = text.find(old, i + len(old))
+        more = ", …" if count > 10 else ""
+        return f"[{rel}: old occurs at lines {', '.join(map(str, at))}{more}; add context so it matches once]"
+    # Models write \" in raw strings, where the backslash stays.
+    bare = re.sub(r"\\([\"'])", r"\1", old)
+    if bare != old and text.count(bare) == 1:
+        return f"[{rel}: old matches once without the backslashes before its quotes; a raw string keeps them]"
+    lines, want = text.split("\n"), [w.strip() for w in old.strip("\n").split("\n")]
+    trimmed = [line.strip() for line in lines]
+    # Each file line equal to a line of old votes for where old would start; short lines such as } say too little.
+    where, votes = {}, {}
+    for i, w in enumerate(want):
+        if len(w) > 3:
+            where.setdefault(w, []).append(i)
+    for j, line in enumerate(trimmed):
+        for i in where.get(line, ()):
+            votes[j - i] = votes.get(j - i, 0) + 1
+    if votes:
+        start = max(votes, key=lambda s: (votes[s], -s))
+        alike = f"{votes[start]} of {len(want)} lines alike"
+    else:
+        # No line is the same: align on the file line closest to old's longest one.
+        i = max(range(len(want)), key=lambda i: len(want[i]))
+        close = difflib.get_close_matches(want[i], trimmed[:20000], n=1, cutoff=0.6)
+        if not close:
+            return f"[{rel}: no line of old is in the file; show() it before editing]"
+        start, alike = trimmed.index(close[0]) - i, "the closest match"
+    start = max(start, 0)
+    end = min(start + len(want), len(lines))
+    if [line.split() for line in lines[start:end]] == [w.split() for w in want]:
+        alike = "it differs only in whitespace"
+    shown = enumerate(lines[start:end][:12], start + 1)
+    rows = [f"{n}: {line[:200]}{'…' if len(line) > 200 else ''}" for n, line in shown]
+    more = f"; show({rel!r}, {start + 13}, {end}) has the rest" if end - start > 12 else ""
+    span = f"line {end}" if end - start == 1 else f"lines {start + 1}-{end}"
+    return f"[{rel}: nearest to old is {span}, {alike}{more}]\n" + "\n".join(rows)
+
+
 def edit(path, old, new=None):
     pair = lambda p: isinstance(p, (list, tuple)) and len(p) == 2 and all(isinstance(s, str) for s in p)  # noqa: E731
     if isinstance(old, str) and isinstance(new, str):
@@ -274,6 +322,8 @@ def edit(path, old, new=None):
             find = eol(o)
             count = result.count(find)
             if count != 1:
+                if hint := _near(result, find, rel):
+                    _say(hint)
                 which = f" (pair {k} of {len(pairs)}; nothing was changed)" if len(pairs) > 1 else ""
                 raise ValueError(f"old text {'not found' if count == 0 else f'occurs {count} times'} in {rel}{which}")
             result = result.replace(find, eol(n), 1)
