@@ -11,6 +11,7 @@ HALF = 16000
 LIMIT = 8 << 20
 OUT_CAP = 64 << 20  # what a run's own printing may put on disk; past it, output is dropped
 SPILLS = 10  # the cut runs' whole outputs kept on disk for show(); older ones are deleted
+SPILL_AGE = 86400  # seconds another worker's spilled output is kept: one that is gone can't delete its own
 RUN_CAP = 570
 GUIDES = ("AGENTS.md", "CLAUDE.md")  # a folder's instructions: the first of these it has
 GUIDE_CAP = 8 << 10  # characters of one folder's instructions a run shows; show() reads the rest
@@ -32,6 +33,7 @@ _said = 0  # bytes this run printed through edit, write and check, the output th
 _turn = {}  # what this turn's edit(), write() and undo() changed and write() created, for undo(); seeded from low's log
 _groups = set()
 _spawned = []  # the commands this run's code started with subprocess, each with its Popen, for their exit status
+_spilled = []  # this worker's spilled outputs, oldest first
 _Popen, _os_system = subprocess.Popen, os.system  # low's own commands; the run's code gets _Seen and _system
 _deadline = time.monotonic() + RUN_CAP
 _running = _dropped = _executing = False
@@ -84,13 +86,18 @@ def _kill():
     os.kill(os.getpid(), signal.SIGKILL)
 
 
+def _descendants():
+    tree = _children(os.getpid())
+    for parent in tree:
+        tree.extend(_children(parent))
+    return tree
+
+
 def _reap():
     """Stops what a run left running, a server or watcher started with subprocess.Popen say: it holds the run's
     capture, a deleted file nothing reads or caps once the run is over, and would fill the disk from there. Returns
     how many processes it stopped."""
-    tree = _children(os.getpid())
-    for parent in tree:
-        tree.extend(_children(parent))
+    tree = _descendants()
     groups = set()
     for pid in tree:
         with contextlib.suppress(OSError):
@@ -175,21 +182,28 @@ def _read(f):
 
 def _spill(text, n):
     """Keeps a run's whole output, of which the model gets only the ends, where show() and sh() can read it: in low's
-    cache for this repo, outside the tree, with the newest SPILLS kept. Its path, or None when it can't be written."""
+    cache for this repo, outside the tree, with this worker's newest SPILLS kept. Every low in the repo shares the
+    folder, a second look's worker too, and on Linux each worker has a process namespace of its own, where pids repeat:
+    so a file takes a name no other has, and others' files are left for a day. Its path, or None when it can't be
+    written."""
     folder = os.path.join(os.environ.get("XDG_CACHE_HOME") or tempfile.gettempdir(), "low-out")
-    path = os.path.join(folder, f"run-{os.getpid()}-{n}.txt")
     try:
         os.makedirs(folder, exist_ok=True)
-        with open(path, "w", encoding="utf-8", errors="replace") as f:
+        fd, path = tempfile.mkstemp(prefix=f"run-{n}-", suffix=".txt", dir=folder)
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
             f.write(text)
     except OSError:
         return None
+    _spilled.append(path)
+    gone, _spilled[:] = _spilled[:-SPILLS], _spilled[-SPILLS:]
     with contextlib.suppress(OSError):
-        kept = [e for e in os.scandir(folder) if e.name.startswith("run-")]
-        kept.sort(key=lambda e: e.stat().st_mtime_ns)
-        for e in kept[:-SPILLS]:
+        for e in os.scandir(folder):
             with contextlib.suppress(OSError):
-                os.unlink(e.path)
+                if e.name.startswith("run-") and e.path not in _spilled and e.stat().st_mtime < time.time() - SPILL_AGE:
+                    gone.append(e.path)
+    for old in gone:
+        with contextlib.suppress(OSError):
+            os.unlink(old)
     return path
 
 
@@ -808,7 +822,9 @@ def check():
         _say("[no check configured: check() ran nothing]")
         return True
     ran = len(_report.get("cmds", []))
-    answer = _host({"needs_check": True, "actions": _report.get("actions", []), "cmds": _report.get("cmds", [])})
+    # With processes the run started still going, low runs the check again at the turn's end instead of reusing this.
+    answer = _host({"needs_check": True, "actions": _report.get("actions", []), "cmds": _report.get("cmds", []),
+                    "alive": len(_descendants())})
     ok = answer.get("ok") is True
     global _checked
     _checked = _tree() if ok else None

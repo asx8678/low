@@ -956,23 +956,15 @@ impl Agent {
     /// user's editor, a pull, a branch switch. None when nothing did or the last turn's tree is unknown.
     async fn moved_since(&self, start: &str) -> Option<Vec<String>> {
         let last = self.session.entries.iter().rev().find_map(|e| Report::of(e)?.tree)?;
-        let (last, now) = (last.split(' ').next()?.to_string(), start.split(' ').next()?.to_string());
+        let (last, now) = (last.split(' ').next()?, start.split(' ').next()?);
         if last == now || now.is_empty() {
             return None;
         }
-        let (root, args) = (self.root.clone(), ["diff-tree", "-r", "--name-status", "--no-renames", "-z", &last, &now]);
-        let args = args.map(String::from);
-        let out = tokio::task::spawn_blocking(move || git(&root, None, &args)).await.ok()?.ok()?;
-        let fields: Vec<&str> = out.split('\0').filter(|f| !f.is_empty()).collect();
-        let files: Vec<String> = fields
-            .chunks(2)
-            .filter(|pair| pair.get(1).is_none_or(|path| self.quiet.as_deref() != Some(*path)))
-            .filter_map(|pair| match pair {
-                ["A", path] => Some(format!("{path} (new)")),
-                ["D", path] => Some(format!("{path} (deleted)")),
-                [_, path] => Some(path.to_string()),
-                _ => None,
-            })
+        let files: Vec<String> = tree_diff(&self.root, last, now)
+            .await?
+            .iter()
+            .filter(|(_, path)| self.quiet.as_deref() != Some(path))
+            .map(named)
             .collect();
         (!files.is_empty()).then_some(files)
     }
@@ -1246,6 +1238,11 @@ impl Agent {
                     Some(check) => self.verify(&check, false).await,
                     None => (false, "no check command configured (set check in low.toml)".into()),
                 };
+                // A pass while the run's own processes were going may rest on them, such as a server the check's tests
+                // reach on localhost, which macOS's sandbox lets them: the turn's end runs the check again, not reuse it.
+                if reply["alive"].as_u64().is_some_and(|n| n > 0) {
+                    self.passed = None;
+                }
                 reply = self.worker()?.resume(ok, &out).await?;
             }
             anyhow::Ok(reply)
@@ -1795,6 +1792,26 @@ pub async fn tree_at(root: &Path, index: &Path, repo: bool) -> Result<String> {
     tokio::task::spawn_blocking(move || snapshot(&root, &index)).await?
 }
 
+/// The files that differ between two snapshots, each with git's status letter (A, D, M, T). An untracked file over
+/// git::BIG is in neither tree, only in a snapshot's suffix, so it is not among them. None when git fails.
+async fn tree_diff(root: &Path, from: &str, to: &str) -> Option<Vec<(String, String)>> {
+    let (from, to) = (from.split(' ').next()?, to.split(' ').next()?);
+    let args = ["diff-tree", "-r", "--name-status", "--no-renames", "-z", from, to].map(String::from);
+    let root = root.to_path_buf();
+    let out = tokio::task::spawn_blocking(move || git(&root, None, &args)).await.ok()?.ok()?;
+    let fields: Vec<&str> = out.split('\0').filter(|f| !f.is_empty()).collect();
+    Some(fields.as_chunks::<2>().0.iter().map(|[status, path]| (status.to_string(), path.to_string())).collect())
+}
+
+/// A file tree_diff lists, as a turn's report names one: "path (new)", "path (deleted)", else the path.
+fn named((status, path): &(String, String)) -> String {
+    match status.as_str() {
+        "A" => format!("{path} (new)"),
+        "D" => format!("{path} (deleted)"),
+        _ => path.clone(),
+    }
+}
+
 /// One run of `check` in the sandbox, on the tree `before`: whether it passed and left the tree as it was, its output
 /// ending in low's verdict line, and the tree after it.
 pub async fn trial(
@@ -1816,7 +1833,20 @@ pub async fn trial(
     let after = tree_at(root, index, repo).await;
     let why = match (before, &after) {
         (Err(e), _) | (_, Err(e)) => format!("{e:#}"),
-        (Ok(a), Ok(b)) if a != b => "the check changed the working tree".into(),
+        // Named, so a file another writer is changing meanwhile (a log a background job appends to, say) takes one
+        // look to find, not a hunt through the tree.
+        (Ok(a), Ok(b)) if a != b => match tree_diff(root, a, b).await {
+            Some(files) if !files.is_empty() => {
+                let files: Vec<String> = files.iter().map(named).collect();
+                format!("the check changed the working tree: {}", by_folder(&files))
+            }
+            // The trees are the same and only the snapshot's suffix differs: a file git doesn't index.
+            _ if a.split(' ').next() == b.split(' ').next() => format!(
+                "the check changed the working tree: an untracked file over {} MB, which low compares by size and time",
+                crate::git::BIG >> 20
+            ),
+            _ => "the check changed the working tree".into(),
+        },
         _ => redact(check).0,
     };
     let ok = passed && matches!((before, &after), (Ok(a), Ok(b)) if a == b);
@@ -2027,7 +2057,6 @@ impl Claims {
     }
 }
 
-/// The first LISTED items joined by `sep`, then how many more there are.
 /// Changed files as a list, a top-level folder with several in it as one item: "review/ (171 files deleted)".
 fn by_folder(changes: &[String]) -> String {
     let mut folders: Vec<(&str, Vec<&String>)> = vec![];
@@ -2059,6 +2088,7 @@ fn by_folder(changes: &[String]) -> String {
     capped(&items, ", ")
 }
 
+/// The first LISTED items joined by `sep`, then how many more there are.
 fn capped(items: &[String], sep: &str) -> String {
     let more = items.len().saturating_sub(LISTED);
     let shown = items[..items.len() - more].join(sep);

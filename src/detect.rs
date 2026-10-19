@@ -60,10 +60,15 @@ fn make(root: &Path) -> Option<String> {
     ["check", "test"].into_iter().find(|t| targets.contains(t)).map(|t| format!("make {t}"))
 }
 
+/// In a workspace whose root is a package too, plain cargo builds and tests that package alone, so a workspace that
+/// sets no default-members gets --workspace, which takes in its members. default-members is the repository's own
+/// choice of what plain cargo runs.
 fn cargo(root: &Path) -> Rule {
-    root.join("Cargo.toml")
-        .is_file()
-        .then(|| ("Cargo.toml", vec!["cargo build -q && cargo test -q".into(), "cargo build -q".into()]))
+    let text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let manifest: toml::Table = toml::from_str(&text).unwrap_or_default();
+    let workspace = manifest.get("workspace").and_then(toml::Value::as_table);
+    let all = if workspace.is_some_and(|w| !w.contains_key("default-members")) { " --workspace" } else { "" };
+    Some(("Cargo.toml", vec![format!("cargo build -q{all} && cargo test -q{all}"), format!("cargo build -q{all}")]))
 }
 
 /// The package.json's check or typecheck script and its test script, with the lockfile's package manager; CI=1 keeps
@@ -335,6 +340,15 @@ mod tests {
         assert_eq!(mix, ["mix compile --warnings-as-errors && mix test", "mix compile --warnings-as-errors"]);
         let cargo = commands(&repo("cargo", &[("Cargo.toml", "")]));
         assert_eq!(cargo, ["cargo build -q && cargo test -q", "cargo build -q"]);
+        let rooted = "[package]\nname = \"app\"\n\n[workspace]\nmembers = [\"crates/core\"]\n";
+        let workspace = commands(&repo("cargo-workspace", &[("Cargo.toml", rooted)]));
+        let members = ["cargo build -q --workspace && cargo test -q --workspace", "cargo build -q --workspace"];
+        assert_eq!(workspace, members);
+        let chosen = format!("{rooted}default-members = [\"crates/core\"]\n");
+        let defaults = commands(&repo("cargo-defaults", &[("Cargo.toml", &chosen)]));
+        assert_eq!(defaults, cargo, "default-members says what plain cargo runs");
+        let broken = commands(&repo("cargo-broken", &[("Cargo.toml", "[workspace")]));
+        assert_eq!(broken, cargo, "a manifest that doesn't parse is still a Rust repository");
     }
 
     #[test]
@@ -370,6 +384,7 @@ mod tests {
         let package = r#"{"scripts": {"typecheck": "tsc", "test": "vitest"}}"#;
         let repos = [
             repo("redact-make", &[("Makefile", "check:\n\ttrue\n"), ("Cargo.toml", "")]),
+            repo("redact-cargo", &[("Cargo.toml", "[workspace]\nmembers = []\n")]),
             repo("redact-node", &[("package.json", package), ("bun.lock", "")]),
             repo("redact-py", &[("pytest.ini", ""), (".venv/bin/python", "")]),
             repo("redact-go", &[("go.mod", "")]),

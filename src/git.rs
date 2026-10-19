@@ -5,7 +5,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::sync::OnceLock;
 
-const BIG: u64 = 16 << 20;
+pub const BIG: u64 = 16 << 20;
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 static GIT_GUARD: OnceLock<(String, Vec<String>)> = OnceLock::new();
 /// One git at a time on low's index: a snapshot abandoned by Ctrl-C keeps running on the blocking pool.
