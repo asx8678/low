@@ -97,7 +97,8 @@ In the REPL:
 
 | command | does |
 |---|---|
-| `/model [filter]` | lists the models your providers serve and switches to one |
+| `/models [filter]` | picks the model and the reasoning effort in one panel: ↑↓ the model, ←→ the effort (`default` is the model profile's), typing filters, Enter applies, Esc keeps both; a name no provider lists can be typed and tried. Without a terminal it is a numbered list |
+| `/model [filter]` | the same as `/models` |
 | `/effort [level]` | shows the reasoning effort the session sends, or sets it: `low`, `medium`, `high`, `xhigh` or `max` |
 | `/providers` | adds, edits and removes providers |
 | `/cost` | shows the session's requests and tokens |
@@ -121,7 +122,7 @@ search = "deepseek"                  # the provider whose key search() and fetch
 
 [models."deepseek-v4.1-flash"]       # sent with every request to this model
 temperature = 0.0                    # temperature = false sends none, for a model that refuses it
-reasoning_effort = "low"             # the default effort; --effort and /effort change it per session
+reasoning_effort = "low"             # the default effort; --effort, /effort and /models change it per session
 compact_at = 200000                  # compact the context at this many prompt tokens
 keep_warm = 600                      # low --serve: re-send the prompt after this many idle seconds, for an hour after the last task (default 600, 0: never)
 turn_budget = 60                     # stop a turn after this many compact_at of tokens (cached input counts a quarter; default 60)

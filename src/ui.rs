@@ -21,6 +21,8 @@ static STEP: AtomicUsize = AtomicUsize::new(0);
 static EVENTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 static TERMIOS: OnceLock<Termios> = OnceLock::new();
 static BARRED: AtomicBool = AtomicBool::new(false);
+/// /models' picker is up, with the cursor hidden.
+static PICKING: AtomicBool = AtomicBool::new(false);
 pub static CHECK: AtomicI32 = AtomicI32::new(0);
 
 static STYLED: LazyLock<bool> =
@@ -54,7 +56,7 @@ pub fn printable(text: &str) -> String {
 }
 
 /// The terminal's rows and columns, asked of the tty itself: the ticker calls this every second.
-fn size() -> Option<(u16, u16)> {
+pub fn size() -> Option<(u16, u16)> {
     let ws = tcgetwinsize(std::fs::File::open("/dev/tty").ok()?).ok()?;
     Some((ws.ws_row, ws.ws_col)).filter(|&(rows, cols)| rows >= 5 && cols >= 20)
 }
@@ -96,6 +98,11 @@ impl Drop for Turn {
     }
 }
 
+/// Marks the picker as up, so a signal that ends low shows the cursor again.
+pub fn picking(up: bool) {
+    PICKING.store(up, Ordering::Relaxed);
+}
+
 pub fn guard() {
     if let Ok(saved) = tcgetattr(stdin()) {
         let _ = TERMIOS.set(saved);
@@ -110,6 +117,7 @@ pub fn guard() {
 extern "C" fn quit(signal: libc::c_int) {
     let group = CHECK.load(Ordering::Relaxed);
     let reset: &[u8] = if BARRED.load(Ordering::Relaxed) { b"\x1b7\x1b[999;1H\x1b[2K\x1b[r\x1b8\n" } else { b"" };
+    let cursor: &[u8] = if PICKING.load(Ordering::Relaxed) { b"\x1b[?25h\n" } else { b"" };
     // Only async-signal-safe calls from here: each is one system call.
     if group > 1
         && let Some(group) = Pid::from_raw(group)
@@ -120,6 +128,7 @@ extern "C" fn quit(signal: libc::c_int) {
         let _ = tcsetattr(stdin(), OptionalActions::Now, saved);
     }
     let _ = rustix::io::write(stdout(), reset);
+    let _ = rustix::io::write(stdout(), cursor);
     unsafe { libc::_exit(128 + signal) };
 }
 

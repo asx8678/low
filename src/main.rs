@@ -2,6 +2,7 @@ mod agent;
 mod compact;
 mod git;
 mod llm;
+mod picker;
 mod providers;
 mod redact;
 mod render;
@@ -19,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 /// The build `low --version` names and the session log records.
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " ", env!("LOW_BUILD"));
-const ABOUT: &str = "A low-entropy, code-mode coding agent. Without a task it starts a REPL (/compact, /cost, /think, /effort [level], /model [filter], /providers).";
+const ABOUT: &str = "A low-entropy, code-mode coding agent. Without a task it starts a REPL (/models, /model [filter], /effort [level], /providers, /compact, /cost, /think).";
 const USAGE: &str = "Usage: low [OPTIONS] [TASK]";
 const HELP: &str = "\
 Arguments:
@@ -28,9 +29,9 @@ Arguments:
 Options:
       --resume         Resume the latest session in this repo
       --session <ID>   Resume this session of this repo (its id, as in [session ...])
-  -m, --model <MODEL>  Model for a new session; with --resume it switches the session to it (so does /model)
+  -m, --model <MODEL>  Model for a new session; with --resume it switches the session to it (so do /models and /model)
       --effort <LEVEL> How hard the model thinks: low, medium, high, xhigh or max, sent as reasoning_effort (DeepSeek runs
-                       medium and xhigh as high); like -m it sets a new session and switches a resumed one (so does /effort);
+                       medium and xhigh as high); like -m it sets a new session and switches a resumed one (so do /effort and /models);
                        DeepSeek caches per level, so a switch sends the context uncached once
       --yolo           No sandbox: network on, writes anywhere (env vars stay filtered; env = [...] in ~/.config/low/config.toml passes more)
       --serve          After the task, keep the session and take the next tasks from low --send, keeping the provider's prompt cache warm in between (from a script, start it without a task)
@@ -320,12 +321,10 @@ async fn start() -> Result<()> {
                 }
                 .await
             }
-            _ if let Some(filter) = line.strip_prefix("/model").filter(|f| f.is_empty() || f.starts_with(' ')) => {
-                pick(&mut agent, &mut editor, filter.trim()).await
+            _ if let Some(filter) = argument(line, "/models").or_else(|| argument(line, "/model")) => {
+                models(&mut agent, &mut editor, filter).await
             }
-            _ if let Some(level) = line.strip_prefix("/effort").filter(|f| f.is_empty() || f.starts_with(' ')) => {
-                effort(&mut agent, level.trim())
-            }
+            _ if let Some(level) = argument(line, "/effort") => effort(&mut agent, level),
             task => {
                 editor.add_history_entry(task)?;
                 agent.run(task).await.map(drop)
@@ -339,6 +338,61 @@ async fn start() -> Result<()> {
             eprintln!("error: {error}");
         }
     }
+}
+
+/// What follows a command's name on its line, if the line is that command.
+fn argument<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    line.strip_prefix(name).filter(|rest| rest.is_empty() || rest.starts_with(' ')).map(str::trim)
+}
+
+/// /models and /model: on a terminal, one panel for the model and the reasoning effort; elsewhere a numbered list.
+async fn models(agent: &mut agent::Agent, editor: &mut rustyline::DefaultEditor, filter: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !terminal || ui::size().is_none() || std::env::var_os("TERM").is_some_and(|t| t == "dumb") {
+        return pick(agent, editor, filter).await;
+    }
+    let now = (agent.provider().to_string(), agent.model().to_string());
+    let mut rows: Vec<picker::Row> = agent
+        .models()
+        .await
+        .into_iter()
+        .map(|(provider, model, profiled)| {
+            let current = (&provider, &model) == (&now.0, &now.1);
+            picker::Row { provider, model, profiled, current }
+        })
+        .collect();
+    // The session's model is a row even when no provider lists it now.
+    if !rows.iter().any(|r| r.current) {
+        let profiled = agent.profile(&now.1).is_some();
+        rows.insert(0, picker::Row { provider: now.0.clone(), model: now.1.clone(), profiled, current: true });
+    }
+    let default = |agent: &agent::Agent, model: &str| -> Option<String> {
+        agent.profile(model)?.get("reasoning_effort")?.as_str().map(String::from)
+    };
+    let defaults = rows.iter().filter_map(|r| Some((r.model.clone(), default(agent, &r.model)?))).collect();
+    // The session's effort is picked as the default when it is just what the profile sets.
+    let explicit = agent.effort().filter(|e| default(agent, &now.1).as_deref() != Some(*e));
+    let mut state = picker::State::new(rows, defaults, filter, explicit);
+    let Some(picked) = picker::choose(&mut state)? else { return Ok(()) };
+    let rows = state.rows();
+    let (provider, model) = match picked.target {
+        picker::Target::Listed(i) => (rows[i].provider.clone(), rows[i].model.clone()),
+        picker::Target::Typed(typed) => {
+            let (provider, model) = agent.resolve(&typed);
+            ui::note(&format!("{} is not listed; trying it on {provider}", ui::printable(&model)));
+            (provider, model)
+        }
+    };
+    let profile = default(agent, &model);
+    let to = (provider.as_str(), model.as_str());
+    for step in picker::steps((&now.0, &now.1), agent.effort(), to, profile.as_deref(), picked.effort) {
+        match step {
+            picker::Step::Switch => agent.switch(&provider, &model)?,
+            picker::Step::Effort(level) => agent.set_effort(level)?,
+        }
+    }
+    Ok(())
 }
 
 async fn pick(agent: &mut agent::Agent, editor: &mut rustyline::DefaultEditor, filter: &str) -> Result<()> {
@@ -391,13 +445,15 @@ fn effort(agent: &mut agent::Agent, level: &str) -> Result<()> {
     if level.is_empty() {
         let now = agent.effort().unwrap_or("not set, so the provider's default");
         let choices = agent::EFFORTS.join(" ");
-        println!("reasoning effort: {now}\nset it with /effort {choices} (DeepSeek runs medium and xhigh as high)");
+        println!(
+            "reasoning effort: {now}\nset it with /effort {choices}, or pick it in /models (DeepSeek runs medium and xhigh as high)"
+        );
         return Ok(());
     }
     agent.set_effort(level)
 }
 
-const COMMANDS: &[&str] = &["/compact", "/cost", "/think", "/effort", "/model", "/providers"];
+const COMMANDS: &[&str] = &["/compact", "/cost", "/think", "/effort", "/model", "/models", "/providers"];
 
 /// A "/word" line that names no command is a typo, and must not reach the model as a task.
 fn unknown(line: &str) -> Option<String> {

@@ -174,14 +174,28 @@ impl Agent {
     }
 
     pub fn resume_with(&mut self, model: &str) -> Result<()> {
-        let (provider, model) = match qualified(&self.config.providers, model) {
-            Some((provider, id)) => (provider, id),
-            None => (holding(&self.config.providers, model).cloned().unwrap_or_else(|| self.provider.clone()), model),
-        };
+        let (provider, model) = self.resolve(model);
         if provider == self.provider && model == self.model() {
             return Ok(());
         }
-        self.switch(&provider, model)
+        self.switch(&provider, &model)
+    }
+
+    /// The provider and model id a typed model names: `provider:model`, else the provider that lists it, else the
+    /// current one.
+    pub fn resolve(&self, model: &str) -> (String, String) {
+        match qualified(&self.config.providers, model) {
+            Some((provider, id)) => (provider, id.to_string()),
+            None => {
+                let provider = holding(&self.config.providers, model).cloned();
+                (provider.unwrap_or_else(|| self.provider.clone()), model.to_string())
+            }
+        }
+    }
+
+    /// The model's profile in config.toml, if it has one.
+    pub fn profile(&self, model: &str) -> Option<&serde_json::Map<String, Value>> {
+        self.config.models.get(model)
     }
 
     /// Runs one task and returns its result as `low --json`, `low --send` and `--tasks` give it.
