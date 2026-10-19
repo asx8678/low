@@ -11,6 +11,8 @@ HALF = 16000
 LIMIT = 8 << 20
 OUT_CAP = 64 << 20  # what a run's own printing may put on disk; past it, output is dropped
 RUN_CAP = 570
+GUIDES = ("AGENTS.md", "CLAUDE.md")  # a folder's instructions: the first of these it has
+GUIDE_CAP = 8 << 10  # characters of one folder's instructions a run shows; show() reads the rest
 IGNORABLE = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r(?!\n)")
 ESCAPED = re.compile(r"\\([!-/:-@\[-`{-~])")  # markdown's backslash before ASCII punctuation, as DeepSeek's fetch writes it
@@ -178,6 +180,37 @@ def _say(text):
     _said += os.fstat(1).st_size - before
 
 
+def _guide(path):
+    """Prints the AGENTS.md (else CLAUDE.md) of each folder between the repo root and path, outermost first, unless the
+    model's context already holds it: the root's is in the system prompt, a folder's own the first time a run shows,
+    edits or writes a file under it. low passes the ones still in context as state["guides"]."""
+    real = os.path.realpath(os.path.join(ROOT, path))
+    if READONLY or not real.startswith(ROOT + os.sep):
+        return
+    seen = set(_state.get("guides") or ()) | set(_report.get("guides", ()))
+    parts = os.path.relpath(os.path.dirname(real), ROOT).split(os.sep)
+    for k in range(1, len(parts) + 1 if parts != ["."] else 1):
+        folder = os.path.join(*parts[:k])
+        found = (os.path.join(folder, name) for name in GUIDES)
+        rel = next((r for r in found if os.path.isfile(os.path.join(ROOT, r))), None)
+        full = rel and os.path.realpath(os.path.join(ROOT, rel))
+        if not rel or rel in seen or not full.startswith(ROOT + os.sep):
+            continue
+        _report.setdefault("guides", []).append(rel)
+        if full == real:
+            continue  # show() is about to print it
+        try:
+            with open(full, encoding="utf-8", errors="replace") as f:
+                text = f.read(GUIDE_CAP + 1)
+        except OSError:
+            continue
+        more = ""
+        if len(text) > GUIDE_CAP:
+            text = text[:text.rfind("\n", 0, GUIDE_CAP) + 1] or text[:GUIDE_CAP]
+            more = f"; show({rel!r}, {text.count(chr(10)) + 1}) has the rest"
+        print(f"[{rel}: instructions for the files in {folder}/, shown once{more}]\n{text.rstrip()}\n[end of {rel}]")
+
+
 def _change(tool, path, make):
     rel = _rel(path)
     real = os.path.realpath(os.path.join(ROOT, rel))
@@ -198,11 +231,14 @@ def _change(tool, path, make):
         st = os.stat(real) if os.path.lexists(real) else None
         if st and stat.S_ISREG(st.st_mode) and (st.st_nlink > 1 or st.st_dev != os.stat(ROOT).st_dev):
             raise ValueError(f"{path} has other hard links or lives on another volume; low will not change it")
-        before, written = make(os.path.join(ROOT, rel), rel)
+        before, written, *notes = make(os.path.join(ROOT, rel), rel)
+        notes = notes[0] if notes else []
         delta = [l[0] for l in difflib.unified_diff(before.splitlines(), written.splitlines(), lineterm="")][2:]
         action = {"tool": tool, "path": rel, "ok": True, "added": delta.count("+"), "removed": delta.count("-")}
         if tool == "write" and st:
             action["replaced"] = True
+        if notes:
+            action["reindented"] = len(notes)
         _report.setdefault("actions", []).append(action)
     except Exception as e:
         _report.setdefault("actions", []).append({"tool": tool, "path": rel, "ok": False, "error": str(e)})
@@ -210,7 +246,7 @@ def _change(tool, path, make):
     finally:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
     _forget()
-    note = ""
+    note = "".join(f"; {n}" for n in notes)
     if FMT:
         out, code = _exec(f"{FMT} {shlex.quote('./' + rel if rel.startswith('-') else rel)}", 60)
         note = f"; fmt failed: {out.strip().splitlines()[0] if out.strip() else code}" if code else ""
@@ -221,6 +257,7 @@ def _change(tool, path, make):
         diff = difflib.unified_diff(written.splitlines(True), after.splitlines(True), n=1)
         note += "; the formatter changed it:\n" + "".join(list(diff)[2:]).rstrip("\n")
     _say(f"{tool} {rel}: ok{note}")
+    _guide(rel)
 
 
 def _forget():
@@ -341,6 +378,52 @@ def _near(text, old, rel):
     return f"[{rel}: nearest to old is {span}, {alike}{more}]\n" + "\n".join(rows)
 
 
+def _indent(line):
+    return line[:len(line) - len(line.lstrip())]
+
+
+def _shifted(text, old, new):
+    """old matched by whole lines once with every line indented deeper or shallower by the same amount: text with them
+    replaced by new indented alike, and what was done; None when that is not the case."""
+    core = old.strip("\n")
+    lead, trail = len(old) - len(old.lstrip("\n")), len(old) - len(old.rstrip("\n"))
+    if not core.strip() or new[:lead] != "\n" * lead or trail and new[len(new) - trail:] != "\n" * trail:
+        return None
+    new = new[lead:len(new) - trail]
+    lines, want = text.split("\n"), core.split("\n")
+    stripped = [w.strip() for w in want]
+    first = next(k for k, w in enumerate(stripped) if w)
+    found = [i - first for i, line in enumerate(lines) if line.strip() == stripped[first] and i >= first]
+    found = [i for i in found if [line.strip() for line in lines[i:i + len(want)]] == stripped]
+    if len(found) != 1:
+        return None
+    start = found[0]
+    pairs = [(_indent(f), _indent(w)) for f, w in zip(lines[start:start + len(want)], want) if w.strip()]
+    deeper = pairs[0][0].endswith(pairs[0][1]) and len(pairs[0][0]) > len(pairs[0][1])
+    shift = (pairs[0][0][:len(pairs[0][0]) - len(pairs[0][1])] if deeper
+             else pairs[0][1][:len(pairs[0][1]) - len(pairs[0][0])])
+    if not shift or any(f != (shift + w if deeper else w[len(shift):]) or not deeper and not w.startswith(shift)
+                        for f, w in pairs):
+        return None
+    out = []
+    for line in new.split("\n"):
+        if not line.strip():
+            out.append(line)
+        elif deeper:
+            out.append(shift + line)
+        elif line.startswith(shift):
+            out.append(line[len(shift):])
+        else:
+            return None
+    end = start + len(want)
+    kind = "tab" if shift == "\t" * len(shift) else "space" if shift == " " * len(shift) else "blank"
+    width = f"{len(shift)} {kind}{'s' if len(shift) > 1 else ''}"
+    span = f"line {start + 1}" if end - start == 1 else f"lines {start + 1}-{end}"
+    verb, way = "matches" if end - start == 1 else "match", "deeper" if deeper else "shallower"
+    note = f"{span} {verb} old indented {width} {way}, so new was too"
+    return "\n".join(lines[:start] + out + lines[end:]), note
+
+
 def edit(path, old, new=None):
     pair = lambda p: isinstance(p, (list, tuple)) and len(p) == 2 and all(isinstance(s, str) for s in p)  # noqa: E731
     texts = isinstance(old, (list, tuple)) and all(isinstance(s, str) for s in old)
@@ -359,19 +442,26 @@ def edit(path, old, new=None):
         crlf = "\r\n" in raw and raw.count("\r\n") == raw.count("\n")
         eol = (lambda s: s.replace("\r\n", "\n")) if crlf else (lambda s: s)
         text = result = eol(raw)
+        notes = []
         for k, (o, n) in enumerate(pairs, 1):
             find = eol(o)
             count = result.count(find)
+            which = f"pair {k} of {len(pairs)}" if len(pairs) > 1 else ""
+            # An old whose lines are all indented too deep or too shallow by the same amount still means one place.
+            if count == 0 and (shifted := _shifted(result, find, eol(n))):
+                result = shifted[0]
+                notes.append(f"{which}: {shifted[1]}" if which else shifted[1])
+                continue
             if count != 1:
                 if hint := _near(result, find, rel):
                     _say(hint)
-                which = f" (pair {k} of {len(pairs)}; nothing was changed)" if len(pairs) > 1 else ""
+                which = f" ({which}; nothing was changed)" if which else ""
                 raise ValueError(f"old text {'not found' if count == 0 else f'occurs {count} times'} in {rel}{which}")
             result = result.replace(find, eol(n), 1)
         data = (result.replace("\n", "\r\n") if crlf else result).encode("utf-8")
         with open(full, "wb") as f:
             f.write(data)
-        return text, result
+        return text, result, notes
     _change("edit", path, make)
 
 
@@ -462,6 +552,7 @@ def show(path, start=1, end=None):
     full = os.path.join(ROOT, path)
     with open(full, "rb") as f:
         _report.setdefault("reads", []).append(_rel(path))
+        _guide(path)
         if b"\0" in f.read(8192):
             print(f"[{_rel(path)}: binary, {os.fstat(f.fileno()).st_size} bytes]")
             return

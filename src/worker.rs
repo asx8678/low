@@ -315,6 +315,11 @@ fn sandbox(root: &Path, yolo: bool, writes: bool, program: &str, args: &[&str]) 
         let subpaths = |dirs: &[PathBuf]| -> String { dirs.iter().map(|d| format!(" (subpath {d:?})")).collect() };
         let protected = subpaths(&[protected, frozen].concat());
         let (dirs, secrets) = (subpaths(&writable), subpaths(secrets));
+        // An allow with no path would allow every read.
+        let skills = match skill_reads() {
+            [] => String::new(),
+            found => format!("(allow file-read-data{})", subpaths(found)),
+        };
         let sockets = root.join("tmp");
         let profile = format!(
             "(version 1)(allow default)(deny network*)\
@@ -324,7 +329,7 @@ fn sandbox(root: &Path, yolo: bool, writes: bool, program: &str, args: &[&str]) 
               (local unix-socket (subpath {sockets:?})) (remote unix-socket (subpath {sockets:?})))\
              (deny file-write*)(allow file-write*{dirs} (subpath \"/dev\"))(deny file-write*{protected})\
              (deny file-write* (require-all (subpath {root:?}) (regex #\"/\\.[gG][iI][tT](/|$)\")))\
-             (deny file-read-data{secrets})\
+             (deny file-read-data{secrets}){skills}\
              (deny file-ioctl (regex #\"^/dev/tty\"))(deny file-write* (regex #\"^/dev/tty\"))(deny appleevent-send)\
              (deny process-exec (literal \"/usr/bin/osascript\") (literal \"/usr/bin/osacompile\") \
               (literal \"/usr/bin/open\") (literal \"/bin/launchctl\") (literal \"/usr/bin/automator\"))"
@@ -348,6 +353,9 @@ fn sandbox(root: &Path, yolo: bool, writes: bool, program: &str, args: &[&str]) 
             } else {
                 cmd.arg("--ro-bind").arg("/dev/null").arg(path);
             }
+        }
+        for dir in skill_reads() {
+            cmd.arg("--ro-bind").arg(dir).arg(dir);
         }
         for dir in protected.iter().chain(&nested(root)).filter(|d| d.exists()) {
             cmd.arg("--ro-bind").arg(dir).arg(dir);
@@ -385,6 +393,45 @@ fn secrets() -> &'static [PathBuf] {
             paths.push(path);
         }
         paths
+    })
+}
+
+/// Where skills are kept, in the repository and in the home directory: a folder per skill, with a SKILL.md.
+pub const SKILLS: [&str; 2] = [".agents/skills", ".claude/skills"];
+
+/// What the sandbox lets the worker read though it sits among what it hides: $HOME's skills folders, which ~/.claude
+/// holds, and the folders their skills link to, which hiding ~/.claude hides too. A skill is written for an agent to
+/// read; the rest of ~/.claude (credentials, transcripts, settings) stays hidden, and so does a skill linked into
+/// another secret path. Resolved, as the sandbox matches resolved paths.
+pub fn skill_reads() -> &'static [PathBuf] {
+    static FOUND: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    FOUND.get_or_init(|| {
+        let home = home();
+        if home.as_os_str().is_empty() {
+            return vec![];
+        }
+        let hidden: Vec<PathBuf> =
+            SECRETS.split(',').map(|s| home.join(s.trim())).map(|p| p.canonicalize().unwrap_or(p)).collect();
+        let claude = home.join(".claude").canonicalize().ok();
+        // A folder that holds a hidden path, or the home directory, or one inside a hidden path but for `except`.
+        let hides = |p: &Path, except: Option<&PathBuf>| {
+            homes().iter().any(|h| h.starts_with(p))
+                || hidden.iter().any(|s| s.starts_with(p) || Some(s) != except && p.starts_with(s))
+        };
+        let mut found = vec![];
+        for dir in SKILLS.map(|s| home.join(s)).iter().filter_map(|d| d.canonicalize().ok()) {
+            if !dir.is_dir() || hides(&dir, claude.as_ref()) {
+                continue;
+            }
+            let entries = std::fs::read_dir(&dir).into_iter().flatten().flatten();
+            for target in entries.filter_map(|e| e.path().canonicalize().ok()) {
+                if !target.starts_with(&dir) && target.is_dir() && !hides(&target, None) && !found.contains(&target) {
+                    found.push(target);
+                }
+            }
+            found.push(dir);
+        }
+        found
     })
 }
 
@@ -678,6 +725,109 @@ mod tests {
             "{out}"
         );
         assert_eq!(std::fs::read_to_string(dir.join("w.txt")).unwrap(), "three\r\n");
+        drop(worker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// edit() takes an old whose lines are all indented too deep or too shallow by the same amount, and indents new
+    /// alike; anything less certain is still a miss.
+    #[tokio::test]
+    async fn shifted_edits() {
+        let dir = std::env::temp_dir().join(format!("low-shift-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("c.py"), "class A:\n    def f(self):\n        x = 1\n\n        return x\n").unwrap();
+        std::fs::write(dir.join("d.py"), "if a:\n    x\nif b:\n    x\n").unwrap();
+        std::fs::write(dir.join("e.py"), "a:\r\n    b = 1\r\n").unwrap();
+        let mut worker = super::Worker::start(&dir, true, None, None).unwrap();
+        let reply = run(
+            &mut worker,
+            "edit('c.py', 'def f(self):\\n    x = 1\\n\\n    return x', \
+                                      'def f(self):\\n    x = 2\\n\\n    return x')",
+        )
+        .await;
+        assert_eq!(reply["out"], "edit c.py: ok; lines 2-5 match old indented 4 spaces deeper, so new was too\n");
+        assert_eq!(reply["actions"][0]["reindented"], 1);
+        let c = std::fs::read_to_string(dir.join("c.py")).unwrap();
+        assert_eq!(c, "class A:\n    def f(self):\n        x = 2\n\n        return x\n");
+        let misses = [
+            // Too shallow a new can't lose the indentation old had too much of.
+            ("edit('c.py', '            x = 2', 'x = 3')", "old text not found in c.py"),
+            // Two places match once indented alike.
+            ("edit('d.py', '      x', '      y')", "old text not found in d.py"),
+            // Lines indented by different amounts.
+            ("edit('c.py', 'def f(self):\\n      x = 2', 'z')", "old text not found in c.py"),
+        ];
+        for (code, part) in misses {
+            let out = run(&mut worker, code).await["out"].as_str().unwrap_or_default().to_string();
+            assert!(out.contains(part) && !out.contains(": ok"), "{code}: {out}");
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("c.py")).unwrap(), c);
+        let reply = run(&mut worker, "edit('e.py', [('a:', 'a :'), ('      b = 1\\n', '      b = 2\\n')])").await;
+        assert_eq!(
+            reply["out"],
+            "edit e.py: ok; pair 2 of 2: line 2 matches old indented 2 spaces shallower, so new was too\n"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("e.py")).unwrap(), "a :\r\n    b = 2\r\n");
+        drop(worker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder's AGENTS.md, else CLAUDE.md, is shown once, outermost first, by the first show(), edit() or write() under
+    /// it that the run's state doesn't say the context already holds; the root's never, as it is in the system prompt.
+    #[tokio::test]
+    async fn folder_guides() {
+        let dir = std::env::temp_dir().join(format!("low-guide-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("pkg/sub")).unwrap();
+        std::fs::create_dir_all(dir.join("big")).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "ROOT RULES\n").unwrap();
+        std::fs::write(dir.join("top.py"), "x = 1\n").unwrap();
+        std::fs::write(dir.join("pkg/AGENTS.md"), "PKG RULES\n").unwrap();
+        std::fs::write(dir.join("pkg/CLAUDE.md"), "NOT THIS ONE\n").unwrap();
+        std::fs::write(dir.join("pkg/sub/CLAUDE.md"), "SUB RULES\n").unwrap();
+        std::fs::write(dir.join("pkg/sub/m.py"), "y = 1\n").unwrap();
+        std::fs::write(dir.join("big/AGENTS.md"), "a long line of rules for this folder\n".repeat(300)).unwrap();
+        std::fs::write(dir.join("big/b.py"), "z = 1\n").unwrap();
+        let mut worker = super::Worker::start(&dir, true, None, None).unwrap();
+        let mut ran = async |code: &str, guides: &[&str]| worker.run(code, &json!({"guides": guides})).await.unwrap();
+        let reply = ran("show('top.py')\nshow('pkg/sub/m.py')\nshow('pkg/sub/m.py', 1, 1)", &[]).await;
+        let out = reply["out"].as_str().unwrap();
+        assert!(!out.contains("ROOT RULES") && !out.contains("NOT THIS ONE"), "{out}");
+        assert!(
+            out.contains(
+                "[pkg/AGENTS.md: instructions for the files in pkg/, shown once]\nPKG RULES\n[end of pkg/AGENTS.md]\n\
+                          [pkg/sub/CLAUDE.md: instructions for the files in pkg/sub/, shown once]\nSUB RULES\n\
+                          [end of pkg/sub/CLAUDE.md]\n[pkg/sub/m.py: lines 1-1 of 1]"
+            ),
+            "{out}"
+        );
+        assert_eq!(
+            (out.matches("PKG RULES").count(), &reply["guides"]),
+            (1, &json!(["pkg/AGENTS.md", "pkg/sub/CLAUDE.md"]))
+        );
+        // What the context holds isn't shown again; the rest is, on an edit or write too.
+        let reply = ran("write('pkg/sub/n.py', 'n = 1\\n')", &["pkg/AGENTS.md"]).await;
+        let out = reply["out"].as_str().unwrap();
+        assert!(out.starts_with("write pkg/sub/n.py: ok\n[pkg/sub/CLAUDE.md:") && !out.contains("PKG RULES"), "{out}");
+        let reply = ran("edit('pkg/sub/m.py', 'y = 1', 'y = 2')", &["pkg/AGENTS.md", "pkg/sub/CLAUDE.md"]).await;
+        assert_eq!((&reply["out"], &reply["guides"]), (&json!("edit pkg/sub/m.py: ok\n"), &Value::Null));
+        // Showing the guide itself counts as showing it, once.
+        let reply = ran("show('pkg/AGENTS.md')", &[]).await;
+        let out = reply["out"].as_str().unwrap();
+        assert_eq!((out.matches("PKG RULES").count(), &reply["guides"]), (1, &json!(["pkg/AGENTS.md"])), "{out}");
+        // A long one is clipped at a line, and says where the rest starts.
+        let out = ran("show('big/b.py')", &[]).await["out"].as_str().unwrap().to_string();
+        assert!(
+            out.starts_with(
+                "[big/AGENTS.md: instructions for the files in big/, shown once; show('big/AGENTS.md', 222) \
+                                 has the rest]\n"
+            ) && out.len() < 9000,
+            "{out}"
+        );
+        drop(worker);
+        // A second look's worker reads code, not instructions for changing it.
+        let mut worker = super::Worker::reader(&dir, true).unwrap();
+        let reply = worker.run("show('pkg/sub/m.py')", &json!({})).await.unwrap();
+        assert!(!reply["out"].as_str().unwrap().contains("RULES") && reply["guides"].is_null(), "{reply}");
         drop(worker);
         let _ = std::fs::remove_dir_all(&dir);
     }

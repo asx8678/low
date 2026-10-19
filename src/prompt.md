@@ -24,6 +24,7 @@ fetch(url) -> str             # a web page as markdown; JSON, code and other tex
 search([query, ...]), fetch([url, ...]) -> list  # up to 50 at once, 10 at a time: the answers in order, a RuntimeError in place of each that failed
 ```
 Repo files change only through `edit` and `write`, never through `open(..., "w")` or the shell; scratch files go in a temp dir. Both run the formatter and print one line; if the formatter changed your text, the line shows how. Use raw triple-quoted strings (`r"""..."""`) for multi-line `old`/`new` so backslashes stay exact.
+A folder's own AGENTS.md is printed the first time a run shows, edits or writes a file under it; follow it for the files there.
 
 ## Example
 ```python

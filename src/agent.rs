@@ -1144,7 +1144,7 @@ impl Agent {
     async fn run_code(&mut self, code: &str) -> (String, Value) {
         ui::run(code);
         let state = self.session.state();
-        let state = json!({"accepted": state.accepted, "plan": state.plan});
+        let state = json!({"accepted": state.accepted, "plan": state.plan, "guides": self.session.guides()});
         let clock = Instant::now();
         let ran = async {
             let mut reply = self.worker()?.run(code, &state).await?;
@@ -2229,6 +2229,7 @@ fn system_prompt(root: &Path, yolo: bool, check: Option<&str>, repo: bool, web: 
         let why = "outside the repo, sandbox-protected, unreadable, or not a regular file";
         ui::note(&format!("left out of the prompt ({why}): AGENTS.md"));
     }
+    prompt += &crate::skills::section(root);
     prompt += &listing(root);
     prompt
 }

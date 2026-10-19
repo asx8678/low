@@ -8,6 +8,7 @@ mod redact;
 mod render;
 mod serve;
 mod session;
+mod skills;
 mod stats;
 mod tasks;
 mod ui;

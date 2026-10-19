@@ -38,6 +38,8 @@ struct Marks {
     state: State,
     /// What the replies have spent, weighed as a turn's budget weighs them.
     spent: u64,
+    /// The folders' instructions (AGENTS.md) runs have shown, each with the entry of the run that showed it.
+    guides: Vec<(usize, String)>,
 }
 
 impl Marks {
@@ -68,6 +70,10 @@ impl Marks {
         }
         if entry["role"] == "assistant" || meta["aside"] == true {
             self.spent += crate::agent::weighted(meta);
+        }
+        if entry["role"] == "tool" {
+            let shown = meta["guides"].as_array().into_iter().flatten().filter_map(Value::as_str);
+            self.guides.extend(shown.map(|g| (i, g.to_string())));
         }
     }
 }
@@ -195,6 +201,13 @@ impl Session {
 
     pub fn keep(&self) -> usize {
         self.marks.keep.unwrap_or(1)
+    }
+
+    /// The folders' instructions the context still holds: those shown by runs from the kept tail on. One that went
+    /// into a compaction is shown again the next time a run touches its folder.
+    pub fn guides(&self) -> Vec<&str> {
+        let keep = self.keep();
+        self.marks.guides.iter().filter(|(i, _)| *i >= keep).map(|(_, g)| g.as_str()).collect()
     }
 
     /// The last {compact} entry.
@@ -375,10 +388,10 @@ mod tests {
             json!({"role": "user", "content": "first task", "meta": {}}),
             assistant("", &["a"], 1000),
             json!({"role": "tool", "tool_call_id": "a", "content": "ok",
-                   "meta": {"accepted": "it works", "plan": {"steps": ["x"]}}}),
+                   "meta": {"accepted": "it works", "plan": {"steps": ["x"]}, "guides": ["pkg/AGENTS.md"]}}),
             json!({"role": "user", "content": "keep going", "meta": {"host": true}}),
             assistant("", &["b", "c"], 2000),
-            json!({"role": "tool", "tool_call_id": "c", "content": "ran c", "meta": {}}),
+            json!({"role": "tool", "tool_call_id": "c", "content": "ran c", "meta": {"guides": ["pkg/sub/AGENTS.md"]}}),
             json!({"role": "user", "content": "second task", "meta": {}}),
         ];
         for entry in entries {
@@ -399,6 +412,8 @@ mod tests {
         session.push(json!({"role": "user", "content": "use tabs", "meta": {"steer": true}})).unwrap();
         assert_eq!((session.state().accepted.as_deref(), session.newest_task()), (Some("done"), Some(7)));
         assert_eq!(session.spent(), 3020);
+        // The folders' instructions runs showed stay known across tasks, until a compaction drops their runs.
+        assert_eq!(session.guides(), ["pkg/AGENTS.md", "pkg/sub/AGENTS.md"]);
         session.switch("p", "m2", "sys2", Map::new()).unwrap();
         session.push(json!({"compact": {"keep": 10, "summary": "SUMMARY"}})).unwrap();
         session.push(json!({"role": "user", "content": "more", "meta": {"steer": true}})).unwrap();
@@ -408,6 +423,12 @@ mod tests {
         assert!(joined.starts_with("SUMMARY") && joined.contains("[Steered by the user, entry #12]\nmore"), "{joined}");
         // The task and its steers before the kept tail follow a summary written before them.
         assert!(joined.contains("[Current task, entry #7]\nsecond task\n\n[Steered by the user, entry #9]\nuse tabs"));
+        assert!(session.guides().is_empty());
+        session
+            .push(json!({"role": "tool", "tool_call_id": "y", "content": "", "meta": {"guides": ["lib/AGENTS.md"]}}))
+            .unwrap();
+        assert_eq!(session.guides(), ["lib/AGENTS.md"]);
+        let messages = session.messages();
         let live = (messages, session.header().clone(), session.keep(), session.compaction(), session.spent());
         drop(session);
         // A process another test forks meanwhile holds the log's lock until it execs.
@@ -423,6 +444,7 @@ mod tests {
         let resumed =
             (session.messages(), session.header().clone(), session.keep(), session.compaction(), session.spent());
         assert_eq!(live, resumed);
+        assert_eq!(session.guides(), ["lib/AGENTS.md"]);
         assert_eq!((resumed.1["model"].as_str(), resumed.2, resumed.3), (Some("m2"), 10, Some(11)));
         drop(session);
         let _ = std::fs::remove_dir_all(&home);
