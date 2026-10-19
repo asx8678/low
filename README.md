@@ -175,7 +175,7 @@ Every turn ends with one of four verdicts:
 
 **Turn limits:** a turn stops at its token budget (`turn_budget`) or after 200 requests. Once it has used three quarters of either, the model is told about how many requests it has left and asked to spend them on the change rather than on reading; it is not asked to stop early, so a `--tasks` task cut off while it is still changing files keeps its extra turns. At the stop, low asks the model once more, running no code, where the work stands: what changed, what is left and the next step. That reply is the turn's answer, and the next turn starts from it. The session's budget (`session_budget`) caps spending, so it stops without asking.
 
-**Sessions** are JSONL files in `~/.low/sessions`. When the context reaches `compact_at`, low compacts it without an LLM call: it keeps the task, the latest messages and a summary rebuilt from the log.
+**Sessions** are JSONL files in `~/.low/sessions`. Each task the model gets ends with the date it was given on, in your time zone, so the system prompt stays the same and cached. When the context reaches `compact_at`, low compacts it without an LLM call: it keeps the task, the latest messages and a summary rebuilt from the log.
 
 ## Development
 

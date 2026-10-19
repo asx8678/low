@@ -1,7 +1,7 @@
 """The prompt cache golden check: in a session without compaction or a model or effort switch, every request's
 messages start the next one's unchanged (each compared as sent, key order included), across turns and a --resume,
 with the same tools and parameters; reasoning goes back whole, however long."""
-import json
+import datetime, json
 from harness import Env, check, done
 
 LONG = 'Thinking it through. ' * 1000  # 21 KB, past the 16 KB the old build clipped to
@@ -33,4 +33,10 @@ for k, (a, b) in enumerate(zip(raws, raws[1:])):
 check(f'each of {len(raws)} requests starts the next one', len(raws) == 7 and not broken, broken or len(raws))
 echoed = [m.get('reasoning_content', '') for m in raws[2]['messages'] if m['role'] == 'assistant']
 check('a 21 KB reasoning goes back whole', LONG in echoed, [len(x) for x in echoed])
+today = f'\n\n[Today is {datetime.date.today().isoformat()}]'
+tasks = [m['content'] for m in raws[-1]['messages'] if m['role'] == 'user']
+check('each task ends with the date it was given on',
+      tasks == [t + today for t in ('fix add', 'what does add return?', 'print 1')], tasks)
+logged = [x['content'] for x in e.log() if x.get('role') == 'user']
+check('the session log keeps the task as typed', logged == ['fix add', 'what does add return?', 'print 1'], logged)
 done()

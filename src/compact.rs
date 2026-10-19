@@ -33,11 +33,16 @@ pub fn baked(u: usize) -> String {
 /// follows from the entry alone, so every request and every resume sends the same bytes for it, and they are the bytes
 /// the provider streamed, so the prompt prefix stays cached through the reply. Earlier tasks keep their reasoning too,
 /// until a compaction summarizes them: dropping it at a new task broke the cache from the first earlier reply on
-/// (DeepSeek on OpenCode Go reused 34% of the prompt instead of 99%).
+/// (DeepSeek on OpenCode Go reused 34% of the prompt instead of 99%). A task ends with the date it was given on, kept
+/// in its meta, so its text stays the task's everywhere else.
 pub fn wire(entry: &Value) -> Value {
     let mut message = entry.clone();
+    let date = entry["meta"]["date"].as_str().filter(|_| task(entry));
     if let Some(fields) = message.as_object_mut() {
         fields.remove("meta");
+    }
+    if let Some(date) = date {
+        message["content"] = format!("{}\n\n[Today is {date}]", entry["content"].as_str().unwrap_or_default()).into();
     }
     message
 }
@@ -396,6 +401,18 @@ mod tests {
         // Everything fits: nothing to compact, unless an overflow asks for a cut anyway.
         assert_eq!(super::cut(&entries, 1, 1 << 30, false), 1);
         assert!(super::cut(&entries, 1, 0, true) > 1);
+    }
+
+    #[test]
+    fn a_task_carries_its_date() {
+        let task = json!({"role": "user", "content": "fix it", "meta": {"date": "2026-10-19", "snapshot": "t"}});
+        assert_eq!(super::wire(&task), json!({"role": "user", "content": "fix it\n\n[Today is 2026-10-19]"}));
+        // A session from before dates, a steer and low's own messages are sent as they were.
+        let dated = |flag: &str| json!({"date": "2026-10-19", flag: true});
+        for meta in [json!({}), dated("steer"), dated("host")] {
+            let entry = json!({"role": "user", "content": "fix it", "meta": meta});
+            assert_eq!(super::wire(&entry), json!({"role": "user", "content": "fix it"}), "{meta}");
+        }
     }
 
     #[test]

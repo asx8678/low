@@ -237,7 +237,8 @@ impl Session {
         if let Some(summary) = self.marks.summary.and_then(|at| self.entries[at]["compact"]["summary"].as_str()) {
             let mut content = summary.to_string();
             if let Some(u) = newest.filter(|&u| u < keep && !summary.contains(&crate::compact::baked(u))) {
-                let task = self.entries[u]["content"].as_str().unwrap_or_default();
+                let task = crate::compact::wire(&self.entries[u]);
+                let task = task["content"].as_str().unwrap_or_default();
                 let steers = crate::compact::steers(&self.entries, u, keep);
                 content += &format!("\n\n[Current task, entry #{u}]\n{task}{steers}");
             }

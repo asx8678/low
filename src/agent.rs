@@ -479,8 +479,11 @@ impl Agent {
         // So the undo the report prints outlives git gc.
         let (root, tree) = (self.root.clone(), start.clone());
         tokio::task::spawn_blocking(move || crate::git::keep(&root, &tree)).await?;
-        self.session
-            .push(json!({"role": "user", "content": task, "meta": {"snapshot": start, "snapshot_ms": snapshot_ms}}))?;
+        let mut meta = json!({"snapshot": start, "snapshot_ms": snapshot_ms});
+        if let Some(date) = today() {
+            meta["date"] = date.into();
+        }
+        self.session.push(json!({"role": "user", "content": task, "meta": meta}))?;
         // The push first writes what the snapshot logged, so the turn begins at the task itself.
         let began = self.session.entries.len() - 1;
         self.current = Some((began, clock));
@@ -2190,6 +2193,19 @@ fn finish(mut meta: Value) -> (String, Value) {
     }
     meta["tool"] = "run".into();
     (out, meta)
+}
+
+/// Today's date in the user's time zone, as YYYY-MM-DD: a task carries it, so the model knows what "recent" means for
+/// search() and the code, while the system prompt, written once per session, stays the same and cached.
+fn today() -> Option<String> {
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: localtime_r fills tm whenever it returns non-null.
+    if unsafe { libc::localtime_r(&now, tm.as_mut_ptr()) }.is_null() {
+        return None;
+    }
+    let tm = unsafe { tm.assume_init() };
+    Some(format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday))
 }
 
 fn system_prompt(root: &Path, yolo: bool, check: Option<&str>, repo: bool, web: bool) -> String {
