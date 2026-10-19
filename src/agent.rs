@@ -57,6 +57,9 @@ const HANDOFF: &str = "This turn has reached its limit, so low runs no more code
                        run(): what you changed and how far you verified it, what is left to do, and the next step, so \
                        the next turn can pick up from here.";
 const NOT_RUN: &str = "not run: this turn had reached its limit";
+/// The files a repository gives the model its instructions in, the first that can be read going in the system prompt:
+/// CLAUDE.md is what Claude Code reads, for a repository that has no AGENTS.md.
+const INSTRUCTIONS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 const STRAY: &str = "This turn changed files without edit() or write():";
 const STRAY_END: &str = "Delete the ones that are scratch output from running code, keep any that are part of your answer, \
                          then finish again.";
@@ -604,13 +607,14 @@ impl Agent {
             }
             Err(e) if e.is::<llm::ContextOverflow>() => {
                 let system = self.session.header()["system"].as_str().map_or(0, str::len);
-                let agents = repo_text(&self.root, "AGENTS.md", 0).map_or(0, |(_, size)| size as usize);
+                let found = INSTRUCTIONS.into_iter().find_map(|n| repo_text(&self.root, n, 0).map(|(_, s)| (n, s)));
+                let (name, size) = found.map_or((INSTRUCTIONS[0], 0), |(n, s)| (n, s as usize));
                 anyhow::bail!(
                     "{e}; still over after compacting: the request is {} KB, of which the system prompt is {} KB \
-                     (including {} KB of AGENTS.md)",
+                     (including {} KB of {name})",
                     self.sent() * 4 / 1024,
                     system / 1024,
-                    agents.min(AGENTS_MAX) / 1024
+                    size.min(AGENTS_MAX) / 1024
                 );
             }
             // Out of credit or quota on this provider: once a turn, go on with the model profile's fallback.
@@ -2324,17 +2328,21 @@ fn system_prompt(root: &Path, yolo: bool, config: &Config, repo: bool, web: bool
             prompt += REGISTRIES;
         }
     }
-    if let Some((agents, size)) = repo_text(root, "AGENTS.md", AGENTS_MAX) {
-        prompt += "\n\n# Project instructions (AGENTS.md)\n\n";
-        prompt += &agents;
-        if size > AGENTS_MAX as u64 {
-            let (kept, all) = (AGENTS_MAX / 1024, size.div_ceil(1024));
-            prompt +=
-                &format!("\n\n[AGENTS.md clipped to its first {kept} KB of {all} KB; read the file for the rest]");
+    // One that is there but can't be read is noted, and the next one tried.
+    for name in INSTRUCTIONS {
+        if let Some((text, size)) = repo_text(root, name, AGENTS_MAX) {
+            prompt += &format!("\n\n# Project instructions ({name})\n\n{text}");
+            if size > AGENTS_MAX as u64 {
+                let (kept, all) = (AGENTS_MAX / 1024, size.div_ceil(1024));
+                prompt +=
+                    &format!("\n\n[{name} clipped to its first {kept} KB of {all} KB; read the file for the rest]");
+            }
+            break;
         }
-    } else if std::fs::symlink_metadata(root.join("AGENTS.md")).is_ok() {
-        let why = "outside the repo, sandbox-protected, unreadable, or not a regular file";
-        ui::note(&format!("left out of the prompt ({why}): AGENTS.md"));
+        if std::fs::symlink_metadata(root.join(name)).is_ok() {
+            let why = "outside the repo, sandbox-protected, unreadable, or not a regular file";
+            ui::note(&format!("left out of the prompt ({why}): {name}"));
+        }
     }
     prompt += &crate::skills::section(root);
     prompt += &listing(root);
