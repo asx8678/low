@@ -10,6 +10,7 @@ READONLY = os.environ.pop("LOW_READONLY", "")
 HALF = 16000
 LIMIT = 8 << 20
 OUT_CAP = 64 << 20  # what a run's own printing may put on disk; past it, output is dropped
+SPILLS = 10  # the cut runs' whole outputs kept on disk for show(); older ones are deleted
 RUN_CAP = 570
 GUIDES = ("AGENTS.md", "CLAUDE.md")  # a folder's instructions: the first of these it has
 GUIDE_CAP = 8 << 10  # characters of one folder's instructions a run shows; show() reads the rest
@@ -172,8 +173,34 @@ def _read(f):
     return head + f"\n[… {size - LIMIT} bytes omitted]\n".encode() + f.read()
 
 
+def _spill(text, n):
+    """Keeps a run's whole output, of which the model gets only the ends, where show() and sh() can read it: in low's
+    cache for this repo, outside the tree, with the newest SPILLS kept. Its path, or None when it can't be written."""
+    folder = os.path.join(os.environ.get("XDG_CACHE_HOME") or tempfile.gettempdir(), "low-out")
+    path = os.path.join(folder, f"run-{os.getpid()}-{n}.txt")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(path, "w", encoding="utf-8", errors="replace") as f:
+            f.write(text)
+    except OSError:
+        return None
+    with contextlib.suppress(OSError):
+        kept = [e for e in os.scandir(folder) if e.name.startswith("run-")]
+        kept.sort(key=lambda e: e.stat().st_mtime_ns)
+        for e in kept[:-SPILLS]:
+            with contextlib.suppress(OSError):
+                os.unlink(e.path)
+    return path
+
+
 def _rel(path):
     return os.path.relpath(os.path.join(ROOT, path), ROOT)
+
+
+def _shown(path):
+    """A path as show() names it: from the repo root, or whole when it is outside the repo, as a run's output file is."""
+    rel = _rel(path)
+    return os.path.abspath(os.path.join(ROOT, path)) if rel.startswith("..") else rel
 
 
 def _say(text):
@@ -678,7 +705,7 @@ def _block(lines, i):
 
 def _blocks(path, full, pattern):
     """show(path, regex): each definition with a line matching pattern, numbered, a gap between them marked."""
-    rel = _rel(path)
+    rel = _shown(path)
     with open(full, encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
     spans = []
@@ -710,10 +737,10 @@ def _blocks(path, full, pattern):
 def show(path, start=1, end=None):
     full = os.path.join(ROOT, path)
     with open(full, "rb") as f:
-        _report.setdefault("reads", []).append(_rel(path))
+        _report.setdefault("reads", []).append(_shown(path))
         _guide(path)
         if b"\0" in f.read(8192):
-            print(f"[{_rel(path)}: binary, {os.fstat(f.fileno()).st_size} bytes]")
+            print(f"[{_shown(path)}: binary, {os.fstat(f.fileno()).st_size} bytes]")
             return
     if isinstance(start, str):
         return _blocks(path, full, start)
@@ -729,11 +756,11 @@ def show(path, start=1, end=None):
                 if room >= 0 or not rows:
                     rows.append(f"{total}: {line}")
     if start > total:
-        print(f"[{_rel(path)}: empty]" if not total else f"[{_rel(path)}: {total} lines; nothing at line {start}]")
+        print(f"[{_shown(path)}: empty]" if not total else f"[{_shown(path)}: {total} lines; nothing at line {start}]")
         return
     end, stop = min(asked or total, total), start + len(rows) - 1
-    rest = f"; show({_rel(path)!r}, {stop + 1}{f', {asked}' if asked else ''}) continues" if stop < end else ""
-    print(f"[{_rel(path)}: lines {start}-{stop} of {total}{rest}]")
+    rest = f"; show({_shown(path)!r}, {stop + 1}{f', {asked}' if asked else ''}) continues" if stop < end else ""
+    print(f"[{_shown(path)}: lines {start}-{stop} of {total}{rest}]")
     print("\n".join(rows))
 
 
@@ -974,7 +1001,9 @@ for n, request in enumerate(_inbox, 1):
     capture.close()
     _report["chars"] = len(text)
     if len(text) > 2 * HALF:
-        text = f"{text[:HALF]}\n[… {len(text) - 2 * HALF} characters omitted]\n{text[-HALF:]}"
+        spill = _spill(text, n)
+        where = f"; all {len(text)} are in {spill}: show() or grep it" if spill else ""
+        text = f"{text[:HALF]}\n[… {len(text) - 2 * HALF} characters omitted{where}]\n{text[-HALF:]}"
     _outbox.write(json.dumps(dict(_report, out=text or "(no output)", error=failed)) + "\n")
     _outbox.flush()
 _kill()

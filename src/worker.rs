@@ -728,6 +728,26 @@ mod tests {
         std::fs::create_dir(dir.join("d")).unwrap();
         let reply = run(&mut worker, "write('d', 'x')").await;
         assert!(reply["out"].as_str().is_some_and(|out| out.contains("d exists and is not a regular file")), "{reply}");
+        // Output past 2 * HALF keeps its ends, and its cut names a file outside the tree with all of it, which show()
+        // reads by that path; only the newest SPILLS such files stay.
+        let long = "print('\\n'.join(f'line {i} ' + 'x' * 40 for i in range(3000)))";
+        let reply = run(&mut worker, long).await;
+        let out = reply["out"].as_str().unwrap_or_default();
+        let path = out.split("are in ").nth(1).and_then(|rest| rest.split(':').next()).unwrap_or_default();
+        assert!(out.contains("characters omitted; all ") && !path.starts_with(dir.to_str().unwrap()), "{out:.200}");
+        assert!(
+            std::fs::read_to_string(path)
+                .is_ok_and(|all| all.lines().nth(1500) == Some(&format!("line 1500 {}", "x".repeat(40))))
+        );
+        let out = run(&mut worker, &format!("show({path:?}, 1501)")).await["out"].to_string();
+        let (head, row) = (format!("[{path}: lines 1501-"), format!("1501: line 1500 {}", "x".repeat(40)));
+        assert!(out.contains(&head) && out.contains(&format!("show('{path}', ")) && out.contains(&row), "{out:.300}");
+        for _ in 0..11 {
+            run(&mut worker, long).await;
+        }
+        let folder = std::path::Path::new(path).parent().unwrap();
+        assert_eq!(std::fs::read_dir(folder).unwrap().count(), 10);
+        assert!(!std::path::Path::new(path).exists());
         drop(worker);
         // With no check configured, check() runs nothing and passes, so `assert check()` doesn't end the run, and its
         // line is the helper's own, not output finish() waits for the model to read.
