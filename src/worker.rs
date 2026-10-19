@@ -565,19 +565,36 @@ mod tests {
                  edit('n.py', 'def g():\\n  x = 1', 'pass')",
                 "[n.py: nearest to old is lines 1-2, it differs only in whitespace]\n1: def g():\n2:     x = 1\n",
             ),
-            ("edit('n.py', 'x = 1', 'x = 2')", "[n.py: old occurs at lines 2, 5; add context so it matches once]"),
+            (
+                "edit('n.py', 'x = 1', 'x = 2')",
+                "[n.py: old occurs at lines 2, 5; add context so it matches once]\n1: def g():\n2:     x = 1\n\
+                 3:     return x\n4: \n--\n3:     return x\n4: \n5: x = 1\n6: s = \"a\"\n",
+            ),
             (
                 "edit('n.py', 'def g():\\n    x = 2\\n    return x', 'pass')",
-                "[n.py: nearest to old is lines 1-3, 2 of 3 lines alike]\n1: def g():\n2:     x = 1\n3:     return x\n",
+                "[n.py: nearest to old is lines 1-3, 2 of 3 lines alike; line 2 differs at column 9: the file has '1', \
+                 old has '2']\n1: def g():\n2:     x = 1\n3:     return x\n",
             ),
-            ("edit('n.py', 'retrun x', 'y')", "[n.py: nearest to old is line 3, the closest match]\n3:     return x\n"),
+            (
+                "edit('n.py', 'retrun x', 'y')",
+                "[n.py: nearest to old is line 3, the closest match; line 3 differs at column 8: the file has 'urn x', \
+                 old has 'run x']\n3:     return x\n",
+            ),
             (
                 "edit('n.py', r's = \\\"a\\\"', 'y')",
-                "[n.py: old matches once without the backslashes before its quotes",
+                "[n.py: old matches once with its backslash escapes read as a normal string reads them; a raw string \
+                 keeps them as typed]\n",
+            ),
+            (
+                "edit('n.py', r'def g():\\n    x = 1', 'pass')",
+                "[n.py: old matches once with its backslash escapes read as a normal string reads them",
             ),
             ("edit('n.py', 'zzzz', 'y')", "[n.py: no line of old is in the file; show() it before editing]"),
+            // [old, new] and [old1, new1, ...] are taken too, though the prompt and the error name only two forms.
+            ("edit('n.py', ['s = \"a\"', 's = \"b\"'])", "edit n.py: ok"),
+            ("edit('n.py', ['s = \"b\"', 's = \"c\"', 'def g', 'def h'])", "edit n.py: ok"),
             (
-                "edit('a.py', ['return 2', 'return 3'])",
+                "edit('n.py', ['s = \"c\"', 's = \"d\"', 'x'])",
                 "edit() takes (path, old, new) or (path, [(old, new), ...]) with string old and new",
             ),
             ("total = 1\nratio(total, 0)", "    return a / b"),
@@ -598,6 +615,8 @@ mod tests {
             assert!(reply["out"].as_str().is_some_and(|out| out.contains(part)), "{code}: {reply}");
         }
         assert!(std::fs::read_to_string(dir.join("a.py")).unwrap().contains("return 4"));
+        let n = std::fs::read_to_string(dir.join("n.py")).unwrap();
+        assert_eq!(n, "def h():\n    x = 1\n    return x\n\nx = 1\ns = \"c\"\n");
         assert!(!dir.join("a\u{202e}b.txt").exists());
         // The process a run leaves running is gone by the next run.
         let reply = run(&mut worker, "import subprocess\nlive = subprocess.Popen(['sleep', '60'])").await;

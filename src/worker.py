@@ -256,9 +256,36 @@ def _forget():
             G.pop(key, None)
 
 
+def _differ(line, want, n):
+    """Where file line n and a line of old first differ, both without their indentation and trailing whitespace."""
+    text = line.strip()
+    i = next((i for i, (a, b) in enumerate(zip(text, want)) if a != b), min(len(text), len(want)))
+
+    def piece(s):
+        if not s:
+            return "a blank line"
+        return "the end of the line" if i >= len(s) else repr(s[i:i + 30]) + ("…" if len(s) > i + 30 else "")
+    column = len(line) - len(line.lstrip()) + i + 1
+    return f"line {n} differs at column {column}: the file has {piece(text)}, old has {piece(want)}"
+
+
+def _around(lines, first, last):
+    """A match of old, lines first..last, with two lines either side, numbered as show() numbers them. A longer match
+    keeps only its ends: every match has the same lines in between."""
+    total = len(lines) - (lines[-1] == "")  # show() counts no line after a final newline
+    keep = [*range(max(first - 2, 1), first + 1), *([last] if last > first else []),
+            *range(last + 1, min(last + 2, total) + 1)]
+    rows = []
+    for k, n in enumerate(keep):
+        if k and n > keep[k - 1] + 1:
+            rows.append("…")
+        rows.append(f"{n}: {lines[n - 1][:200]}{'…' if len(lines[n - 1]) > 200 else ''}")
+    return rows
+
+
 def _near(text, old, rel):
-    """Where a failed edit's old text is: the line of each match, or the lines most like it, so the next run can fix
-    old without first showing the file again."""
+    """Where a failed edit's old text is: each match with the lines around it, or the lines most like it and where they
+    first differ, so the next run can fix old without first showing the file again."""
     if not old.strip():
         return None
     count, lead = text.count(old), len(old) - len(old.lstrip("\n"))
@@ -268,11 +295,15 @@ def _near(text, old, rel):
             at.append(text.count("\n", 0, i + lead) + 1)
             i = text.find(old, i + len(old))
         more = ", …" if count > 10 else ""
-        return f"[{rel}: old occurs at lines {', '.join(map(str, at))}{more}; add context so it matches once]"
-    # Models write \" in raw strings, where the backslash stays.
-    bare = re.sub(r"\\([\"'])", r"\1", old)
+        lines, span = text.split("\n"), old.strip("\n").count("\n")
+        shown = "\n--\n".join("\n".join(_around(lines, n, n + span)) for n in at[:3])
+        return f"[{rel}: old occurs at lines {', '.join(map(str, at))}{more}; add context so it matches once]\n{shown}"
+    # Models write \" in raw strings, where the backslash stays, \n where they mean a line break, and \\ for one
+    # backslash.
+    bare = re.sub(r"\\([\\\"'nt])", lambda m: {"n": "\n", "t": "\t"}.get(m[1], m[1]), old)
     if bare != old and text.count(bare) == 1:
-        return f"[{rel}: old matches once without the backslashes before its quotes; a raw string keeps them]"
+        return (f"[{rel}: old matches once with its backslash escapes read as a normal string reads them; a raw string "
+                "keeps them as typed]")
     lines, want = text.split("\n"), [w.strip() for w in old.strip("\n").split("\n")]
     trimmed = [line.strip() for line in lines]
     # Each file line equal to a line of old votes for where old would start; short lines such as } say too little.
@@ -295,8 +326,11 @@ def _near(text, old, rel):
         start, alike = trimmed.index(close[0]) - i, "the closest match"
     start = max(start, 0)
     end = min(start + len(want), len(lines))
+    first = next((j for j in range(start, end) if trimmed[j] != want[j - start]), None)
     if [line.split() for line in lines[start:end]] == [w.split() for w in want]:
         alike = "it differs only in whitespace"
+    elif first is not None:
+        alike += "; " + _differ(lines[first], want[first - start], first + 1)
     shown = enumerate(lines[start:end][:12], start + 1)
     rows = [f"{n}: {line[:200]}{'…' if len(line) > 200 else ''}" for n, line in shown]
     more = f"; show({rel!r}, {start + 13}, {end}) has the rest" if end - start > 12 else ""
@@ -306,10 +340,14 @@ def _near(text, old, rel):
 
 def edit(path, old, new=None):
     pair = lambda p: isinstance(p, (list, tuple)) and len(p) == 2 and all(isinstance(s, str) for s in p)  # noqa: E731
+    texts = isinstance(old, (list, tuple)) and all(isinstance(s, str) for s in old)
     if isinstance(old, str) and isinstance(new, str):
         pairs = [(old, new)]
     elif new is None and isinstance(old, (list, tuple)) and old and all(pair(p) for p in old):
         pairs = [tuple(p) for p in old]
+    elif new is None and texts and old and len(old) % 2 == 0:
+        # [old, new] and [old1, new1, old2, new2, ...]: not the forms the prompt names, but models keep writing them.
+        pairs = list(zip(old[::2], old[1::2]))
     else:
         raise TypeError("edit() takes (path, old, new) or (path, [(old, new), ...]) with string old and new")
     def make(full, rel):
