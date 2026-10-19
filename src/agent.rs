@@ -94,7 +94,7 @@ const REFUTED_END: &str = "Fix the code or correct the report, then finish again
 /// DeepSeek's own tool-call markup, which leaks into a run()'s code at times: what follows it is no Python.
 const MARKUP: &[&str] = &["<｜end▁of▁thinking｜>", "｜DSML｜"];
 const HELPERS: &[&str] =
-    &["sh", "show", "accept", "edit", "write", "check", "plan", "done", "finish", "ask", "search", "fetch"];
+    &["sh", "show", "accept", "edit", "write", "check", "plan", "done", "finish", "ask", "search", "fetch", "recall"];
 /// The helpers that reach the web, in the prompt only when config.toml's search names a provider.
 const WEB: &str = "search(query, count=10) -> list  # web search: [{title, url, summary, date, site_name}]; site:, \"phrase\", \
                    after:2025 work; query up to 128 chars, count up to 50\nfetch(url) -> str             # a web page \
@@ -1164,6 +1164,16 @@ impl Agent {
                 if let Some(requests) = reply["web"].as_array().cloned() {
                     let out = self.web(&requests).await;
                     reply = self.worker()?.resume(true, &out).await?;
+                    continue;
+                }
+                // The sandbox hides the session log, so low reads the entry the run asks for.
+                if let Some(n) = reply["recall"].as_u64() {
+                    let n = usize::try_from(n).unwrap_or(usize::MAX);
+                    let (ok, out) = match crate::compact::recall(&self.session.entries, self.session.keep(), n) {
+                        Ok(text) => (true, text),
+                        Err(why) => (false, why),
+                    };
+                    reply = self.worker()?.resume(ok, &out).await?;
                     continue;
                 }
                 if stale(&reply) {

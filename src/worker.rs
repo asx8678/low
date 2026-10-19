@@ -792,6 +792,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// recall() asks low for an entry and pages it as show() pages a file, under its #n, leaving no file behind; what low
+    /// turns down it prints.
+    #[tokio::test]
+    async fn recalled_entries() {
+        let dir = std::env::temp_dir().join(format!("low-recall-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry: String = (1..=4000).map(|i| format!("line {i} of the entry\n")).collect();
+        let mut worker = super::Worker::start(&dir, true, None, None).unwrap();
+        let mut ran = async |code: &str| {
+            let (mut reply, mut asked) = (worker.run(code, &json!({})).await.unwrap(), vec![]);
+            while reply["needs_check"] == true {
+                asked.push(reply["recall"].clone());
+                let (ok, out) = match reply["recall"].as_u64() {
+                    Some(412) => (true, entry.as_str()),
+                    Some(7) => (true, "a\0b"),
+                    _ => (false, "still in context"),
+                };
+                reply = worker.resume(ok, out).await.unwrap();
+            }
+            (reply, asked)
+        };
+        let (reply, asked) = ran("recall('#412')\nrecall(9)").await;
+        let out = reply["out"].as_str().unwrap();
+        assert_eq!((asked, &reply["reads"]), (vec![json!(412), json!(9)], &json!(["#412"])));
+        assert!(out.starts_with("[#412: lines 1-") && out.contains("; recall(412, ") && !out.contains("low-entry"));
+        assert!(out.contains("\n1: line 1 of the entry\n") && out.ends_with("\n[#9: still in context]\n"), "{out}");
+        assert!(out.len() < 32_000 && !out.contains("line 4000"), "{}", out.len());
+        let (reply, _) = ran("recall(412, 3999)").await;
+        let out = reply["out"].as_str().unwrap();
+        assert_eq!(
+            out,
+            "[#412: lines 3999-4000 of 4000]\n3999: line 3999 of the entry\n4000: line 4000 of the entry\n"
+        );
+        let (reply, _) = ran("recall(7)").await;
+        assert_eq!(reply["out"], "[#7: lines 1-1 of 1]\n1: a\\0b\n");
+        let temp = std::fs::read_dir(std::env::temp_dir()).unwrap().flatten();
+        assert!(!temp.into_iter().any(|e| e.file_name().to_string_lossy().starts_with("low-entry-412-")));
+        drop(worker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A folder's AGENTS.md, else CLAUDE.md, is shown once, outermost first, by the first show(), edit() or write() under
     /// it that the run's state doesn't say the context already holds; the root's never, as it is in the system prompt.
     #[tokio::test]

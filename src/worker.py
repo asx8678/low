@@ -1,4 +1,4 @@
-import ast, contextlib, ctypes, difflib, importlib.util, json, linecache, os, re, shlex, signal, stat, subprocess, sys, tempfile, threading, time, traceback
+import ast, contextlib, ctypes, difflib, importlib.util, io, json, linecache, os, re, shlex, signal, stat, subprocess, sys, tempfile, threading, time, traceback
 
 ROOT = os.getcwd()
 sys.path.append(ROOT)
@@ -634,6 +634,33 @@ def show(path, start=1, end=None):
     print("\n".join(rows))
 
 
+def recall(n, start=1, end=None):
+    """Prints entry #n of the session, one a summary replaced, as it was. The sandbox hides the log, so low reads it;
+    show() pages it from a temporary file, under the #n it goes by, and each call asks for it again."""
+    n = int(str(n).lstrip("#"))
+    answer = _host({"needs_check": True, "recall": n})
+    if answer.get("ok") is not True:
+        print(f"[#{n}: {answer.get('out') or 'low could not read it'}]")
+        return
+    fd, path = tempfile.mkstemp(prefix=f"low-entry-{n}-", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
+            f.write((answer.get("out") or "").replace("\0", "\\0"))  # show() takes a NUL for a binary file
+        # show() sizes the page by what the run printed so far, which has to be on fd 1 before stdout is redirected.
+        sys.stdout.flush()
+        page = io.StringIO()
+        with contextlib.redirect_stdout(page):
+            show(path, start, end)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+    _report["reads"][-1] = f"#{n}"
+    text = page.getvalue()
+    # show() heads the page with the name it gives the file, which goes by #n here.
+    name = text[1 : text.find(": ")]
+    print(text.replace(f"show({name!r}, ", f"recall({n}, ").replace(f"[{name}:", f"[#{n}:", 1), end="")
+
+
 def accept(criteria):
     _report["accepted"] = str(criteria)
 
@@ -737,7 +764,7 @@ def fetch(url):
 
 
 TOOLS = {"sh": sh, "show": show, "edit": edit, "write": write, "accept": accept, "plan": plan, "done": done, "check": check,
-         "finish": finish, "ask": ask, "search": search, "fetch": fetch}
+         "finish": finish, "ask": ask, "search": search, "fetch": fetch, "recall": recall}
 G = {"__name__": "__main__", **TOOLS}
 HELPERS = tuple(f"{name}()" for name in TOOLS)
 

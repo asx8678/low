@@ -244,7 +244,11 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
         .collect();
     let events = events.split_off(events.len().saturating_sub(40));
 
-    let footer = format!("\n[Entries #1-#{} are summarized here. Continue the task.]", keep - 1);
+    let footer = format!(
+        "\n[Entries #1-#{} are summarized here. recall(n) prints entry #n as it was; read a file again instead, since it \
+         may have changed. Continue the task.]",
+        keep - 1
+    );
     let mut out = String::from("[Summary of earlier work, rebuilt from the session log. Newer messages follow it.]\n");
     for (title, lines, cap) in [
         ("Recent user directions", dialogue, 16_384),
@@ -270,6 +274,72 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
         out += &format!("\n\n{}\n{}{}", baked(u), text(u), steers(entries, u, keep));
     }
     out
+}
+
+/// Entry `n` whole, as recall(n) prints it, or why it can't: only what a summary replaced, entries before `keep`, since
+/// the context holds the rest. A message as the model got it; a reply with each run's code and result, and its
+/// reasoning last, whether `n` is the reply or a result, since a summary cites a run by either. No LLM call: it is the
+/// log as written, already redacted.
+pub fn recall(entries: &[Value], keep: usize, n: usize) -> Result<String, String> {
+    let last = entries.len().saturating_sub(1);
+    if n == 0 || n > last {
+        return Err(format!("no such entry: this session's run from #1 to #{last}"));
+    }
+    if n >= keep {
+        return Err(match keep {
+            ..=1 => "nothing is summarized yet: every entry is still in your context".to_string(),
+            _ => format!("still in your context; recall() opens #1-#{}, which a summary replaced", keep - 1),
+        });
+    }
+    let role = |i: usize| entries[i]["role"].as_str().unwrap_or_default();
+    let calls = |i: usize| entries[i]["tool_calls"].as_array().map_or(&[][..], Vec::as_slice);
+    let reply = match role(n) {
+        "user" => {
+            let meta = &entries[n]["meta"];
+            let who = match (meta["steer"] == true, meta["host"].is_null()) {
+                (true, _) => "the user, steering the turn",
+                (_, true) => "the user",
+                _ => "low",
+            };
+            let text = wire(&entries[n]);
+            return Ok(format!("[#{n}: a message from {who}]\n{}", text["content"].as_str().unwrap_or_default()));
+        }
+        "assistant" => n,
+        "tool" => {
+            let id = &entries[n]["tool_call_id"];
+            let made = (1..n).rev().find(|&i| role(i) == "assistant" && calls(i).iter().any(|c| c["id"] == *id));
+            let Some(a) = made else {
+                return Ok(format!("[#{n}: a run's result]\n{}", entries[n]["content"].as_str().unwrap_or_default()));
+            };
+            a
+        }
+        _ => return Err("low's own record, not a message".into()),
+    };
+    let entry = &entries[reply];
+    let mut out = vec![];
+    if let Some(text) = entry["content"].as_str().filter(|t| !t.trim().is_empty()) {
+        out.push(format!("[#{reply}: your reply]\n{text}"));
+    }
+    for call in calls(reply) {
+        let args = call["function"]["arguments"].as_str().unwrap_or_default();
+        let parsed: Value = serde_json::from_str(args).unwrap_or_default();
+        out.push(format!("[#{reply}: the run's code]\n{}", parsed["code"].as_str().unwrap_or(args)));
+        let result = (reply + 1..entries.len())
+            .take_while(|&r| matches!(role(r), "tool" | ""))
+            .find(|&r| entries[r]["tool_call_id"] == call["id"]);
+        out.push(match result {
+            Some(r) => format!("[#{r}: its result]\n{}", entries[r]["content"].as_str().unwrap_or_default()),
+            None => "[no result: the run was cut off]".into(),
+        });
+    }
+    let reasoning = ["reasoning_content", "reasoning"].iter().find_map(|f| entry[*f].as_str());
+    if let Some(text) = reasoning.filter(|t| !t.trim().is_empty()) {
+        out.push(format!("[#{reply}: your reasoning]\n{text}"));
+    }
+    if out.is_empty() {
+        out.push(format!("[#{reply}: an empty reply]"));
+    }
+    Ok(out.join("\n"))
 }
 
 fn touch<'a>(files: &mut BTreeMap<&'a str, (usize, usize)>, path: &'a str, rank: usize, i: usize) {
@@ -413,6 +483,30 @@ mod tests {
             let entry = json!({"role": "user", "content": "fix it", "meta": meta});
             assert_eq!(super::wire(&entry), json!({"role": "user", "content": "fix it"}), "{meta}");
         }
+    }
+
+    #[test]
+    fn recall_opens_what_a_summary_replaced() {
+        let mut entries = session(3);
+        entries[2]["reasoning_content"] = json!("the bug is in f0");
+        entries[5]["meta"] = json!({"date": "2026-10-19"});
+        entries.push(json!({"role": "user", "content": "go on", "meta": {"host": true}}));
+        entries.push(json!({"event": "worker", "text": "python worker ready"}));
+        let recall = |keep: usize, n: usize| super::recall(&entries, keep, n);
+        // A run whole, its reasoning last, whether the summary cites the reply that made it or its result.
+        let run = "[#2: the run's code]\ncheck()\n[#3: its result]\nok\n[#2: your reasoning]\nthe bug is in f0";
+        assert_eq!((recall(9, 2).as_deref(), recall(9, 3).as_deref()), (Ok(run), Ok(run)));
+        assert_eq!(recall(9, 4).as_deref(), Ok("[#4: your reply]\nfixed bug 0"));
+        // A message as the model got it.
+        let task = "[#5: a message from the user]\ntask 1: fix bug 1\n\n[Today is 2026-10-19]";
+        assert_eq!(recall(9, 5).as_deref(), Ok(task));
+        assert_eq!(recall(15, 13).as_deref(), Ok("[#13: a message from low]\ngo on"));
+        // What the context still holds, low's own records and entries that don't exist are refused.
+        assert_eq!(recall(15, 14), Err("low's own record, not a message".to_string()));
+        for n in [0, 9, 12, 15, 99] {
+            assert!(recall(9, n).is_err(), "{n}");
+        }
+        assert!(recall(1, 2).is_err_and(|why| why.starts_with("nothing is summarized yet")));
     }
 
     #[test]
