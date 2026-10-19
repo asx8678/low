@@ -4,7 +4,10 @@ Usage: python3 mock.py SCRIPT.json PORTFILE REQUESTS.jsonl REPO
 
 SCRIPT.json is a list of replies served in order, one per POST; past its end every reply is {"content": "done."}. Or
 it is {"rules": [{"match": text, "reply": {...}}], "after_tool": {...}, "default": {...}}, which answers a tool
-result with after_tool and a user message with the first rule whose text it contains. A reply has any of:
+result with after_tool and a user message with the first rule whose text it contains. Or {"replies": [...],
+"asides": [...]}: the list of replies, and what low's second looks at a turn's claims get, in order. Those requests
+use none of the rest: past "asides" (or without it) each gets ASIDE, and they are logged with "aside": true and their
+own index. A reply has any of:
   status, headers, body   a non-200 answer (e.g. 429 with a Retry-After header)
   reasoning, content      streamed text, in small deltas
   code                    one run(code) tool call ("calls": [code, ...] for several; "raw_args" for exact arguments)
@@ -33,7 +36,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 script = json.load(open(sys.argv[1]))
 portfile, logfile, repo = sys.argv[2], sys.argv[3], sys.argv[4]
 lock = threading.Lock()
-state = {'n': 0, 'seen': []}
+state = {'n': 0, 'asides': 0, 'seen': []}
+LOOK = 'You are taking a second look'  # how the first user message of low's second look begins
+ASIDE = {'content': 'uncertain: the mock checks no claims - it answers every second look this way'}
 PAGES = {
     'https://example.org/three/releases': '# r186\n\nthree.js r186 (0.186.1), see "notes".\n',
     'https://registry.npmjs.org/three/latest': '{"name": "three", "version": "0.186.1", "description": "a \\"3D\\" library"}',
@@ -93,12 +98,20 @@ class H(BaseHTTPRequestHandler):
             return self.tool(self.path.rsplit('/', 1)[1], req)
         msgs = req.get('messages', [])
         text = ''.join(json.dumps(m, sort_keys=True, ensure_ascii=False) for m in msgs)
+        aside = len(msgs) > 1 and str(msgs[1].get('content', '')).startswith(LOOK)
+        replies = script.get('replies') if isinstance(script, dict) else script
         with lock:
-            i = state['n']
-            state['n'] += 1
+            counter = 'asides' if aside else 'n'
+            i = state[counter]
+            state[counter] += 1
             best = max((lcp(text, s) for s in state['seen']), default=0)
             state['seen'].append(text)
-            if isinstance(script, dict):
+            if aside:
+                given = script.get('asides', []) if isinstance(script, dict) else []
+                reply = given[i] if i < len(given) else ASIDE
+            elif isinstance(replies, list):
+                reply = replies[i] if i < len(replies) else {'content': 'done.'}
+            else:
                 last = msgs[-1] if msgs else {}
                 if last.get('role') == 'tool':
                     reply = script.get('after_tool', {'content': 'Done.'})
@@ -106,10 +119,9 @@ class H(BaseHTTPRequestHandler):
                     said = str(last.get('content', ''))[-4000:]
                     reply = next((r['reply'] for r in script['rules'] if r['match'] in said),
                                  script.get('default', {'content': 'Done.'}))
-            else:
-                reply = script[i] if i < len(script) else {'content': 'done.'}
             with open(logfile, 'a') as f:
-                f.write(json.dumps({'i': i, 'at': time.time(), 'auth': self.headers.get('authorization'), 'body': req,
+                f.write(json.dumps({'i': i, **({'aside': True} if aside else {}), 'at': time.time(),
+                                    'auth': self.headers.get('authorization'), 'body': req,
                                     'raw': raw.decode()}) + '\n')
         time.sleep(reply.get('delay', 0))
         if 'touch' in reply:
@@ -146,7 +158,7 @@ class H(BaseHTTPRequestHandler):
         calls = [None] if 'raw_args' in reply else reply.get('calls') or ([reply['code']] if 'code' in reply else [])
         for k, code in enumerate(calls):
             args = reply['raw_args'] if code is None else json.dumps({'code': code})
-            ev({'tool_calls': [{'index': k, 'id': f'call_{i}_{k}', 'type': 'function',
+            ev({'tool_calls': [{'index': k, 'id': f'call_{"a" * aside}{i}_{k}', 'type': 'function',
                                 'function': {'name': 'run', 'arguments': ''}}]})
             for p in pieces(args, 11):
                 ev({'tool_calls': [{'index': k, 'function': {'arguments': p}}]})

@@ -180,6 +180,16 @@ pub struct Worker {
 
 impl Worker {
     pub fn start(root: &Path, yolo: bool, check: Option<&str>, fmt: Option<&str>) -> Result<Self> {
+        Self::spawn(root, yolo, true, check.is_some(), fmt)
+    }
+
+    /// A worker for the second look at a turn's claims: its sandbox keeps the repo read-only, edit() and write() refuse,
+    /// and check(), search() and fetch() ask low, which turns them down.
+    pub fn reader(root: &Path, yolo: bool) -> Result<Self> {
+        Self::spawn(root, yolo, false, true, None)
+    }
+
+    fn spawn(root: &Path, yolo: bool, writes: bool, check: bool, fmt: Option<&str>) -> Result<Self> {
         let bwrap = || std::process::Command::new("bwrap").arg("--version").output().is_ok_and(|o| o.status.success());
         if !yolo && !cfg!(target_os = "macos") && !bwrap() {
             return Err(
@@ -187,8 +197,9 @@ impl Worker {
             );
         }
         let guarded = json!(protected(root).iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>()).to_string();
-        let mut child = sandboxed(root, yolo, &python(), &["-I", "-B", "-u", "-c", include_str!("worker.py")])
-            .env("LOW_CHECK", if check.is_some() { "1" } else { "" })
+        let mut child = sandbox(root, yolo, writes, &python(), &["-I", "-B", "-u", "-c", include_str!("worker.py")])
+            .env("LOW_CHECK", if check { "1" } else { "" })
+            .env("LOW_READONLY", if writes { "" } else { "1" })
             .env("LOW_FMT", fmt.unwrap_or_default())
             .env("LOW_PROTECTED", guarded)
             .env("LOW_LOCKED", json!(locked().iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>()).to_string())
@@ -289,14 +300,21 @@ pub fn descendants(pid: i32) -> Vec<i32> {
 }
 
 pub fn sandboxed(root: &Path, yolo: bool, program: &str, args: &[&str]) -> Command {
+    sandbox(root, yolo, true, program, args)
+}
+
+/// The sandbox, with the repo writable or, without `writes`, read-only: the temp dirs it may sit in stay writable.
+fn sandbox(root: &Path, yolo: bool, writes: bool, program: &str, args: &[&str]) -> Command {
     let writable = writable(root);
     let secrets = secrets();
+    let frozen: Vec<PathBuf> = (!writes).then(|| root.to_path_buf()).into_iter().collect();
     let protected: Vec<PathBuf> = protected(root).into_iter().chain(locked().iter().cloned()).collect();
     let mut cmd = if yolo {
         Command::new(program)
     } else if cfg!(target_os = "macos") {
         let subpaths = |dirs: &[PathBuf]| -> String { dirs.iter().map(|d| format!(" (subpath {d:?})")).collect() };
-        let (dirs, secrets, protected) = (subpaths(&writable), subpaths(secrets), subpaths(&protected));
+        let protected = subpaths(&[protected, frozen].concat());
+        let (dirs, secrets) = (subpaths(&writable), subpaths(secrets));
         let sockets = root.join("tmp");
         let profile = format!(
             "(version 1)(allow default)(deny network*)\
@@ -319,6 +337,10 @@ pub fn sandboxed(root: &Path, yolo: bool, program: &str, args: &[&str]) -> Comma
         cmd.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/run"]);
         for dir in &writable {
             cmd.arg("--bind").arg(dir).arg(dir);
+        }
+        // Before the secrets are hidden: a mount over a folder shows again what was hidden inside it.
+        for dir in &frozen {
+            cmd.arg("--ro-bind").arg(dir).arg(dir);
         }
         for path in secrets.iter().filter(|p| p.exists()) {
             if path.is_dir() {
@@ -642,6 +664,20 @@ mod tests {
         let reply = run(&mut worker, "assert check()\nfinish('done')").await;
         assert_eq!((&reply["out"], &reply["own"]), (&json!("[no check configured: check() ran nothing]\n"), &json!(0)));
         assert_eq!((&reply["check"], &reply["error"]), (&Value::Null, &json!(false)));
+        drop(worker);
+        // A second look's worker only reads: edit() and write() refuse, and check() asks low, which turns it down.
+        let mut worker = super::Worker::reader(&dir, true).unwrap();
+        let code = "try:\n    write('w.txt', 'x')\nexcept ValueError as e:\n    print(e)\nprint(check(), open('w.txt').read())";
+        let mut reply = worker.run(code, &json!({})).await.unwrap();
+        while reply["needs_check"] == true {
+            reply = worker.resume(false, "[off]").await.unwrap();
+        }
+        let out = reply["out"].as_str().unwrap_or_default();
+        assert!(
+            out.starts_with("w.txt stays as it is: this worker only reads") && out.contains("[off]\nFalse three"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("w.txt")).unwrap(), "three\r\n");
         drop(worker);
         let _ = std::fs::remove_dir_all(&dir);
     }

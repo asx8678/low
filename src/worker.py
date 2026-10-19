@@ -6,6 +6,7 @@ CHECK = os.environ.pop("LOW_CHECK", "")
 FMT = os.environ.pop("LOW_FMT", "")
 PROTECTED = [os.path.realpath(d) for d in json.loads(os.environ.pop("LOW_PROTECTED", "[]"))]
 LOCKED = [os.path.realpath(d) for d in json.loads(os.environ.pop("LOW_LOCKED", "[]"))]
+READONLY = os.environ.pop("LOW_READONLY", "")
 HALF = 16000
 LIMIT = 8 << 20
 OUT_CAP = 64 << 20  # what a run's own printing may put on disk; past it, output is dropped
@@ -182,6 +183,8 @@ def _change(tool, path, make):
     real = os.path.realpath(os.path.join(ROOT, rel))
     signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
     try:
+        if READONLY:
+            raise ValueError(f"{path} stays as it is: this worker only reads, to check the report's claims")
         if rel.startswith("..") or not real.startswith(ROOT + os.sep):
             raise ValueError(f"{path} is outside the repo")
         if IGNORABLE.search(rel):

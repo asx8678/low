@@ -34,7 +34,7 @@ cost      3 requests · 2 runs · 4.9k tok in · 266 tok out · 0:10
 - **Sandboxed by default.** No network, writes only inside the repo and temp dirs, and your SSH keys, cloud credentials and shell history are out of reach.
 - **Verified.** low runs your project's check on the final tree, and every turn ends with a verdict.
 - **Reversible.** Inside a git repository, low never commits to your branches: git is the undo, and every turn report prints the exact restore command. The snapshots those commands restore stay under `refs/low/snapshots` for 14 days, so `git gc` can't remove them; `git update-ref -d refs/low/snapshots` drops them sooner. A file git ignores, such as `.env`, is listed as changed but can't be restored that way, and the report says so. For the same reason `sh()` refuses `git clean -x` and `-X`, which delete every ignored file.
-- **Low entropy.** A short system prompt, deterministic harness decisions, rule-based context compaction, and no hidden LLM calls.
+- **Low entropy.** A short system prompt, deterministic harness decisions, rule-based context compaction, and no hidden LLM calls: the one low makes on its own, a second look at an unchecked turn's claims, shows as it runs and counts in the turn's cost.
 - **Any OpenAI-compatible model.** Point it at any `/chat/completions` endpoint.
 
 In a [15-task benchmark](https://github.com/asx8678/low/blob/7d9ab8a/tuning/REPORT.md) with the same model (DeepSeek V4.1 Flash), OpenCode needed about 1.3× low's round trips, 2.5× its tool calls and 2× its uncached input tokens.
@@ -158,6 +158,8 @@ Every turn ends with one of four verdicts:
 | **NO CHANGES** | nothing changed, e.g. a question or a review |
 | **NO CHECK** | files changed, and no check is configured |
 | **QUESTION** | the model asked you something (exit 4); answer it as the next task |
+
+**A second look.** A turn that changed files with no check passing (none configured, or one still failing after low asked the model to fix it) gets a second look at its report before it ends. The same model, in a conversation of its own that starts with the turn's system prompt, so the provider's prompt cache still has it, gets the task, the criteria, what each run edited and ran, the diff and the final report, but none of the turn's messages. It picks the 3 to 5 claims likeliest to be wrong and checks them by reading the code, in a worker whose sandbox keeps the repository read-only: `edit()` and `write()` refuse, and `check()`, `search()` and `fetch()` are off. It is told not to build or run the project; `sh()` still works, so that rests on the prompt and the read-only tree (under `--yolo`, on the prompt and `edit()` and `write()` alone). A claim the code contradicts goes back to the model once, and its answer gets a second look of its own. The report's `claims` row says how many held, were contradicted or stayed uncertain; the verdict and exit status stay as the table says. A look makes at most 6 requests; they show as it runs, are logged as `aside` events, and count in the turn's cost and in `/cost`.
 
 **The sandbox:**
 - **Network:** off. On macOS only localhost is reachable; on Linux, only servers started inside the sandbox. `search()` and `fetch()`, when set up, send their query or URL out through low (above).
