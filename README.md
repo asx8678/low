@@ -143,6 +143,7 @@ Inside `run(code)`, the model has a few helpers:
 |---|---|
 | `sh(cmd)` | runs a shell command; returns stdout and stderr, with `[exit N]` on failure. A command the run's code starts with `subprocess` or `os.system` instead is listed and refused as `sh()`'s are |
 | `show(path, start, end)` | prints numbered lines, paging long files |
+| `recall(n, start, end)` | prints entry `#n` of the session, one a compaction's summary cites but replaced, as it was: a message, or a run's code, its result and the model's reasoning; it pages like `show`. low reads it from the session log, which the sandbox hides, and makes no LLM call; entries the context still holds are refused |
 | `edit(path, old, new)` | replaces exactly one occurrence, or several pairs all-or-none, then runs `fmt`; an `old` whose lines are all indented too deep or too shallow by the same amount still matches when that finds one place, and `new` is indented the same way |
 | `write(path, content)` | creates a file, or replaces one |
 | `check()` | runs the repository's `check` inside the sandbox; with none configured it runs nothing and returns `True` |
@@ -175,7 +176,7 @@ Every turn ends with one of four verdicts:
 
 **Turn limits:** a turn stops at its token budget (`turn_budget`) or after 200 requests. Once it has used three quarters of either, the model is told about how many requests it has left and asked to spend them on the change rather than on reading; it is not asked to stop early, so a `--tasks` task cut off while it is still changing files keeps its extra turns. At the stop, low asks the model once more, running no code, where the work stands: what changed, what is left and the next step. That reply is the turn's answer, and the next turn starts from it. The session's budget (`session_budget`) caps spending, so it stops without asking.
 
-**Sessions** are JSONL files in `~/.low/sessions`. Each task the model gets ends with the date it was given on, in your time zone, so the system prompt stays the same and cached. When the context reaches `compact_at`, low compacts it without an LLM call: it keeps the task, the latest messages and a summary rebuilt from the log.
+**Sessions** are JSONL files in `~/.low/sessions`. Each task the model gets ends with the date it was given on, in your time zone, so the system prompt stays the same and cached. When the context reaches `compact_at`, low compacts it without an LLM call: it keeps the task, the latest messages and a summary rebuilt from the log. The summary cites what it replaced as entries (`#412`), and `recall(412)` opens one as it was; the summary says so too, so a session started before `recall` existed learns of it at its next compaction.
 
 ## Development
 

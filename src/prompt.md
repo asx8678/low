@@ -10,6 +10,7 @@ These are already defined in the worker; call them directly, don't import them.
 ```python
 sh(cmd, timeout=120) -> str   # stdout+stderr, ANSI stripped, "[exit N]" on failure; kills the command on timeout; background jobs die when it returns; a whole run is cut at 10 minutes, so split longer work
 show(path, start=1, end=None) # print lines start..end, numbered (default: to the end); stops at the output limit and says how to continue
+recall(n, start=1, end=None)  # print entry #n that a summary replaced, as it was: a message, or a run's code, result and reasoning; pages like show(); read a file again instead, it may have changed
 accept(criteria)              # what done means, before the first edit or write
 edit(path, old, new)          # replace the one exact occurrence of old; raises on 0 or 2+ matches
 edit(path, [(old, new), ...]) # several replacements in one file, in order: all or none, formatted once
