@@ -79,7 +79,7 @@ low marks each line `[x]` done, `[!]` not verified or `[?]` asked a question, wr
 
 ## Web search
 
-Inside a task, low's model can call `search(query)` and `fetch(url)` (DeepSeek's search API) when a `[deepseek]` provider with an API key is in providers.toml, or `search = "<provider>"` in `~/.config/low/config.toml` names one. Without it the helpers are not offered. `fetch(url)` takes only a URL that a `search()` returned or that the task text gives, so put a URL in the task when low should read a specific page.
+Inside a task, low's model can always call `fetch(url)` on package registries, CDNs and docs hosts (npm, PyPI, crates.io, docs.rs, GitHub's API and raw files, jsDelivr, unpkg, cdnjs, and the Rust, Python and MDN docs): low fetches those itself, with no setup. `search(query)`, and `fetch(url)` of any other page, go through DeepSeek's search API: they need a `[deepseek]` provider with an API key in providers.toml, or `search = "<provider>"` in `~/.config/low/config.toml` naming one, and without it `search()` is not offered. Off those hosts, `fetch(url)` takes only a URL that a `search()` returned or that the task text gives, so put a URL in the task when low should read a specific page.
 
 ## Rules
 

@@ -154,9 +154,9 @@ Inside `run(code)`, the model has a few helpers:
 | `finish(report)` · `ask(question)` | end the turn with the final report, or with a question for you that the next task answers |
 | `search(query)` · `fetch(url)` | web search and a page as markdown (JSON, code and other text files as their text, less some blank lines but for the open hosts below), through [DeepSeek's search API](https://api-docs.deepseek.com/guides/search/); low makes the request, since the sandbox has no network. A list of up to 50 queries or URLs goes out at once, 10 requests at a time, and comes back as a list in the same order, with the error in place of each one that failed. Only when a provider is set up for it (below), except `fetch` on the open hosts. `fetch` takes a URL that a `search` returned or the task gives, or any https URL on a package registry, CDN or docs host that shows no one the URLs asked of it (npm, PyPI, crates.io, docs.rs, GitHub's API and raw files, jsDelivr, unpkg, cdnjs, and the Rust, Python and MDN docs; jsDelivr's public hit counts per file are the nearest thing). low fetches those hosts' URLs itself, from your IP as your package manager does, and gives them back as served, with no provider needed; it follows redirects only among them, refuses binary files and bodies over 8 MB, and sends an HTML page, a rate limit, a server error or a redirect elsewhere on to DeepSeek when a provider is set up. Both refuse an argument that looks like a secret, so code in a run can't send what it read to someone who would see it |
 
-Repository files change only through `edit`, `write` and `undo`, so low knows exactly what the model touched. A turn that changed files without using either is asked once to clean up its scratch output.
+Repository files change only through `edit`, `write` and `undo`, so low knows exactly what the model touched. A turn that changed files without them is asked once to clean up its scratch output.
 
-Every turn ends with one of four verdicts:
+Every turn ends with one of five verdicts:
 
 | verdict | meaning |
 |---|---|

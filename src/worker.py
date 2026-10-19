@@ -526,15 +526,19 @@ def undo(*paths):
     tree = str(_state.get("snapshot") or "").split(" ")[0]
     if not tree:
         raise ValueError("undo() needs the snapshot low takes when a turn begins, and it takes none outside a git repository")
+    # edit() and write() go through a symlink under the link's name, and the snapshot holds the link as the path it
+    # points to: put back through the link, that path would replace the file. So each path, and each that write()
+    # created, counts where it really is, whatever name the turn (or low's log, after a restart) has for it.
+    real = lambda path: os.path.relpath(os.path.realpath(os.path.join(ROOT, path)), ROOT)  # noqa: E731
+    created = {real(path) for path in _turn.get("created", ())}
     paths = paths or sorted(_turn.get("touched", ()))
     if not paths:
         _say("[undo: edit() and write() changed nothing this turn]")
-    for path in paths:
-        rel = _rel(path)
+    for rel in dict.fromkeys(map(real, paths)):
         p = _Popen(["git", "cat-file", "blob", f"{tree}:{rel}"], cwd=ROOT, stdout=subprocess.PIPE,
                    stderr=subprocess.DEVNULL)
         blob = p.communicate()[0]
-        if p.returncode and rel not in _turn.get("created", ()):
+        if p.returncode and rel not in created:
             raise ValueError(f"{rel} was not in the snapshot taken when this turn began, and write() did not create it")
         if p.returncode and not os.path.lexists(os.path.join(ROOT, rel)):
             continue  # created by write() and removed already
