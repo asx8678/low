@@ -1,5 +1,6 @@
 mod agent;
 mod compact;
+mod detect;
 mod git;
 mod llm;
 mod picker;
@@ -25,7 +26,7 @@ const ABOUT: &str = "A low-entropy, code-mode coding agent. Without a task it st
 const USAGE: &str = "Usage: low [OPTIONS] [TASK]";
 const HELP: &str = "\
 Arguments:
-  [TASK]  Run this task once and exit: 0 done, 1 not verified (a configured check did not pass on the final tree), 3 an error, 4 the model asked a question (answer it as the next task), 5 stopped short (2 is a bad argument)
+  [TASK]  Run this task once and exit: 0 done, 1 not verified (the check, low.toml's or one low detected, did not pass on the final tree), 3 an error, 4 the model asked a question (answer it as the next task), 5 stopped short (2 is a bad argument)
 
 Options:
       --resume         Resume the latest session in this repo
@@ -160,6 +161,12 @@ pub struct Config {
     pub protect: Vec<String>,
     #[serde(skip)]
     pub providers: providers::Providers,
+    /// Whether low may work out a check: low.toml names none and doesn't turn that off with check = "".
+    #[serde(skip)]
+    pub detect: bool,
+    /// The check low worked out, and how its baseline went.
+    #[serde(skip)]
+    pub detected: Option<detect::Detected>,
 }
 
 fn load(path: &Path) -> Result<Config> {
@@ -241,9 +248,10 @@ async fn start() -> Result<()> {
     let id = cli.session.clone().or_else(|| cli.tasks.as_deref().and_then(|file| tasks::session(&home, file)));
     let resume = cli.resume || id.is_some();
     let picked = cli.model.clone().filter(|_| resume);
-    let config = Config {
+    let mut config = Config {
         model: cli.model.or(user.model),
         base_url: None,
+        detect: repo.check.is_none(),
         check: repo.check.filter(|c| !c.trim().is_empty()),
         fmt: repo.fmt,
         search,
@@ -251,6 +259,7 @@ async fn start() -> Result<()> {
         models: user.models,
         protect: vec![],
         providers,
+        detected: None,
     };
     worker::allow_env(config.env.clone());
     // A --tasks checklist is low's to mark: the model reads it but doesn't change it. low.toml's paths are the
@@ -259,6 +268,13 @@ async fn start() -> Result<()> {
     let given = cli.protect.iter().chain(&cli.tasks).map(|p| cwd.join(p));
     let protect = repo.protect.iter().map(|p| root.join(p)).chain(given);
     worker::protect(protect.map(|p| p.canonicalize().unwrap_or(p)).collect());
+    // A new session's check, when low.toml names none, is the first one the repository's files suggest that passes on
+    // the tree as found; it runs before the system prompt, which says what check() runs, is written.
+    if config.detect && !resume && repo_dir && (cli.yolo || !worker::read_only(&root)) {
+        git::guard_git(&root);
+        config.detected = detect::baseline(&root, &home, cli.yolo).await;
+        config.check = config.detected.as_ref().and_then(|d| d.check.clone());
+    }
     let mut agent = agent::Agent::new(&root, &home, config, resume, id.as_deref(), cli.yolo, repo_dir)?;
     if let Some(model) = picked {
         agent.resume_with(&model)?;

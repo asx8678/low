@@ -1,3 +1,4 @@
+use crate::detect::Detected;
 use crate::git::{changes, git, guard_git, snapshot};
 use crate::llm::{self, Llm};
 use crate::providers::Providers;
@@ -156,6 +157,9 @@ pub struct Agent {
     restarts: usize,
     broken: Option<String>,
     passed: Option<(String, String)>,
+    /// The pass of a check detected at the session's start, on the tree as found: the first turn starts with it, so a
+    /// check() before anything changes doesn't run it again.
+    baseline: Option<(String, String)>,
     /// Whether the root is a git repository; outside one there are no snapshots and no undo.
     repo: bool,
     /// The last turn's result: its verdict, report rows and final answer.
@@ -174,16 +178,18 @@ impl Agent {
     pub fn new(
         root: &Path,
         home: &Path,
-        config: Config,
+        mut config: Config,
         resume: bool,
         id: Option<&str>,
         yolo: bool,
         repo: bool,
     ) -> Result<Self> {
         guard_git(root);
-        let context = context(root, &config, yolo);
         let session = if resume || id.is_some() {
-            Session::resume(home, root, context, id)?
+            Session::resume(home, root, id, |header| {
+                adopt(&mut config, header);
+                context(root, &config, yolo)
+            })?
         } else {
             let model = config
                 .model
@@ -210,9 +216,10 @@ impl Agent {
             };
             web(provider, &config.providers[provider].base_url)?;
             let profile = config.models.get(&model).cloned().unwrap_or_default();
-            let system = system_prompt(root, yolo, config.check.as_deref(), repo, config.search.is_some());
-            Session::create(home, root, provider, &model, &system, profile, context)?
+            let system = system_prompt(root, yolo, &config, repo, config.search.is_some());
+            Session::create(home, root, provider, &model, &system, profile, context(root, &config, yolo))?
         };
+        let baseline = config.detected.as_ref().and_then(|d| d.passed.clone());
         let (provider, llm) = connect(&config.providers, &session)?;
         let mut since = session.entries.iter().rev().take_while(|e| e["switch"].is_null());
         let learned = since.find_map(|e| e["compact"]["at"].as_u64());
@@ -232,6 +239,7 @@ impl Agent {
             restarts: 0,
             broken: None,
             passed: None,
+            baseline,
             repo,
             last: None,
             question: None,
@@ -394,7 +402,7 @@ impl Agent {
         web(provider, &self.config.providers[provider].base_url)?;
         let profile = self.config.models.get(model).cloned().unwrap_or_default();
         let web = self.config.search.is_some();
-        let system = system_prompt(&self.root, self.yolo, self.config.check.as_deref(), self.repo, web);
+        let system = system_prompt(&self.root, self.yolo, &self.config, self.repo, web);
         self.session.switch(provider, model, &system, profile)?;
         (self.provider, self.llm) = connect(&self.config.providers, &self.session)?;
         self.compact_at = self.session.header()["compact_at"].as_u64().unwrap_or(COMPACT_AT);
@@ -470,7 +478,8 @@ impl Agent {
     }
 
     async fn turn(&mut self, task: &str) -> Result<bool> {
-        (self.pending, self.restarts, self.broken, self.passed, self.claims) = (None, 0, None, None, None);
+        let baseline = self.baseline.take();
+        (self.pending, self.restarts, self.broken, self.passed, self.claims) = (None, 0, None, baseline, None);
         self.session.flush()?;
         let clock = Instant::now();
         let why = "low's change detection (a private git index, not your staging area) could not snapshot the tree";
@@ -1313,22 +1322,8 @@ impl Agent {
         } else {
             ui::activity("running check()");
         }
-        let script = format!("exec 2>&1\n{check}");
-        let cmd = worker::sandboxed(&self.root, self.yolo, "/bin/sh", &["-c", &script]);
-        let (passed, out) = match tokio::time::timeout(CHECK_TIMEOUT, grouped(cmd)).await {
-            Ok(Ok((passed, out))) => (passed, redact(&out).0),
-            Ok(Err(e)) => (false, format!("{e:#}")),
-            Err(_) => (false, format!("timeout after {}s", CHECK_TIMEOUT.as_secs())),
-        };
-        let after = self.tree().await;
-        let why = match (&before, &after) {
-            (Err(e), _) | (_, Err(e)) => format!("{e:#}"),
-            (Ok(a), Ok(b)) if a != b => "the check changed the working tree".into(),
-            _ => redact(check).0,
-        };
-        let ok = passed && matches!((&before, &after), (Ok(a), Ok(b)) if a == b);
-        let verdict = if ok { "passed" } else { "FAILED" };
-        let out = format!("{}\n[check {verdict}: {why}]", out.trim_end()).trim_start().to_string();
+        let index = self.session.index();
+        let (ok, out, after) = trial(&self.root, &index, self.repo, self.yolo, check, &before, CHECK_TIMEOUT).await;
         if gate && ok {
             ui::settle();
         } else if gate {
@@ -1343,13 +1338,7 @@ impl Agent {
     /// The working tree as a git tree id. Git runs on the blocking pool, so Ctrl-C and the status bar stay live
     /// while a large repo is snapshotted.
     async fn tree(&self) -> Result<String> {
-        // Outside a git repository there is no snapshot: only edit() and write() show what changed.
-        if !self.repo {
-            return Ok(String::new());
-        }
-        let _busy = ui::busy("indexing the working tree");
-        let (root, index) = (self.root.clone(), self.session.index());
-        tokio::task::spawn_blocking(move || snapshot(&root, &index)).await?
+        tree_at(&self.root, &self.session.index(), self.repo).await
     }
 
     async fn moved(&self, start: &str) -> bool {
@@ -1398,7 +1387,8 @@ impl Agent {
         let question = self.question.take();
         let claims = self.claims.take();
         let configured = self.config.check.is_some();
-        let (check, verdict) = verdict(changed, checked, configured, !inputs.is_empty(), question.is_some());
+        let detected = self.config.detected.as_ref();
+        let (check, verdict) = verdict(changed, checked, configured, !inputs.is_empty(), question.is_some(), detected);
         let checked = checked && inputs.is_empty();
         let state = self.session.state();
         let task = first["content"].as_str().unwrap_or_default();
@@ -1409,7 +1399,7 @@ impl Agent {
         if let Some(steps) = steps {
             rows.push(("plan", format!("{done}/{steps} steps done")));
         }
-        rows.push(("check", check.into()));
+        rows.push(("check", check.clone()));
         if !inputs.is_empty() {
             rows.push(("inputs", format!("check inputs changed: {}", inputs.join(", "))));
         }
@@ -1470,7 +1460,7 @@ impl Agent {
             question,
             criteria: state.accepted.clone(),
             plan: state.plan,
-            check: check.into(),
+            check,
             claims: claims.clone(),
             changes: changes.clone(),
             repos,
@@ -1692,6 +1682,48 @@ fn connect(providers: &Providers, session: &Session) -> Result<(String, Llm)> {
     Ok((name.into(), llm))
 }
 
+/// The working tree as a git tree id, through the private index `index`. Git runs on the blocking pool, so Ctrl-C and
+/// the status bar stay live while a large repo is snapshotted.
+pub async fn tree_at(root: &Path, index: &Path, repo: bool) -> Result<String> {
+    // Outside a git repository there is no snapshot: only edit() and write() show what changed.
+    if !repo {
+        return Ok(String::new());
+    }
+    let _busy = ui::busy("indexing the working tree");
+    let (root, index) = (root.to_path_buf(), index.to_path_buf());
+    tokio::task::spawn_blocking(move || snapshot(&root, &index)).await?
+}
+
+/// One run of `check` in the sandbox, on the tree `before`: whether it passed and left the tree as it was, its output
+/// ending in low's verdict line, and the tree after it.
+pub async fn trial(
+    root: &Path,
+    index: &Path,
+    repo: bool,
+    yolo: bool,
+    check: &str,
+    before: &Result<String>,
+    timeout: Duration,
+) -> (bool, String, Result<String>) {
+    let script = format!("exec 2>&1\n{check}");
+    let cmd = worker::sandboxed(root, yolo, "/bin/sh", &["-c", &script]);
+    let (passed, out) = match tokio::time::timeout(timeout, grouped(cmd)).await {
+        Ok(Ok((passed, out))) => (passed, redact(&out).0),
+        Ok(Err(e)) => (false, format!("{e:#}")),
+        Err(_) => (false, format!("timeout after {}s", timeout.as_secs())),
+    };
+    let after = tree_at(root, index, repo).await;
+    let why = match (before, &after) {
+        (Err(e), _) | (_, Err(e)) => format!("{e:#}"),
+        (Ok(a), Ok(b)) if a != b => "the check changed the working tree".into(),
+        _ => redact(check).0,
+    };
+    let ok = passed && matches!((before, &after), (Ok(a), Ok(b)) if a == b);
+    let verdict = if ok { "passed" } else { "FAILED" };
+    let out = format!("{}\n[check {verdict}: {why}]", out.trim_end()).trim_start().to_string();
+    (ok, out, after)
+}
+
 async fn grouped(mut cmd: tokio::process::Command) -> Result<(bool, String)> {
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).process_group(0).spawn()?;
     let pid = child.id().context("the check exited before it started")?.cast_signed();
@@ -1901,22 +1933,36 @@ fn capped(items: &[String], sep: &str) -> String {
     if more > 0 { format!("{shown}{sep}and {more} more") } else { shown }
 }
 
-/// A turn report's check row and verdict.
+/// A turn report's check row and verdict. A check low detected says so, and so does one whose baseline failed.
 fn verdict(
     changed: bool,
     checked: bool,
     configured: bool,
     inputs: bool,
     question: bool,
-) -> (&'static str, &'static str) {
-    match (changed, checked, configured) {
-        _ if question => ("not run: the model asked a question", "QUESTION"),
-        (false, _, _) => ("-", "NO CHANGES"),
-        (true, true, _) if inputs => ("passed, but this turn changed what it runs", "UNVERIFIED"),
-        (true, true, _) => ("passed on the final tree", "VERIFIED"),
-        (true, false, false) => ("none configured: set check in low.toml", "NO CHECK"),
-        (true, false, true) => ("not passed on the final tree", "UNVERIFIED"),
-    }
+    detected: Option<&Detected>,
+) -> (String, &'static str) {
+    let from = detected.filter(|_| configured).map(|d| format!(" (detected from {})", d.from)).unwrap_or_default();
+    let (check, verdict) = match (changed, checked, configured) {
+        _ if question => ("not run: the model asked a question".into(), "QUESTION"),
+        (false, _, _) => ("-".into(), "NO CHANGES"),
+        (true, true, _) if inputs => ("passed, but this turn changed what it runs".into(), "UNVERIFIED"),
+        (true, true, _) => (format!("passed on the final tree{from}"), "VERIFIED"),
+        (true, false, false) => match detected.and_then(|d| Some((d.failed.last()?, &d.from))) {
+            Some((failed, from)) => {
+                let failed = redact(failed).0;
+                (
+                    format!(
+                        "none: `{failed}`, detected from {from}, failed on the tree as found; set check in low.toml"
+                    ),
+                    "NO CHECK",
+                )
+            }
+            None => ("none configured: set check in low.toml".into(), "NO CHECK"),
+        },
+        (true, false, true) => (format!("not passed on the final tree{from}"), "UNVERIFIED"),
+    };
+    (check, verdict)
 }
 
 /// What a turn has used so far: its nudges and retries, and the tokens it spent against its budget.
@@ -2041,7 +2087,23 @@ fn context(root: &Path, config: &Config, yolo: bool) -> serde_json::Map<String, 
         "sandbox": sandbox, "env": config.env,
         "check": config.check.as_deref().map(|c| redact(c).0), "fmt": config.fmt.as_deref().map(|f| redact(f).0),
     });
-    context.as_object().cloned().unwrap_or_default()
+    let mut context = context.as_object().cloned().unwrap_or_default();
+    // Where a detected check came from, and what failed on the tree as found: a resumed session keeps that decision.
+    if let Some(detected) = &config.detected {
+        context.insert("check_from".into(), detected.from.clone().into());
+        context.insert("check_failed".into(), detected.failed.iter().map(|c| redact(c).0).collect());
+    }
+    context
+}
+
+/// A resumed session keeps the check its start detected, as its system prompt says, unless low.toml now names one or
+/// turns detection off; the tree may have moved since, so its baseline's pass isn't reused.
+fn adopt(config: &mut Config, header: &Value) {
+    let Some(from) = header["check_from"].as_str().filter(|_| config.detect && config.check.is_none()) else { return };
+    config.check = header["check"].as_str().map(String::from);
+    let failed = header["check_failed"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from));
+    let detected = Detected { from: from.into(), check: config.check.clone(), failed: failed.collect(), passed: None };
+    config.detected = Some(detected);
 }
 
 /// The lines of `changes` (as `changes()` writes them) that this turn made: paths it wrote with edit() or write(), and
@@ -2208,14 +2270,21 @@ fn today() -> Option<String> {
     Some(format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday))
 }
 
-fn system_prompt(root: &Path, yolo: bool, check: Option<&str>, repo: bool, web: bool) -> String {
+fn system_prompt(root: &Path, yolo: bool, config: &Config, repo: bool, web: bool) -> String {
     let mut prompt = include_str!("prompt.md").to_string();
     if !web {
         prompt = prompt.replace(WEB, "");
     }
-    prompt += &match check {
-        Some(check) => format!("\ncheck() runs `{}`.", redact(check).0),
-        None => "\nNo check command is configured, so check() runs nothing.".into(),
+    let from = config.detected.as_ref().map(|d| d.from.as_str());
+    prompt += &match (config.check.as_deref(), from) {
+        (Some(check), Some(from)) => {
+            format!(
+                "\ncheck() runs `{}`, which low detected from {from}; it passed on the tree as found.",
+                redact(check).0
+            )
+        }
+        (Some(check), None) => format!("\ncheck() runs `{}`.", redact(check).0),
+        (None, _) => "\nNo check command is configured, so check() runs nothing.".into(),
     };
     let read_only = !yolo && worker::read_only(root);
     if read_only {

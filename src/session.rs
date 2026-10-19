@@ -127,8 +127,14 @@ impl Session {
         self.entries[at].get("switch").unwrap_or(&self.entries[at])
     }
 
-    /// The newest session of this repository, or the one `id` names (its id, or its log's path).
-    pub fn resume(home: &Path, root: &Path, context: Map<String, Value>, id: Option<&str>) -> Result<Self> {
+    /// The newest session of this repository, or the one `id` names (its id, or its log's path). `context` gives what
+    /// the resume entry records, from the session's header.
+    pub fn resume(
+        home: &Path,
+        root: &Path,
+        id: Option<&str>,
+        context: impl FnOnce(&Value) -> Map<String, Value>,
+    ) -> Result<Self> {
         let id = id.map(|id| Path::new(id).file_stem().and_then(|s| s.to_str()).unwrap_or(id));
         sweep(&home.join(".low/sessions"));
         let mut paths: Vec<PathBuf> = fs::read_dir(home.join(".low/sessions"))
@@ -167,6 +173,7 @@ impl Session {
                 let mut marks = Marks::default();
                 entries.iter().enumerate().for_each(|(i, entry)| marks.add(i, entry));
                 let mut session = Self { file, path, entries, opened, marks };
+                let context = context(&session.entries[0]);
                 session.push(json!({"resume": context}))?;
                 return Ok(session);
             }
@@ -433,13 +440,13 @@ mod tests {
         let live = (messages, session.header().clone(), session.keep(), session.compaction(), session.spent());
         drop(session);
         // A process another test forks meanwhile holds the log's lock until it execs.
-        let mut resumed = Session::resume(&home, &root, Map::new(), None);
+        let mut resumed = Session::resume(&home, &root, None, |_| Map::new());
         for _ in 0..50 {
             if resumed.is_ok() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
-            resumed = Session::resume(&home, &root, Map::new(), None);
+            resumed = Session::resume(&home, &root, None, |_| Map::new());
         }
         let session = resumed.unwrap();
         let resumed =

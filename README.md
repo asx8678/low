@@ -71,6 +71,8 @@ protect = ["Cargo.lock", "migrations"]      # files and folders the model may no
                                             # the sandbox enforces it, so under --yolo only edit()/write() refuse them)
 ```
 
+Without a `check`, a new session works one out from the files at the repository's root: a Makefile's `check` or `test` target, then the first of `Cargo.toml` (`cargo build -q && cargo test -q`), `package.json` (its `check` or `typecheck` script and its `test` script, with the lockfile's package manager), a pytest setup, `go.mod` (`go build ./... && go test ./...`) and `mix.exs` (`mix compile --warnings-as-errors && mix test`), each followed by its build alone. Before the first request it runs them in that order, in the sandbox and for at most 5 minutes each, on the tree as it finds it, and uses the first that passes, so tests that already fail don't hold every turn's verdict, and a repository whose tests need a database still gets its build checked. If none passes, the session has no check. A resumed session keeps what its start decided. Lows started together in one tree wait for one such run and reuse its result for up to an hour. `check = ""` turns this off.
+
 **3. Give it a task:**
 
 ```sh
@@ -81,7 +83,7 @@ low "the median of an even-length list is wrong; fix it"
 
 | command | does |
 |---|---|
-| `low "<task>"` | runs one task and exits: 0 done, 1 not verified (a configured check didn't pass on the final tree), 3 an error, 4 the model asked a question (answer it as the next task, e.g. `low --resume "<answer>"`), 5 stopped short |
+| `low "<task>"` | runs one task and exits: 0 done, 1 not verified (the check, low.toml's or one low detected, didn't pass on the final tree), 3 an error, 4 the model asked a question (answer it as the next task, e.g. `low --resume "<answer>"`), 5 stopped short |
 | `low` | starts the REPL |
 | `low --resume` | continues the latest session in this repository |
 | `low --session <id>` | continues that session of this repository |
@@ -145,7 +147,7 @@ Inside `run(code)`, the model has a few helpers:
 | `show(path, start, end)` | prints numbered lines, paging long files |
 | `edit(path, old, new)` | replaces exactly one occurrence, or several pairs all-or-none, then runs `fmt`; an `old` whose lines are all indented too deep or too shallow by the same amount still matches when that finds one place, and `new` is indented the same way |
 | `write(path, content)` | creates a file, or replaces one |
-| `check()` | runs the repository's `check` inside the sandbox; with none configured it runs nothing and returns `True` |
+| `check()` | runs the repository's `check` (low.toml's, or the one low detected) inside the sandbox; with none it runs nothing and returns `True` |
 | `accept(criteria)` · `plan(steps)` · `done()` | record what done means and track the turn's steps: shown as the turn runs, and in a `--json` result |
 | `finish(report)` · `ask(question)` | end the turn with the final report, or with a question for you that the next task answers |
 | `search(query)` · `fetch(url)` | web search and a page as markdown (JSON, code and other text files as their text, less some blank lines), through [DeepSeek's search API](https://api-docs.deepseek.com/guides/search/); low makes the request, since the sandbox has no network. A list of up to 50 queries or URLs goes out at once, 10 requests at a time, and comes back as a list in the same order, with the error in place of each one that failed. Only when a provider is set up for it (below). `fetch` takes a URL that a `search` returned or the task gives, or any https URL on a package registry, CDN or docs host that shows no one the URLs asked of it (npm, PyPI, crates.io, docs.rs, GitHub's API and raw files, jsDelivr, unpkg, cdnjs, and the Rust, Python and MDN docs; jsDelivr's public hit counts per file are the nearest thing); both refuse an argument that looks like a secret, so code in a run can't send what it read to someone who would see it |
@@ -159,7 +161,7 @@ Every turn ends with one of four verdicts:
 | **VERIFIED** | files changed, and the check passed on the final tree |
 | **UNVERIFIED** | files changed, but the check didn't pass, or the turn changed what the check runs |
 | **NO CHANGES** | nothing changed, e.g. a question or a review |
-| **NO CHECK** | files changed, and no check is configured |
+| **NO CHECK** | files changed, and there is no check: low.toml sets none and low detected none that passes on the tree as found, or `check = ""` |
 | **QUESTION** | the model asked you something (exit 4); answer it as the next task |
 
 **A second look.** A turn that changed files with no check passing (none configured, or one still failing after low asked the model to fix it) gets a second look at its report before it ends. The same model, in a conversation of its own that starts with the turn's system prompt, so the provider's prompt cache still has it, gets the task, the criteria, what each run edited and ran, the diff and the final report, but none of the turn's messages. It picks the 3 to 5 claims likeliest to be wrong and checks them by reading the code, in a worker whose sandbox keeps the repository read-only: `edit()` and `write()` refuse, and `check()`, `search()` and `fetch()` are off. It is told not to build or run the project; `sh()` still works, so that rests on the prompt and the read-only tree (under `--yolo`, on the prompt and `edit()` and `write()` alone). A claim the code contradicts goes back to the model once, and its answer gets a second look of its own. The report's `claims` row says how many held, were contradicted or stayed uncertain; the verdict and exit status stay as the table says. A look makes at most 6 requests; they show as it runs, are logged as `aside` events, and count in the turn's cost and in `/cost`.

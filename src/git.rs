@@ -16,6 +16,10 @@ const KEPT: &str = "refs/low/snapshots";
 const KEEP_FOR: u64 = 14 * 86_400;
 
 pub fn guard_git(root: &Path) {
+    // Once per process: a check detected at the start guards git before the agent does.
+    if GIT_GUARD.get().is_some() {
+        return;
+    }
     let out = std::process::Command::new("git")
         .args(["config", "--show-scope", "-z", "--get-regexp", r"^(filter|diff)\."])
         .current_dir(root)
