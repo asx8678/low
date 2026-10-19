@@ -33,7 +33,7 @@ cost      3 requests · 2 runs · 4.9k tok in · 266 tok out · 0:10
 - **Code mode.** The model writes a program instead of making many small tool calls: fewer round trips, fewer tokens.
 - **Sandboxed by default.** No network, writes only inside the repo and temp dirs, and your SSH keys, cloud credentials and shell history are out of reach.
 - **Verified.** low runs your project's check on the final tree, and every turn ends with a verdict.
-- **Reversible.** Inside a git repository, low never commits to your branches: git is the undo, and every turn report prints the exact restore command. The snapshots those commands restore stay under `refs/low/snapshots` for 14 days, so `git gc` can't remove them; `git update-ref -d refs/low/snapshots` drops them sooner. A file git ignores, such as `.env`, is listed as changed but can't be restored that way, and the report says so. For the same reason `sh()` refuses `git clean -x` and `-X`, which delete every ignored file.
+- **Reversible.** Inside a git repository, low never commits to your branches: git is the undo, and every turn report prints the exact restore command. The snapshots those commands restore stay under `refs/low/snapshots` for 14 days, so `git gc` can't remove them; `git update-ref -d refs/low/snapshots` drops them sooner. A file git ignores, such as `.env`, is listed as changed but can't be restored that way, and the report says so. For the same reason `sh()` refuses `git clean -x` and `-X`, which delete every ignored file, and so does `subprocess` in a run.
 - **Low entropy.** A short system prompt, deterministic harness decisions, rule-based context compaction, and no hidden LLM calls: the one low makes on its own, a second look at an unchecked turn's claims, shows as it runs and counts in the turn's cost.
 - **Any OpenAI-compatible model.** Point it at any `/chat/completions` endpoint.
 
@@ -141,7 +141,7 @@ Inside `run(code)`, the model has a few helpers:
 
 | helper | does |
 |---|---|
-| `sh(cmd)` | runs a shell command; returns stdout and stderr, with `[exit N]` on failure |
+| `sh(cmd)` | runs a shell command; returns stdout and stderr, with `[exit N]` on failure. A command the run's code starts with `subprocess` or `os.system` instead is listed and refused as `sh()`'s are |
 | `show(path, start, end)` | prints numbered lines, paging long files |
 | `edit(path, old, new)` | replaces exactly one occurrence, or several pairs all-or-none, then runs `fmt`; an `old` whose lines are all indented too deep or too shallow by the same amount still matches when that finds one place, and `new` is indented the same way |
 | `write(path, content)` | creates a file, or replaces one |

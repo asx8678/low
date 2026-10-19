@@ -26,6 +26,8 @@ _state = {}
 _checked = None
 _said = 0  # bytes this run printed through edit, write and check, the output the model can predict
 _groups = set()
+_spawned = []  # the commands this run's code started with subprocess, each with its Popen, for their exit status
+_Popen, _os_system = subprocess.Popen, os.system  # low's own commands; the run's code gets _Seen and _system
 _deadline = time.monotonic() + RUN_CAP
 _running = _dropped = _executing = False
 _flow = threading.Lock()  # held while a run's output is switched, so the watch never switches the wrong run's
@@ -120,8 +122,8 @@ def _exec(cmd, timeout):
     left = _deadline - time.monotonic()
     if not timeout or timeout > left:
         timeout = max(1, int(left))
-    p = subprocess.Popen(cmd, shell=True, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, start_new_session=True)
+    p = _Popen(cmd, shell=True, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+               stderr=subprocess.STDOUT, start_new_session=True)
     _groups.add(p.pid)
     # Read as it comes, keeping both ends in memory, so a command that prints without end fills no disk.
     head, tail, size = bytearray(), bytearray(), [0]
@@ -532,20 +534,76 @@ def _cleans_ignored(cmd):
     return None
 
 
-def sh(cmd, timeout=120):
+def _listed(cmd):
+    """Lists a command the run starts, as the turn's report, a second look and check()'s freshness count them; with
+    the refusal when it would delete the files git ignores."""
     entry = [str(cmd), None, []]
     _report.setdefault("cmds", []).append(entry)
     what = _cleans_ignored(cmd)
-    if what:
-        entry[1] = "refused"
-        listed = subprocess.run(["git", "ls-files", "-o", "-i", "--exclude-standard", "--directory"], cwd=ROOT,
-                                capture_output=True, text=True).stdout.split()
-        some = ", ".join(listed[:5]) + (f" and {len(listed) - 5} more" if len(listed) > 5 else "")
-        return (f"[refused: {what} deletes the files git ignores ({some or 'none now'}), and no undo restores them; "
-                "delete the ones you mean by name]")
+    if not what:
+        return entry, None
+    entry[1] = "refused"
+    listed = _Popen(["git", "ls-files", "-o", "-i", "--exclude-standard", "--directory"], cwd=ROOT, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).communicate()[0].split()
+    some = ", ".join(listed[:5]) + (f" and {len(listed) - 5} more" if len(listed) > 5 else "")
+    return entry, (f"[refused: {what} deletes the files git ignores ({some or 'none now'}), and no undo restores them; "
+                   "delete the ones you mean by name]")
+
+
+def _files(cmd):
+    return [_rel(w) for w in str(cmd).split() if os.path.isfile(os.path.join(ROOT, w))]
+
+
+def sh(cmd, timeout=120):
+    entry, refused = _listed(cmd)
+    if refused:
+        return refused
     out, code = _exec(cmd, timeout)
-    entry[1:] = [code, [_rel(w) for w in str(cmd).split() if os.path.isfile(os.path.join(ROOT, w))]]
+    entry[1:] = [code, _files(cmd)]
     return out.rstrip("\n") + (f"\n[exit {code}]" if code else "")
+
+
+class _Seen(_Popen):
+    """subprocess.Popen as the run's code gets it, through run(), check_output() and os.popen() too: its command is
+    listed and refused as sh()'s is, and its exit status is filled in when the run ends. In the session logs about one
+    run in 20 started its commands this way, mostly a grep, which low saw nothing of."""
+
+    def __init__(self, args, *rest, **kwargs):
+        try:
+            if isinstance(args, (str, bytes, os.PathLike)):
+                cmd = os.fsdecode(args)
+            else:
+                args = list(args)
+                cmd = shlex.join(map(os.fsdecode, args))
+        except TypeError:  # what Popen itself turns down, as it then does
+            cmd = str(args)
+        entry, refused = _listed(cmd)
+        if refused:
+            raise PermissionError(refused)
+        entry[2] = _files(cmd)
+        try:
+            super().__init__(args, *rest, **kwargs)
+        except BaseException as e:
+            entry[1] = type(e).__name__
+            raise
+        _spawned.append((entry, self))
+
+
+_Seen.__name__ = _Seen.__qualname__ = "Popen"  # as a printed handle or a traceback names it
+
+
+def _system(command):
+    """os.system as the run's code gets it, listed and refused as sh() is."""
+    entry, refused = _listed(os.fsdecode(command))
+    if refused:
+        raise PermissionError(refused)
+    entry[2] = _files(entry[0])
+    status = _os_system(command)
+    try:
+        entry[1] = os.waitstatus_to_exitcode(status)
+    except ValueError:
+        entry[1] = status
+    return status
 
 
 def show(path, start=1, end=None):
@@ -597,7 +655,8 @@ def check():
 
 
 def _tree():
-    out = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "-z"], cwd=ROOT, capture_output=True).stdout
+    out = _Popen(["git", "ls-files", "-co", "--exclude-standard", "-z"], cwd=ROOT, stdout=subprocess.PIPE,
+                 stderr=subprocess.DEVNULL).communicate()[0]
     tree = {}
     for f in filter(None, out.decode("utf-8", "replace").split("\0")):
         with contextlib.suppress(OSError):
@@ -697,6 +756,7 @@ class _Helpers:
 
 
 sh.sh = sys.modules["sh"] = sh
+subprocess.Popen, os.system = _Seen, _system
 sys.meta_path.append(_Helpers())
 signal.signal(signal.SIGINT, signal.SIG_IGN)
 signal.signal(signal.SIGALRM, _overrun)
@@ -758,6 +818,11 @@ for n, request in enumerate(_inbox, 1):
         _report["shadowed"] = shadowed
         print(f"[{', '.join(shadowed)}: low's helpers, restored before the next run]")
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Before the reap, which would leave a stopped process looking as if it exited 0.
+    for entry, p in _spawned:
+        code = p.poll()
+        entry[1] = "stopped at the run's end" if code is None else code
+    _spawned.clear()
     left = _reap()
     if left:
         _say(f"[stopped {left} process{'es' if left > 1 else ''} this run left running: what a run starts ends with it]")

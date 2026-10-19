@@ -692,7 +692,27 @@ mod tests {
         assert!(reply["out"].as_str().is_some_and(|out| out.contains("[stopped 1 process")), "{reply}");
         let gone = "import os\ntry:\n    os.kill(live.pid, 0)\nexcept ProcessLookupError:\n    print('gone')";
         assert_eq!(run(&mut worker, gone).await["out"], "gone\n");
+        // What the run's code starts with subprocess or os.system is listed as sh()'s commands are, with its exit
+        // status, and refused where sh() would refuse it.
+        let code = "import os, subprocess\nsh('true')\nsubprocess.run('exit 3', shell=True)\n\
+                    subprocess.check_output(['cat', 'a.py'])\nos.system('exit 2')\nlive = subprocess.Popen(['sleep', '60'])\n\
+                    try:\n    subprocess.run(['no-such-command-low'])\nexcept FileNotFoundError:\n    pass\n\
+                    try:\n    subprocess.run(['git', 'clean', '-fdX'])\nexcept PermissionError as e:\n    print(e)";
+        let reply = run(&mut worker, code).await;
+        let cmds = json!([
+            ["true", 0, []],
+            ["exit 3", 3, []],
+            ["cat a.py", 0, ["a.py"]],
+            ["exit 2", 2, []],
+            ["sleep 60", "stopped at the run's end", []],
+            ["no-such-command-low", "FileNotFoundError", []],
+            ["git clean -fdX", "refused", []]
+        ]);
+        assert_eq!(reply["cmds"], cmds, "{reply}");
+        assert!(reply["out"].as_str().is_some_and(|out| out.starts_with("[refused: git clean -x or -X")), "{reply}");
+        // low's own commands, such as the tree a check() records, aren't listed.
         let reply = run(&mut worker, "edit('a.py', 'return 4', 'return 5')\nassert check()\nfinish('done')").await;
+        assert!(reply["cmds"].is_null(), "{reply}");
         assert_eq!((&reply["finish"], &reply["own"], &reply["check"]), (&json!("done"), &json!(0), &json!(true)));
         assert_eq!(run(&mut worker, "print('x')\nfinish('done')").await["own"], 2);
         // write() replaces a regular file, keeping CRLF line ends, and refuses anything else that exists.
