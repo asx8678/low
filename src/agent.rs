@@ -198,6 +198,7 @@ impl Agent {
         repo: bool,
     ) -> Result<Self> {
         guard_git(root);
+        ui::rooted(root);
         let session = if resume || id.is_some() {
             Session::resume(home, root, id, |header| {
                 adopt(&mut config, header);
@@ -1468,7 +1469,8 @@ impl Agent {
         let lines = |list: &str| list.lines().filter(|l| *l != "none").map(String::from).collect::<Vec<_>>();
         let mut changes = lines(&listed);
         // Files another writer changed during the turn: neither this turn's to report nor its to undo.
-        let elsewhere = lines(&all).len() - changes.len();
+        let others: Vec<String> = lines(&all).into_iter().filter(|l| !changes.contains(l)).collect();
+        let elsewhere = others.len();
         let ignored = if self.repo { self.ignored(began, &changes).await } else { vec![] };
         changes.extend(ignored.iter().map(|path| format!("{path} (ignored by git)")));
         let first = &self.session.entries[began];
@@ -1506,7 +1508,10 @@ impl Agent {
         }
         rows.push(("changes", if changes.is_empty() { "none".into() } else { capped(&changes, "\n") }));
         if elsewhere > 0 {
-            rows.push(("elsewhere", format!("{elsewhere} more changed by another writer in this tree, left out")));
+            rows.push((
+                "elsewhere",
+                format!("{}: another writer changed these during the turn, left out", by_folder(&others)),
+            ));
         }
         if !outside.is_empty() {
             let text = format!("not through low's edit()/write(), maybe outside low: {}", capped(&outside, ", "));
@@ -2023,6 +2028,37 @@ impl Claims {
 }
 
 /// The first LISTED items joined by `sep`, then how many more there are.
+/// Changed files as a list, a top-level folder with several in it as one item: "review/ (171 files deleted)".
+fn by_folder(changes: &[String]) -> String {
+    let mut folders: Vec<(&str, Vec<&String>)> = vec![];
+    for line in changes {
+        let path = changed_path(line).unwrap_or_else(|| line.clone());
+        let top = path.split_once('/').map_or(line.as_str(), |(top, _)| &line[..top.len()]);
+        match folders.iter_mut().find(|(folder, _)| *folder == top) {
+            Some((_, lines)) => lines.push(line),
+            None => folders.push((top, vec![line])),
+        }
+    }
+    let items: Vec<String> = folders
+        .into_iter()
+        .map(|(folder, lines)| match lines[..] {
+            [line] => line.clone(),
+            _ => {
+                let all = |mark: &str| lines.iter().all(|l| l.ends_with(mark));
+                let how = if all(" (deleted)") {
+                    " deleted"
+                } else if all(" (new)") {
+                    " new"
+                } else {
+                    ""
+                };
+                format!("{folder}/ ({} files{how})", lines.len())
+            }
+        })
+        .collect();
+    capped(&items, ", ")
+}
+
 fn capped(items: &[String], sep: &str) -> String {
     let more = items.len().saturating_sub(LISTED);
     let shown = items[..items.len() - more].join(sep);
@@ -2522,6 +2558,14 @@ mod tests {
         assert_eq!(include_str!("prompt.md").matches(super::UNDO).count(), 1);
         assert_eq!(include_str!("prompt.md").matches("HOSTS").count(), 1);
         assert!(super::WEB.contains("HOSTS") && super::WEB_OPEN.contains("HOSTS"));
+    }
+
+    /// What another writer changed is listed by top-level folder where one holds several, saying how when all agree.
+    #[test]
+    fn others_changes_are_listed_by_folder() {
+        let mut lines: Vec<String> = (0..171).map(|i| format!("review/f{i}.md (deleted)")).collect();
+        lines.extend(["Cargo.lock +2 −1", "src/a.rs +1 −0", "src/b.rs (new)"].map(String::from));
+        assert_eq!(super::by_folder(&lines), "review/ (171 files deleted), Cargo.lock +2 −1, src/ (2 files)");
     }
 
     /// A second look's verdict lines count however they are marked up, and lines that name no verdict, or no claim,

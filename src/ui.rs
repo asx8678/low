@@ -472,29 +472,152 @@ struct Live {
     drawn: usize,
     at: Option<Instant>,
     rows: Vec<(&'static str, String)>,
-    group: Option<(usize, Vec<String>)>,
-    intent: Option<String>,
-    running: Option<(Instant, String)>,
+    group: Option<Group>,
+    /// What the model said before its next run, and whether that names a file or symbol.
+    intent: Option<(String, bool)>,
+    running: Option<(Instant, String, bool)>,
+}
+
+/// Runs in a row that only read, shown as one row: under the first thing the model said it was after that names a
+/// file or symbol, when one did.
+struct Group {
+    runs: usize,
+    files: Vec<String>,
+    label: Option<String>,
+    began: Instant,
 }
 
 static LIVE: Mutex<Live> =
     Mutex::new(Live { drawn: 0, at: None, rows: Vec::new(), group: None, intent: None, running: None });
 static PLAN: Mutex<(Vec<String>, Vec<u64>)> = Mutex::new((Vec::new(), Vec::new()));
+/// The repository's root, which the commands shown leave out of their paths.
+static ROOT: Mutex<String> = Mutex::new(String::new());
 const LIVE_LINES: usize = 3;
+/// A group of runs that only read goes to the scrollback when it has this many runs or has run this long, so a long
+/// stretch of reading still leaves a row a minute.
+const GROUP_RUNS: usize = 10;
+const GROUP_TIME: Duration = Duration::from_secs(60);
 const INSPECT: &str = "cat|head|tail|sed|nl|wc|ls|tree|find|grep|rg|file|stat|cd|pwd|echo|diff|sort|uniq|cut|awk|jq|\
-                       which|du|git log|git show|git diff|git status|git grep|git blame|git ls-files|git ls-tree|\
-                       git rev-parse";
+                       which|du|command -v|git log|git show|git diff|git status|git grep|git blame|git ls-files|\
+                       git ls-tree|git rev-parse|git cat-file";
 
+pub fn rooted(root: &std::path::Path) {
+    *ROOT.lock().unwrap() = root.to_string_lossy().into_owned();
+}
+
+/// The commands shell text runs, split where an operator outside quotes ends one; None when it writes to a file or
+/// substitutes a command, which no read needs. A redirect to /dev/null or another descriptor is left out of them.
+fn stages(cmd: &str) -> Option<Vec<String>> {
+    let (mut stages, mut stage, mut quote) = (vec![], String::new(), None);
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), _) if c == q => {
+                quote = None;
+                stage.push(c);
+            }
+            (Some('\''), _) => stage.push(c),
+            (_, '`') => return None,
+            (_, '$') if chars.peek() == Some(&'(') => return None,
+            (_, '\\') => {
+                stage.push(c);
+                stage.extend(chars.next());
+            }
+            (Some(_), _) => stage.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                stage.push(c);
+            }
+            (None, '|' | '&' | ';' | '\n') => {
+                stages.push(std::mem::take(&mut stage));
+                if c != ';' && c != '\n' {
+                    chars.next_if(|n| matches!(n, '|' | '&'));
+                }
+            }
+            (None, '<') if chars.peek() == Some(&'(') => return None,
+            (None, '>') => {
+                chars.next_if(|n| matches!(n, '>' | '|'));
+                let dup = chars.next_if_eq(&'&').is_some();
+                while chars.next_if(|n| *n == ' ' || *n == '\t').is_some() {}
+                let mut target = String::new();
+                while let Some(n) = chars.next_if(|n| !n.is_whitespace() && !"|&;<>".contains(*n)) {
+                    target.push(n);
+                }
+                let descriptor =
+                    dup && (target == "-" || !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()));
+                if target != "/dev/null" && !descriptor {
+                    return None;
+                }
+            }
+            (None, _) => stage.push(c),
+        }
+    }
+    stages.push(stage);
+    Some(stages.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+}
+
+/// Whether a command only reads: each of its commands is one that inspects, through xargs or not, and none writes.
 fn inspects(cmd: &str) -> bool {
-    let read = |part: &str| {
-        INSPECT.split('|').any(|i| part.strip_prefix(i).is_some_and(|rest| rest.is_empty() || rest.starts_with(' ')))
+    let read = |stage: &String| {
+        let words: Vec<&str> = stage.split_whitespace().collect();
+        let words = match words.split_first() {
+            Some((&"xargs", rest)) => &rest[rest.iter().take_while(|w| w.starts_with('-')).count()..],
+            _ => &words[..],
+        };
+        let line = words.join(" ");
+        let named =
+            INSPECT.split('|').find(|i| line.strip_prefix(i).is_some_and(|r| r.is_empty() || r.starts_with(' ')));
+        match named {
+            None => false,
+            Some("sed") => !words.iter().any(|w| {
+                w.starts_with("--in-place") || w.starts_with('-') && !w.starts_with("--") && w[1..].contains('i')
+            }),
+            Some("find") => !words.iter().any(|w| matches!(*w, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir")),
+            Some(_) => true,
+        }
     };
-    cmd.replace("&&", ";").split([';', '|', '\n']).map(str::trim).filter(|p| !p.is_empty()).all(read)
+    stages(cmd).is_some_and(|stages| stages.iter().all(read))
+}
+
+/// A command as the user reads it: paths in the repository relative to it, the temporary directory as $TMPDIR, the
+/// home as ~, and a program named by its full path by its name alone.
+fn short(cmd: &str) -> String {
+    let temp = std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut text = cmd.to_string();
+    for (long, short) in [
+        (ROOT.lock().unwrap().clone(), ""),
+        (format!("/private{temp}"), "$TMPDIR/"),
+        (temp, "$TMPDIR/"),
+        (home.trim_end_matches('/').to_string(), "~/"),
+    ] {
+        if !long.is_empty() {
+            text = text.replace(&format!("{long}/"), short);
+        }
+    }
+    let program = text.split_whitespace().next().unwrap_or_default();
+    match program.rsplit_once('/') {
+        Some((_, name)) if program.starts_with('/') && !name.is_empty() => {
+            format!("{name}{}", &text.trim_start()[program.len()..])
+        }
+        _ => text,
+    }
+}
+
+/// How a command that failed ended: its exit status, or the signal that stopped it (a negative status).
+fn ended(code: i64) -> String {
+    match code {
+        -9 => "killed".into(),
+        -15 => "terminated".into(),
+        -2 => "interrupted".into(),
+        code if code < 0 => format!("signal {}", -code),
+        code => format!("exit {code}"),
+    }
 }
 
 fn redraw(live: &mut Live) {
     let Some(cols) = BAR.lock().unwrap().as_ref().map(|b| b.cols as usize) else { return };
-    let group = live.group.as_ref().map(|(runs, files)| ("2", grouped(*runs, files)));
+    let group = live.group.as_ref().map(grouped).unwrap_or_default();
     let mut out = if live.drawn > 0 { format!("\x1b[{}A", live.drawn) } else { String::new() };
     let mut drawn = 0;
     for (style, text) in group.iter().chain(&live.rows) {
@@ -520,30 +643,45 @@ fn erase(live: &mut Live) {
 }
 
 pub fn settle() {
-    let mut live = LIVE.lock().unwrap();
-    erase(&mut live);
+    settled(&mut LIVE.lock().unwrap());
+}
+
+fn settled(live: &mut Live) {
+    erase(live);
     live.rows.clear();
-    if let Some((runs, files)) = live.group.take() {
-        println!("  {}", paint("2", &grouped(runs, &files)));
+    if let Some(group) = live.group.take() {
+        for (style, text) in grouped(&group) {
+            println!("  {}", paint(style, &text));
+        }
     }
 }
 
-fn grouped(runs: usize, files: &[String]) -> String {
-    if files.is_empty() {
-        return format!("◦ {runs} run{}", if runs == 1 { "" } else { "s" });
-    }
-    let count = if runs > 1 { format!(" · {runs} runs") } else { String::new() };
-    let room = width().saturating_sub(16 + count.len()).max(20);
-    let (mut list, mut shown) = (String::new(), 0);
-    for file in files {
-        if shown > 0 && list.width() + 2 + file.width() > room {
-            break;
+/// A group's rows: what the model said it was after, when it named something, over the files read and the time taken.
+fn grouped(group: &Group) -> Vec<(&'static str, String)> {
+    let Group { runs, files, label, began } = group;
+    let secs = began.elapsed().as_secs();
+    let took = if secs > 0 { format!(" · {}", minutes(secs)) } else { String::new() };
+    let count = if *runs > 1 { format!(" · {runs} runs") } else { String::new() };
+    let lead = if label.is_some() { "  " } else { "◦ " };
+    let read = if files.is_empty() {
+        format!("{lead}{runs} run{}{took}", if *runs == 1 { "" } else { "s" })
+    } else {
+        let room = width().saturating_sub(18 + count.len() + took.len()).max(20);
+        let (mut list, mut shown) = (String::new(), 0);
+        for file in files {
+            if shown > 0 && list.width() + 2 + file.width() > room {
+                break;
+            }
+            list += &format!("{}{file}", if shown > 0 { ", " } else { "" });
+            shown += 1;
         }
-        list += &format!("{}{file}", if shown > 0 { ", " } else { "" });
-        shown += 1;
+        let rest = if shown < files.len() { format!(" +{}", files.len() - shown) } else { String::new() };
+        format!("{lead}read {list}{rest}{count}{took}")
+    };
+    match label {
+        Some(label) => vec![("0", format!("◦ {}", flat(label, width().saturating_sub(6).max(30)))), ("2", read)],
+        None => vec![("2", read)],
     }
-    let rest = if shown < files.len() { format!(" +{}", files.len() - shown) } else { String::new() };
-    format!("◦ read {list}{rest}{count}")
 }
 
 pub fn thinking(text: &str, secs: u64) {
@@ -579,14 +717,39 @@ pub fn writing(lines: usize) {
     redraw(&mut live);
 }
 
+/// What the model is after in its next run: the last sentence it said, or thought, that names a file or symbol, and
+/// otherwise its last sentence. Reasoning is often notes ("Search.", "inspect"), which a sentence that names
+/// something mostly isn't: in a 200-run session it gave 171 runs such a sentence.
 pub fn intent(said: &str, thinking: &str) {
     let text = if said.trim().is_empty() { thinking } else { said };
-    let intent = match sentences(text).as_slice() {
-        [] => None,
-        [.., before, last] if last.chars().count() < 25 => Some(format!("{before} {last}")),
-        [.., last] => Some(last.to_string()),
+    let sentences = sentences(text);
+    let named = sentences.iter().rev().find(|s| s.chars().count() >= 25 && names(s));
+    let intent = match (named, sentences.as_slice()) {
+        (Some(named), _) => Some((named.to_string(), true)),
+        (None, []) => None,
+        (None, [.., before, last]) if last.chars().count() < 25 => Some((format!("{before} {last}"), false)),
+        (None, [.., last]) => Some((last.to_string(), false)),
     };
-    LIVE.lock().unwrap().intent = intent;
+    LIVE.lock().unwrap().intent = intent.map(|(text, named)| {
+        (text.replace("**", "").replace('`', "").trim_start_matches(['-', '*', '#', ' ']).to_string(), named)
+    });
+}
+
+/// Whether a sentence names a file or a symbol: `code`, a path, a file name with an extension, snake_case, a::b, f().
+fn names(sentence: &str) -> bool {
+    sentence.contains('`')
+        || sentence.split_whitespace().any(|word| {
+            let word = word.trim_matches(|c: char| !c.is_alphanumeric() && !"_/.:()".contains(c));
+            let word = word.trim_end_matches(['.', ':']);
+            let extension = word.rsplit_once('.').is_some_and(|(stem, ext)| {
+                stem.chars().filter(|c| c.is_alphanumeric()).count() >= 2
+                    && (1..=4).contains(&ext.len())
+                    && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+            });
+            let alpha = word.chars().any(char::is_alphabetic);
+            alpha && (extension || word.contains("::") || word.ends_with("()") || word.trim_matches('_').contains('_'))
+                || alpha && word.contains('/') && !word.starts_with("//")
+        })
 }
 
 fn sentences(text: &str) -> Vec<&str> {
@@ -612,9 +775,10 @@ pub fn run(code: &str) {
     let first = headline(&code).unwrap_or("(no code)");
     activity(&format!("step {step} running"));
     let mut live = LIVE.lock().unwrap();
-    let label = flat(&live.intent.take().unwrap_or_else(|| first.to_string()), 300);
+    let (label, named) = live.intent.take().unwrap_or_else(|| (first.to_string(), false));
+    let label = flat(&label, 300);
     live.rows = vec![("2", format!("▸ {label}"))];
-    live.running = Some((Instant::now(), label));
+    live.running = Some((Instant::now(), label, named));
     redraw(&mut live);
 }
 
@@ -635,7 +799,10 @@ pub fn ran(meta: &Value, out: &str) {
     let actions = meta["actions"].as_array().map_or(&[][..], Vec::as_slice);
     let mut live = LIVE.lock().unwrap();
     live.rows.clear();
-    let (started, label) = live.running.take().unzip();
+    let (started, label, named) = match live.running.take() {
+        Some((started, label, named)) => (Some(started), Some(label), named),
+        None => (None, None, false),
+    };
     let took = started.map(|s| s.elapsed().as_secs_f64()).filter(|&s| s >= 1.0);
     let quiet =
         cmds.is_empty() && actions.is_empty() && ["exception", "accepted", "plan"].iter().all(|k| meta[k].is_null());
@@ -648,14 +815,22 @@ pub fn ran(meta: &Value, out: &str) {
         return;
     }
     if quiet {
-        let (runs, files) = live.group.get_or_insert_default();
-        *runs += 1;
+        let began = started.unwrap_or_else(Instant::now);
+        let group = live.group.get_or_insert_with(|| Group { runs: 0, files: vec![], label: None, began });
+        group.runs += 1;
+        if group.label.is_none() && named {
+            group.label = label;
+        }
         for read in reads {
-            if !files.contains(&read) {
-                files.push(read);
+            if !group.files.contains(&read) {
+                group.files.push(read);
             }
         }
-        redraw(&mut live);
+        if group.runs >= GROUP_RUNS || group.began.elapsed() >= GROUP_TIME {
+            settled(&mut live);
+        } else {
+            redraw(&mut live);
+        }
         return;
     }
     drop(live);
@@ -698,16 +873,26 @@ pub fn ran(meta: &Value, out: &str) {
     if failed {
         rows.extend(lines[lines.len().saturating_sub(3)..].iter().map(|l| paint("2", &format!("  {}", flat(l, room)))));
     }
-    for (i, (cmd, exit)) in cmds.iter().enumerate() {
+    // A command run again and again in a row, as a loop that polls runs it, is one row with how many times.
+    let mut repeated: Vec<(&str, &Value, usize)> = vec![];
+    for (cmd, exit) in cmds {
+        match repeated.last_mut() {
+            Some((last, last_exit, n)) if *last == cmd && *last_exit == exit => *n += 1,
+            _ => repeated.push((cmd, exit, 1)),
+        }
+    }
+    for (i, (cmd, exit, n)) in repeated.iter().enumerate() {
         if i == 3 {
-            rows.push(paint("2", &format!("  +{} more commands", cmds.len() - 3)));
+            let more: usize = repeated[3..].iter().map(|(_, _, n)| n).sum();
+            rows.push(paint("2", &format!("  +{more} more command{}", if more == 1 { "" } else { "s" })));
             break;
         }
-        let cmd = flat(cmd, room.saturating_sub(14));
+        let times = if *n > 1 { format!(" ×{n}") } else { String::new() };
+        let cmd = flat(&short(cmd), room.saturating_sub(16 + times.len()));
         rows.push(match exit.as_i64() {
-            Some(0) => format!("{} {cmd}  {}", paint("36", "$"), paint("32", "✓")),
-            Some(code) => paint("2", &format!("$ {cmd}  ✗ exit {code}")),
-            None => paint("2", &format!("$ {cmd}  ✗ {}", flat(exit.as_str().unwrap_or("failed"), 40))),
+            Some(0) => format!("{} {cmd}  {}{times}", paint("36", "$"), paint("32", "✓")),
+            Some(code) => paint("2", &format!("$ {cmd}  ✗ {}{times}", ended(code))),
+            None => paint("2", &format!("$ {cmd}  ✗ {}{times}", flat(exit.as_str().unwrap_or("failed"), 40))),
         });
         timed = Some(rows.len() - 1);
     }
@@ -859,9 +1044,72 @@ pub fn wrap(text: &str, room: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Steer, ending};
+    use super::{Steer, ended, ending, inspects, names, short};
     use crate::picker::{Key, keys};
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn a_command_that_only_reads_is_told_by_its_commands_outside_quotes() {
+        for read in [
+            r"grep -nE '^(pub )?fn |^impl ' src/agent.rs",
+            r"grep -n 'def _read\|MAX_OUT' src/worker.py | head -30",
+            r"grep -n -i 'orphan\|capture' review/PLAN.md 2>/dev/null | head -80",
+            "git cat-file -t ed68baf 2>&1; git log --oneline ed68baf..HEAD 2>&1 | head -60",
+            "git ls-files | xargs wc -l | sort -n | tail -30",
+            "cd src && grep -c x *.rs >/dev/null || echo none",
+            r#"grep "a;b|c" f.rs"#,
+            "command -v lsof",
+        ] {
+            assert!(inspects(read), "{read}");
+        }
+        for runs in [
+            "cat a > b",
+            "grep x f | tee out",
+            "echo $(rm -rf x)",
+            "echo `make`",
+            "cat x\nrm -rf y",
+            "grep x f; make",
+            "sed -i 's/a/b/' f",
+            "sed -ni 's/a/b/p' f",
+            "find . -name '*.pyc' -delete",
+            "find . -exec rm {} +",
+            "diff <(make a) b",
+            "lsof -p 1",
+            "/opt/homebrew/bin/python3.14 src/worker.py",
+        ] {
+            assert!(!inspects(runs), "{runs}");
+        }
+    }
+
+    #[test]
+    fn a_command_shows_short_paths_and_how_it_ended() {
+        super::rooted(std::path::Path::new("/r/low"));
+        let temp = std::env::temp_dir();
+        let temp = temp.to_string_lossy();
+        let cmd =
+            format!("/opt/py/bin/python3.14 /r/low/src/worker.py; rm -rf {}/low-x /r/lowx", temp.trim_end_matches('/'));
+        assert_eq!(short(&cmd), "python3.14 src/worker.py; rm -rf $TMPDIR/low-x /r/lowx");
+        assert_eq!(short("git status"), "git status");
+        assert_eq!((ended(-9), ended(-6), ended(1)), ("killed".into(), "signal 6".into(), "exit 1".into()));
+    }
+
+    #[test]
+    fn a_sentence_names_something_when_it_has_a_path_a_file_or_a_symbol() {
+        for named in [
+            "Let's inspect llm.rs around IDLE/retries",
+            "Potential bug in `Session` lock/resume",
+            "check whether compact_at is learned",
+            "does Session::resume load it all",
+            "where finish() redacts",
+        ] {
+            assert!(names(named), "{named}");
+        }
+        for vague in
+            ["Search.", "Let's do that now, e.g. read the rest.", "Read key areas of the worker", "1.5 seconds"]
+        {
+            assert!(!names(vague), "{vague}");
+        }
+    }
 
     fn typed(bytes: &[u8]) -> Steer {
         let mut steer = Steer { typing: String::new(), sent: vec![] };
