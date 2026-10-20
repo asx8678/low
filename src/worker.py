@@ -47,12 +47,22 @@ def _overrun(signum, frame):
         raise TimeoutError(f"the run went past its {RUN_CAP} s limit")
 
 
+SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _frame(message):
+    # A lone surrogate, which a str can hold and a test case may, is written by json.dumps as an escape low's parser
+    # refuses, and that cost the worker and its variables. A str has no other code points in that range: a character
+    # past U+FFFF is one code point, not a pair.
+    return SURROGATE.sub("\ufffd", json.dumps(message, ensure_ascii=False)) + "\n"
+
+
 def _host(message):
     # The run's clock stops while the host answers (a check can take far longer than a run), and starts over after it,
     # as the host's own timeout does.
     global _deadline
     signal.setitimer(signal.ITIMER_REAL, 0)
-    _outbox.write(json.dumps(message) + "\n")
+    _outbox.write(_frame(message))
     _outbox.flush()
     answer = json.loads(_inbox.readline() or "{}")
     _deadline = time.monotonic() + RUN_CAP
@@ -1029,6 +1039,6 @@ for n, request in enumerate(_inbox, 1):
         spill = _spill(text, n)
         where = f"; all {len(text)} are in {spill}: show() or grep it" if spill else ""
         text = f"{text[:HALF]}\n[… {len(text) - 2 * HALF} characters omitted{where}]\n{text[-HALF:]}"
-    _outbox.write(json.dumps(dict(_report, out=text or "(no output)", error=failed)) + "\n")
+    _outbox.write(_frame(dict(_report, out=text or "(no output)", error=failed)))
     _outbox.flush()
 _kill()

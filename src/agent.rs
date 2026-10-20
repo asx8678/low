@@ -1168,14 +1168,26 @@ impl Agent {
             }
             (Some("run"), Some(code)) => self.run_code(code).await,
             (Some("run"), None) => {
-                ui::event(
-                    "bad_call",
-                    "the model's run() came without code (cut off by the output limit?)",
-                    Value::Null,
-                );
-                let out = "error: run() arrived without a code argument, probably cut off by the output limit; \
-                           send it again in smaller steps";
-                (out.into(), json!({"tool": "run", "error": true}))
+                let keys: Vec<&str> = args.as_object().into_iter().flat_map(|o| o.keys().map(String::as_str)).collect();
+                let (event, out) = if keys.is_empty() {
+                    (
+                        "the model's run() came without code (cut off by the output limit?)".to_string(),
+                        "error: run() arrived without a code argument, probably cut off by the output limit; send it \
+                         again in smaller steps"
+                            .to_string(),
+                    )
+                } else {
+                    let sent = keys.join(", ");
+                    (
+                        format!("the model's run() came with {sent} in place of code; not run"),
+                        format!(
+                            "error: run() takes one argument, code: the Python to run. This call sent {sent}, so \
+                             nothing ran. Send it again as run(code); a shell command goes in sh() inside the code."
+                        ),
+                    )
+                };
+                ui::event("bad_call", &event, Value::Null);
+                (out, json!({"tool": "run", "error": true}))
             }
             (Some(name), _) if HELPERS.contains(&name) => {
                 let args = call["function"]["arguments"].as_str().unwrap_or("{}");

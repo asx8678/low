@@ -53,7 +53,9 @@ const STEERED: &str = "[Steered by the user]";
 
 /// The entry the kept tail starts at: the earliest reply from which the rest fits in `keep_tokens`, and without `whole`
 /// at least the last reply. Without `whole` it is `prev`, nothing to compact, when all of it fits: compaction keeps that
-/// much as it is. `whole` follows an overflow, which shows the estimate ran short, so it cuts anyway.
+/// much as it is. `whole` follows an overflow, which shows the estimate ran short, so it cuts anyway. With no reply after
+/// `prev` to cut at, the tail is a reply's own result, not yet answered: without `whole` that is nothing to compact, and
+/// the model's next reply gives the next compaction a place to cut, past the result it has read.
 pub fn cut(entries: &[Value], prev: usize, keep_tokens: usize, whole: bool) -> usize {
     let (mut tail, mut keep) = (0, entries.len());
     for i in (prev + 1..entries.len()).rev() {
@@ -66,7 +68,7 @@ pub fn cut(entries: &[Value], prev: usize, keep_tokens: usize, whole: bool) -> u
             keep = i;
         }
     }
-    if tail > keep_tokens || whole { keep } else { prev }
+    if whole || (tail > keep_tokens && keep < entries.len()) { keep } else { prev }
 }
 
 pub fn summary(entries: &[Value], keep: usize) -> String {
@@ -80,7 +82,7 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
 
     let (mut dialogue, mut used) = (vec![], 0);
     for (n, &u) in recent.iter().enumerate() {
-        let budget = if n + 1 == recent.len() { 3 * EXCHANGE - used } else { EXCHANGE };
+        let budget = if n + 1 == recent.len() { (3 * EXCHANGE).saturating_sub(used) } else { EXCHANGE };
         let a = (1..u).rev().take_while(|&i| role(i) != "user").find(|&i| role(i) == "assistant" && said(i));
         let reply = a.map(|a| quote(text(a)));
         let room = reply.as_ref().map_or(EXCHANGE, |r| (EXCHANGE / 2).max(EXCHANGE.saturating_sub(r.len())));
@@ -91,7 +93,7 @@ pub fn summary(entries: &[Value], keep: usize) -> String {
         };
         used += user.len();
         if let (Some(a), Some(reply)) = (a, reply) {
-            let reply = excerpt(&reply, budget - user.len());
+            let reply = excerpt(&reply, budget.saturating_sub(user.len()));
             used += reply.len();
             dialogue.push(format!("#{a} assistant (historical, not a verified outcome):\n{reply}"));
         }
@@ -471,6 +473,26 @@ mod tests {
         assert!(super::cut(&entries, 1, 0, true) > 1);
     }
 
+    /// A compaction whose kept tail is one reply and its large result leaves the next cut nothing to do, rather than
+    /// keeping nothing; an overflow still cuts it all.
+    #[test]
+    fn cut_keeps_the_last_reply() {
+        let big = "line of output\n".repeat(2000);
+        let mut entries = vec![
+            json!({"system": "s"}),
+            json!({"role": "user", "content": "earlier task", "meta": {}}),
+            json!({"role": "assistant", "content": "earlier answer", "meta": {}}),
+            json!({"role": "user", "content": "task", "meta": {}}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+                "function": {"name": "run", "arguments": "{\"code\": \"print(big())\"}"}}], "meta": {}}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": big, "meta": {"tool": "run"}}),
+        ];
+        let first = super::cut(&entries, 1, 200, false);
+        entries.push(json!({"compact": {"keep": first, "summary": super::summary(&entries, first)}}));
+        assert_eq!((first, super::cut(&entries, first, 200, false)), (4, 4));
+        assert_eq!(super::cut(&entries, first, 200, true), entries.len());
+    }
+
     #[test]
     fn a_task_carries_its_date() {
         let task = json!({"role": "user", "content": "fix it", "meta": {"date": "2026-10-19", "snapshot": "t"}});
@@ -507,6 +529,24 @@ mod tests {
             assert!(recall(9, n).is_err(), "{n}");
         }
         assert!(recall(1, 2).is_err_and(|why| why.starts_with("nothing is summarized yet")));
+    }
+
+    /// Three tasks that fill their exchange budgets: the last exchange's budget runs out without a panic.
+    #[test]
+    fn summary_budget_saturates() {
+        let task = |n: usize| "t".repeat(n);
+        let entries = vec![
+            json!({"system": "s"}),
+            json!({"role": "user", "content": task(3966), "meta": {}}),
+            json!({"role": "assistant", "content": "ok", "meta": {}}),
+            json!({"role": "user", "content": task(3962), "meta": {}}),
+            json!({"role": "assistant", "content": "ok", "meta": {}}),
+            json!({"role": "user", "content": task(3962), "meta": {}}),
+            json!({"role": "assistant", "content": "ok", "meta": {}}),
+            json!({"role": "user", "content": "the next task", "meta": {}}),
+        ];
+        let summary = super::summary(&entries, 7);
+        assert!(summary.contains("#5 user:") && summary.len() <= super::MAX_BYTES + 200, "{}", summary.len());
     }
 
     #[test]

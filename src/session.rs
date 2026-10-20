@@ -151,21 +151,23 @@ impl Session {
             if serde_json::from_str::<Value>(&first).is_ok_and(|header| header["cwd"] == json!(root)) {
                 let mut file = OpenOptions::new().append(true).open(&path)?;
                 ensure!(file.try_lock().is_ok(), "{} is in use by another low", path.display());
-                let mut text = fs::read_to_string(&path)?;
-                let cut = text.rfind('\n').map_or(0, |i| i + 1);
-                if serde_json::from_str::<Value>(&text[cut..]).is_ok() {
+                let mut bytes = fs::read(&path)?;
+                let cut = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+                if serde_json::from_slice::<Value>(&bytes[cut..]).is_ok() {
                     file.write_all(b"\n")?;
-                    text.push('\n');
+                    bytes.push(b'\n');
                 } else {
-                    // A crash while writing left part of a line (a log that ends in its newline has nothing after it).
-                    let torn = text.len() - cut;
+                    // A crash while writing left part of a line (a log that ends in its newline has nothing after it),
+                    // which can end inside a multi-byte character.
+                    let torn = bytes.len() - cut;
                     if torn > 0 {
                         let what = format!("dropped an incomplete last line ({torn} bytes) from {}", path.display());
                         crate::ui::note(&what);
                     }
                     file.set_len(cut as u64)?;
-                    text.truncate(cut);
+                    bytes.truncate(cut);
                 }
+                let text = String::from_utf8(bytes)?;
                 let mut entries: Vec<Value> = text.lines().map(serde_json::from_str).collect::<Result<_, _>>()?;
                 backfill_id(&mut entries, &path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default());
                 eprintln!("[resumed {}]", path.display());
@@ -371,6 +373,24 @@ mod tests {
     use super::Session;
     use serde_json::{Map, Value, json};
 
+    /// Events wait in one queue for the whole process, and a session's next write takes them all, so the tests whose
+    /// sessions raise events or count their entries take turns.
+    static QUEUE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The newest session of `root`, resumed. A process another test forks meanwhile holds the log's lock until it
+    /// execs.
+    fn resume(home: &std::path::Path, root: &std::path::Path) -> Session {
+        let mut resumed = Session::resume(home, root, None, |_| Map::new());
+        for _ in 0..50 {
+            if resumed.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            resumed = Session::resume(home, root, None, |_| Map::new());
+        }
+        resumed.unwrap()
+    }
+
     fn assistant(content: &str, calls: &[&str], prompt: u64) -> Value {
         let calls: Vec<Value> = calls
             .iter()
@@ -387,6 +407,7 @@ mod tests {
     /// What a request is built from, live and after a resume: the same messages, header, state, keep and spend.
     #[test]
     fn messages_and_marks_survive_resume() {
+        let _queue = QUEUE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!("low-session-test-{}", std::process::id()));
         let root = home.join("repo");
         std::fs::create_dir_all(&root).unwrap();
@@ -438,21 +459,37 @@ mod tests {
         let messages = session.messages();
         let live = (messages, session.header().clone(), session.keep(), session.compaction(), session.spent());
         drop(session);
-        // A process another test forks meanwhile holds the log's lock until it execs.
-        let mut resumed = Session::resume(&home, &root, None, |_| Map::new());
-        for _ in 0..50 {
-            if resumed.is_ok() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            resumed = Session::resume(&home, &root, None, |_| Map::new());
-        }
-        let session = resumed.unwrap();
+        let session = resume(&home, &root);
         let resumed =
             (session.messages(), session.header().clone(), session.keep(), session.compaction(), session.spent());
         assert_eq!(live, resumed);
         assert_eq!(session.guides(), ["lib/AGENTS.md"]);
         assert_eq!((resumed.1["model"].as_str(), resumed.2, resumed.3), (Some("m2"), 10, Some(11)));
+        drop(session);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A last line torn inside a multi-byte character is dropped on resume, as a torn ASCII line is.
+    #[test]
+    fn resume_drops_a_torn_utf8_line() {
+        use std::io::Write;
+        let _queue = QUEUE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!("low-session-torn-{}", std::process::id()));
+        let root = home.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut session = Session::create(&home, &root, "p", "m", "sys", Map::new(), Map::new()).unwrap();
+        session.push(json!({"role": "user", "content": "漢字 task", "meta": {}})).unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let mut torn = br#"{"role":"assistant","content":""#.to_vec();
+        torn.extend_from_slice(&[0xe6, 0xbc]); // the first two bytes of 漢
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&torn).unwrap();
+        let session = resume(&home, &root);
+        assert!(session.entries.iter().any(|e| e["content"] == "漢字 task"));
+        assert!(session.entries.iter().all(|e| e["role"] != "assistant"));
+        assert!(session.entries.last().unwrap()["resume"].is_object());
+        let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        assert!(text.ends_with('\n') && text.lines().all(|l| serde_json::from_str::<Value>(l).is_ok()), "{text}");
         drop(session);
         let _ = std::fs::remove_dir_all(&home);
     }

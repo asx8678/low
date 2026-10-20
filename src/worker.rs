@@ -732,6 +732,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A lone surrogate in what a helper records goes to low as U+FFFD: the frame parses and the worker keeps its variables.
+    #[tokio::test]
+    async fn lone_surrogate_frame() {
+        let dir = std::env::temp_dir().join(format!("low-worker-surrogate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut worker = super::Worker::start(&dir, true, None, None).unwrap();
+        let reply = run(&mut worker, "x = 41\naccept('\\ud800 criteria')").await;
+        assert_eq!((&reply["accepted"], &reply["error"]), (&json!("\u{fffd} criteria"), &json!(false)));
+        let reply = run(&mut worker, "print(x + 1)").await;
+        assert_eq!(reply["out"], "42\n");
+        drop(worker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// edit() takes an old whose lines are all indented too deep or too shallow by the same amount, and indents new
     /// alike; anything less certain is still a miss.
     #[tokio::test]
