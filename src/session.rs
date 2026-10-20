@@ -5,8 +5,9 @@
 //! - {event, text, ...}: retries, cut streams, nudges, cache misses, the notes shown to the user, connects, commands
 //! - {check}, {report} per turn, {compact}, {switch}, {resume}, and {end} with this run's totals
 //!
-//! Every line has a wall-clock `at` in ms, in meta for messages since meta never goes on the wire. Nothing secret
-//! goes into it.
+//! Every line has a wall-clock `at` in ms, in meta for messages since meta never goes on the wire. low puts none of
+//! its own secrets in it and redacts run and check output, but tasks, steers and replies are kept as they were sent,
+//! since resume replays them: a key pasted into a task stays in the log.
 use anyhow::{Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::fs::{self, DirBuilder, File, OpenOptions};

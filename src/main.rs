@@ -172,7 +172,8 @@ pub struct Config {
 fn load(path: &Path) -> Result<Config> {
     match std::fs::read_to_string(path) {
         Ok(text) => toml::from_str(&text).with_context(|| path.display().to_string()),
-        Err(_) => Ok(Config::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(e) => Err(e).with_context(|| path.display().to_string()),
     }
 }
 

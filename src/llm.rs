@@ -154,8 +154,8 @@ fn window(error: &str) -> Option<u64> {
         let run = digits.trim_end_matches(',');
         let n: u64 = run.chars().filter(char::is_ascii_digit).collect::<String>().parse().ok()?;
         let n = match rest[run.len()..].chars().next() {
-            Some('k') => n * 1_000,
-            Some('m') => n * 1_000_000,
+            Some('k') => n.checked_mul(1_000)?,
+            Some('m') => n.checked_mul(1_000_000)?,
             _ => n,
         };
         // Under 1024 tokens it is a misread, not a context window.
@@ -901,6 +901,7 @@ mod tests {
         assert_eq!(super::window("This model's maximum context length is 131,072 tokens"), Some(131_072));
         assert_eq!(super::window("context window is 128k"), Some(128_000));
         assert_eq!(super::window("rate limited"), None);
+        assert_eq!(super::window("context window of 18446744073709551615m"), None);
         assert!(super::overflow("Error: context_length_exceeded"));
         assert!(super::refused(&json!({"code": 401})) && super::refused(&json!({"type": "invalid_request_error"})));
         assert!(!super::refused(&json!({"code": 429})) && !super::refused(&json!({"code": 500})));
