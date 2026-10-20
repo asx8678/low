@@ -71,13 +71,14 @@ const PLANTED_END: &str = "The user's git would run hooks and config from there,
 /// A second look's instructions, after the turn's own system prompt, which the provider still has cached. The e2e mock
 /// (tests/e2e/mock.py) tells a second look's requests by its opening words.
 const LOOK: &str = "You are taking a second look at a turn low just finished: another conversation did the task below, \
-                    and you check its final report against the code. You get the task, its criteria, what its runs \
-                    edited and ran, its diff and its report, not that conversation. Nothing here changes files: edit() \
-                    and write() refuse, the repository is read-only, and check(), search() and fetch() are off.\n\n\
-                    Pick the 3 to 5 claims in the report that matter most and are likeliest to be wrong: what the change \
-                    does, a case it handles, something it leaves unchanged, a command said to pass. Check each by \
-                    reading the code with show(), open(), re and sh(\"git grep ...\"), in as few runs as you can; don't \
-                    build, test or run the project.";
+                    and you check its final report against the code. You get the task, its criteria, why it asked for \
+                    this look, what its runs edited and ran, its diff and its report, not that conversation. Nothing \
+                    here changes files: edit() and write() refuse, the repository is read-only, and check(), search() \
+                    and fetch() are off.\n\n\
+                    Pick the 3 to 5 claims in the report that matter most and are likeliest to be wrong, those its \
+                    reason names first: what the change does, a case it handles, something it leaves unchanged, a \
+                    command said to pass. Check each by reading the code with show(), open(), re and \
+                    sh(\"git grep ...\"), in as few runs as you can; don't build, test or run the project.";
 /// The instructions of a second look at the model's answer to the claims a first one found contradicted: it checks
 /// those alone, with the runs and the diff since. It opens as LOOK does, for the e2e mock.
 const RECHECK: &str = "You are taking a second look at a turn low just finished, after an earlier one: that look found \
@@ -117,8 +118,8 @@ const REFUTED_END: &str = "Fix the code or correct the report, then finish again
 /// DeepSeek's own tool-call markup, which leaks into a run()'s code at times: what follows it is no Python.
 const MARKUP: &[&str] = &["<｜end▁of▁thinking｜>", "｜DSML｜"];
 const HELPERS: &[&str] = &[
-    "sh", "show", "accept", "edit", "write", "undo", "check", "plan", "done", "finish", "ask", "search", "fetch",
-    "recall",
+    "sh", "show", "accept", "edit", "write", "undo", "check", "plan", "done", "finish", "ask", "look", "search",
+    "fetch", "recall",
 ];
 /// The undo() line, in the prompt only inside a git repository, where a turn has a snapshot to restore from.
 const UNDO: &str = "undo(*paths)                  # put files back as they were when this turn began (default: all this \
@@ -816,9 +817,10 @@ impl Agent {
             }
             checked = ok;
         }
-        // Nothing has run the report's claims, so a second look reads the code for them. What it finds contradicted goes
-        // back to the model once, and a second look at the answer checks those claims again; the others stand.
-        if changed && !checked && !state.stalled {
+        // Nothing has run the report's claims, so a second look reads the code for them, when the model asked for one with
+        // look(). What it finds contradicted goes back to the model once, and a second look at the answer checks those
+        // claims again; the others stand.
+        if changed && !checked && !state.stalled && !asked(&self.session.entries[began..]).is_empty() {
             let earlier = self.claims.take().filter(|_| state.refuted.is_some());
             let claims = self.look(state, start, began, earlier.as_ref()).await?;
             self.claims = match earlier {
@@ -837,12 +839,13 @@ impl Agent {
         Ok(Some((changed, checked)))
     }
 
-    /// A second look at the report of a turn that changed files with no check passing. The same model, in a conversation
-    /// of its own that starts with the turn's system prompt and the brief but has none of the turn's messages, checks
-    /// the report's riskiest claims by reading the code in a worker that can't change files. Its requests are logged as
-    /// aside events: the turn's cost and /cost count them, the turn's conversation never sees them. After the model was
-    /// asked about the claims an `earlier` look found contradicted, it checks those alone (RECHECK). None when it
-    /// settled nothing: no report, an error, or no verdict even when its last request was told to give one.
+    /// A second look at the report of a turn that changed files with no check passing, where the model asked for one
+    /// with look(). The same model, in a conversation of its own that starts with the turn's system prompt and the brief
+    /// but has none of the turn's messages, checks the report's riskiest claims by reading the code in a worker that
+    /// can't change files. Its requests are logged as aside events: the turn's cost and /cost count them, the turn's
+    /// conversation never sees them. After the model was asked about the claims an `earlier` look found contradicted, it
+    /// checks those alone (RECHECK). None when it settled nothing: no report, an error, or no verdict even when its last
+    /// request was told to give one.
     async fn look(
         &mut self,
         state: &mut TurnState,
@@ -914,8 +917,9 @@ impl Agent {
         Ok(None)
     }
 
-    /// What a second look gets: the task with the user's steers, the criteria, what each of the turn's runs edited and
-    /// ran, the diff of the turn's own files (redacted, at most LOOK_DIFF bytes; outside git, their names) and the report.
+    /// What a second look gets: the task with the user's steers, the criteria, why the model asked for it, what each of
+    /// the turn's runs edited and ran, the diff of the turn's own files (redacted, at most LOOK_DIFF bytes; outside git,
+    /// their names) and the report.
     /// A RECHECK gets the claims found contradicted, and the runs and the diff since the tree and the entry it names.
     async fn brief(
         &self,
@@ -931,6 +935,7 @@ impl Agent {
             task += &format!("\n\n{}", text(&compact::wire(steer)));
         }
         let criteria = self.session.state().accepted.unwrap_or_else(|| "none set".into());
+        let why = asked(turn).iter().map(|w| format!("- {w}")).collect::<Vec<_>>().join("\n");
         let (from, after) = again.map_or((start, 0), |((tree, at), _)| (tree, at - began));
         let runs = turn.iter().enumerate().filter(|(_, e)| e["role"] == "tool").enumerate();
         let runs = runs.filter(|(_, (i, _))| *i >= after);
@@ -958,8 +963,8 @@ impl Agent {
                 )
             }
             None => format!(
-                "## Task\n{task}\n\n## Criteria\n{criteria}\n\n## What the turn's runs did\n{order}\n{runs}\n\n\
-                 ## Diff\n{diff}\n\n## Report\n{report}"
+                "## Task\n{task}\n\n## Criteria\n{criteria}\n\n## Why the model asked for this look\n{why}\n\n\
+                 ## What the turn's runs did\n{order}\n{runs}\n\n## Diff\n{diff}\n\n## Report\n{report}"
             ),
         }
     }
@@ -2414,6 +2419,11 @@ fn changed_path(line: &str) -> Option<String> {
     let marks = [" (new)", " (deleted)", " (binary)", " (ignored by git)"];
     let marked = marks.iter().find_map(|mark| line.strip_suffix(mark));
     marked.or_else(|| line.rsplit_once(" +").map(|(path, _)| path)).map(String::from)
+}
+
+/// What the turn's look() calls gave as the reason to check its claims, in order: none when it asked for no second look.
+fn asked(turn: &[Value]) -> Vec<&str> {
+    turn.iter().filter_map(|e| e["meta"]["look"].as_str()).collect()
 }
 
 fn edited(meta: &Value) -> bool {
