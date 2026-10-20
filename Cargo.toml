@@ -1,6 +1,6 @@
 [package]
 name = "low"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 rust-version = "1.99"
 description = "A low-entropy, code-mode coding agent: one sandboxed Python tool, verified diffs, git as the undo"
