@@ -1,18 +1,16 @@
-"""A turn that changes files with no check passing gets a second look when the model asks for one with look(): the
-same model, in a conversation of its own that has the system prompt and a brief (task, criteria, why the model asked,
-what the runs did, the diff, the report) but none of the turn's messages, reads the code in a worker that can't
-change files and gives each claim it checked a verdict. What it finds contradicted goes back to the model once, and
-a second look at the answer checks those claims alone, with the runs and the diff since; the report and --json carry
-the first look's other claims and what the second made of those. A look's last request is told to give its verdict.
-A turn that didn't ask, a passing check, or a turn without changes gets none."""
+"""A turn that changes files with no check passing gets a second look: the same model, in a conversation of its own that
+has the system prompt and a brief (task, criteria, what the runs did, the diff, the report) but none of the turn's
+messages, reads the code in a worker that can't change files and gives each claim it checked a verdict. What it finds
+contradicted goes back to the model once, and a second look at the answer checks those claims alone, with the runs
+and the diff since; the report and --json carry the first look's other claims and what the second made of those. A
+look's last request is told to give its verdict. A passing check, or a turn without changes, gets none."""
 from harness import Env, check, done, user_messages
 
 LOOK = 'You are taking a second look'
 FILES = {'app.py': "def greet():\n    return 'hi'\n\n\ndef bye():\n    return 'bye'\n"}
 EDITED = "def greet():\n    return 'hello'\n\n\ndef bye():\n    return 'bye'\n"
-UNSURE = "look('whether bye() still says bye')\n"
 FINAL = ("accept('greet() says hello; bye() is unchanged')\nedit('app.py', \"return 'hi'\", \"return 'hello'\")\n"
-         + UNSURE + "finish(\"greet() now returns 'hello'; bye() is unchanged\")")
+         "finish(\"greet() now returns 'hello'; bye() is unchanged\")")
 READS = ("try:\n    write('app.py', 'x')\nexcept ValueError as e:\n    print('refused:', e)\n"
          "try:\n    open('app.py', 'a').write('x')\nexcept OSError as e:\n    print('denied:', type(e).__name__)\n"
          "import os, tempfile\nopen(os.path.join(tempfile.gettempdir(), 'look.txt'), 'w').write('ok')\nprint('tmp ok')\n"
@@ -37,7 +35,6 @@ check('second look: the same system prompt, then only the brief',
       [m['role'] for m in first] == ['system', 'user'] and first[0] == r['requests'][0]['messages'][0], first[1:])
 check('second look: the brief has the task, criteria, runs, diff and report',
       brief.startswith(LOOK) and 'make greet say hello' in brief and 'greet() says hello; bye() is unchanged' in brief
-      and "## Why the model asked for this look\n- whether bye() still says bye" in brief
       and 'run 1: edit app.py' in brief and "+    return 'hello'" in brief and "-    return 'hi'" in brief
       and "## Report\ngreet() now returns 'hello'; bye() is unchanged" in brief, brief)
 ran = asides[1]['messages'][-1]['content']
@@ -108,12 +105,6 @@ e = Env([{'code': FINAL}], files=FILES)
 r = e.low('--json', 'make greet say hello')
 check('uncertain: nothing goes back', (len(r['requests']), len(r['asides'])) == (1, 1)
       and r['result'].get('claims', {}).get('uncertain') and r['code'] == 0, r['result'])
-
-# A turn whose model didn't call look() gets no second look.
-e = Env([{'code': FINAL.replace(UNSURE, '')}], files=FILES)
-r = e.low('--json', 'make greet say hello')
-check('not asked: no second look', r['result'].get('verdict') == 'NO CHECK' and not r['asides']
-      and r['result'].get('claims') is None and r['code'] == 0, r['result'])
 
 # A check that passes, or a turn that changes nothing, gets no second look.
 e = Env([{'code': FINAL.replace('finish(', 'assert check()\nfinish(')}], files=FILES, low_toml='check = "python3 -c pass"\n')

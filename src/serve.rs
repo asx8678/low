@@ -39,7 +39,6 @@ pub async fn serve(agent: &mut Agent, first: Option<String>) -> Result<()> {
     {
         eprintln!("error: {}", agent::error_text(&e));
     }
-    let every = agent.keep_warm();
     let (mut idle, mut last, mut warming) = (tokio::time::Instant::now(), tokio::time::Instant::now(), true);
     let mut poll = tokio::time::interval(POLL);
     loop {
@@ -63,7 +62,7 @@ pub async fn serve(agent: &mut Agent, first: Option<String>) -> Result<()> {
                 return Ok(());
             }
             (idle, last, warming) = (tokio::time::Instant::now(), tokio::time::Instant::now(), true);
-        } else if warming && every.is_some_and(|every| idle.elapsed() >= every) {
+        } else if warming && idle.elapsed() >= agent::WARM_EVERY {
             if last.elapsed() >= WARM_FOR {
                 crate::ui::note("no task for an hour: the prompt cache is no longer kept warm until the next one");
                 warming = false;

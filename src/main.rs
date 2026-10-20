@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 
 /// The build `low --version` names and the session log records.
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " ", env!("LOW_BUILD"));
-const ABOUT: &str = "A low-entropy, code-mode coding agent. Without a task it starts a REPL (/models, /model [filter], /effort [level], /providers, /compact, /cost, /think).";
+const ABOUT: &str =
+    "A low-entropy, code-mode coding agent. Without a task it starts a REPL (/models, /model [filter]).";
 const USAGE: &str = "Usage: low [OPTIONS] [TASK]";
 const HELP: &str = "\
 Arguments:
@@ -33,7 +34,7 @@ Options:
       --session <ID>   Resume this session of this repo (its id, as in [session ...])
   -m, --model <MODEL>  Model for a new session; with --resume it switches the session to it (so do /models and /model)
       --effort <LEVEL> How hard the model thinks: low, medium, high, xhigh or max, sent as reasoning_effort (DeepSeek runs
-                       medium and xhigh as high); like -m it sets a new session and switches a resumed one (so do /effort and /models);
+                       medium and xhigh as high); like -m it sets a new session and switches a resumed one (so does /models);
                        DeepSeek caches per level, so a switch sends the context uncached once
       --yolo           No sandbox: network on, writes anywhere (env vars stay filtered; env = [...] in ~/.config/low/config.toml passes more)
       --serve          After the task, keep the session and take the next tasks from low --send, keeping the provider's prompt cache warm in between (from a script, start it without a task)
@@ -150,8 +151,6 @@ pub struct Config {
     pub base_url: Option<String>,
     pub check: Option<String>,
     pub fmt: Option<String>,
-    /// The provider whose API key search() and fetch() use (DeepSeek's tools API); a provider named deepseek if unset.
-    pub search: Option<String>,
     #[serde(default)]
     pub env: Vec<String>,
     #[serde(default)]
@@ -184,7 +183,7 @@ async fn main() {
     let env = load(&providers::config_dir(&home).join("config.toml")).map(|c| c.env).unwrap_or_default();
     worker::scrub(&env);
     ui::guard();
-    // reqwest brings no crypto of its own: every client, the agent's and /providers', uses ring.
+    // reqwest brings no crypto of its own: every client uses ring.
     let _ = rustls::crypto::ring::default_provider().install_default();
     if let Err(e) = start().await {
         if std::env::args().any(|a| a == "--json") {
@@ -241,10 +240,6 @@ async fn start() -> Result<()> {
         warn("low.toml: env is ignored; set env in ~/.config/low/config.toml");
     }
     let providers = providers::load(&home)?.unwrap_or_default();
-    if let Some(name) = user.search.as_deref().filter(|name| !providers.contains_key(*name)) {
-        bail!("~/.config/low/config.toml sets search = \"{name}\", but providers.toml has no [{name}]");
-    }
-    let search = user.search.clone().or_else(|| providers.contains_key("deepseek").then(|| "deepseek".into()));
     // A checklist names its session, so a later --tasks run continues it.
     let id = cli.session.clone().or_else(|| cli.tasks.as_deref().and_then(|file| tasks::session(&home, file)));
     let resume = cli.resume || id.is_some();
@@ -255,7 +250,6 @@ async fn start() -> Result<()> {
         detect: repo.check.is_none(),
         check: repo.check.filter(|c| !c.trim().is_empty()),
         fmt: repo.fmt,
-        search,
         env: user.env,
         models: user.models,
         protect: vec![],
@@ -330,27 +324,9 @@ async fn start() -> Result<()> {
         }
         let result = match line {
             "" => Ok(()),
-            "/compact" => agent.compact(),
-            "/cost" => {
-                agent.cost();
-                Ok(())
-            }
-            "/think" => {
-                agent.think();
-                Ok(())
-            }
-            "/providers" => {
-                async {
-                    let mut providers = providers::load(&home)?.unwrap_or_default();
-                    let result = providers::menu(&home, &mut providers, agent.provider(), &mut editor).await;
-                    agent.set_providers(providers).and(result)
-                }
-                .await
-            }
             _ if let Some(filter) = argument(line, "/models").or_else(|| argument(line, "/model")) => {
                 models(&mut agent, &mut editor, filter).await
             }
-            _ if let Some(level) = argument(line, "/effort") => effort(&mut agent, level),
             task => {
                 editor.add_history_entry(task)?;
                 agent.run(task).await.map(drop)
@@ -466,20 +442,7 @@ fn exit_code(result: &serde_json::Value) -> i32 {
     result["exit"].as_i64().unwrap_or(agent::ERROR) as i32
 }
 
-/// /effort alone shows the reasoning effort the session's requests carry and the choices; /effort <level> sets it.
-fn effort(agent: &mut agent::Agent, level: &str) -> Result<()> {
-    if level.is_empty() {
-        let now = agent.effort().unwrap_or("not set, so the provider's default");
-        let choices = agent::EFFORTS.join(" ");
-        println!(
-            "reasoning effort: {now}\nset it with /effort {choices}, or pick it in /models (DeepSeek runs medium and xhigh as high)"
-        );
-        return Ok(());
-    }
-    agent.set_effort(level)
-}
-
-const COMMANDS: &[&str] = &["/compact", "/cost", "/think", "/effort", "/model", "/models", "/providers"];
+const COMMANDS: &[&str] = &["/model", "/models"];
 
 /// A "/word" line that names no command is a typo, and must not reach the model as a task.
 fn unknown(line: &str) -> Option<String> {
@@ -512,22 +475,12 @@ fn check_config(user: &Config) -> Result<()> {
     }
     for (model, profile) in &user.models {
         let at = format!("~/.config/low/config.toml: [models.\"{model}\"]");
-        if let Some(key) = ["think_limit", "turn_tokens", "guidance"].into_iter().find(|k| profile.contains_key(*k)) {
+        let gone = ["think_limit", "turn_tokens", "guidance", "keep_warm", "fallback", "turn_budget", "session_budget"];
+        if let Some(key) = gone.into_iter().find(|k| profile.contains_key(*k)) {
             bail!("{at} sets {key}, which low no longer supports; remove it");
         }
         if let Some(value) = profile.get("compact_at").filter(|v| v.as_u64().is_none_or(|n| n < 1024)) {
             bail!("{at} sets compact_at = {value}; it takes a whole number of tokens, at least 1024");
-        }
-        if let Some(value) = profile.get("keep_warm").filter(|v| !v.is_u64()) {
-            bail!("{at} sets keep_warm = {value}; it takes a whole number of seconds, 0 to turn it off");
-        }
-        if let Some(value) = profile.get("fallback").filter(|v| v.as_str().is_none_or(|f| !f.contains(':'))) {
-            bail!("{at} sets fallback = {value}; it takes \"provider:model\", e.g. \"opencode:deepseek-v4.1-flash\"");
-        }
-        for key in ["turn_budget", "session_budget"] {
-            if let Some(value) = profile.get(key).filter(|v| v.as_u64().is_none_or(|n| n < 1)) {
-                bail!("{at} sets {key} = {value}; it takes a whole number of compact_at units, at least 1");
-            }
         }
     }
     Ok(())

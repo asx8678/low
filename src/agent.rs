@@ -20,10 +20,10 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
 const COMPACT_AT: u64 = 100_000;
-/// Seconds an idle --serve session waits before re-sending its prompt to keep it cached; keep_warm in a model's
-/// profile overrides it. OpenCode Go, Zro and open design all still had a 10k-token prompt cached after 20 untouched
-/// minutes (2026-10-17), so ten minutes keeps a margin.
-const WARM_EVERY: u64 = 600;
+/// How long an idle --serve session waits before re-sending its prompt to keep it cached. OpenCode Go, Zro and open
+/// design all still had a 10k-token prompt cached after 20 untouched minutes (2026-10-17), so ten minutes keeps a
+/// margin.
+pub const WARM_EVERY: Duration = Duration::from_mins(10);
 const MAX_REQUESTS: usize = 200;
 const FILES: usize = 200;
 const LISTING: usize = 8 * 1024;
@@ -32,7 +32,7 @@ const AGENTS_MAX: usize = 32 * 1024;
 const RESTARTS: usize = 2;
 const CHECK_TIMEOUT: Duration = Duration::from_mins(30);
 const CHECK_OUT: u64 = 1 << 20;
-/// A turn's budget in compact_at units (turn_budget in a model's profile), counting cached input at a quarter.
+/// A turn's budget in compact_at units, counting cached input at a quarter.
 const TURN_BUDGET: u64 = 60;
 /// Runs in a row with the same code and the same result that end a turn: the model is stuck.
 const REPEATS: usize = 5;
@@ -45,7 +45,7 @@ const LISTED: usize = 10;
 const GATE: &str = "The project check failed on the current tree. Fix what fails, run check(), then finish again. \
                     If it cannot pass, say why in one line. The check output ended with:";
 const RETRY: &str = "Send one run() now with the next step, or a shorter answer.";
-/// Told to the model once a turn, when it has spent three quarters of its budget (turn_budget's tokens or
+/// Told to the model once a turn, when it has spent three quarters of its budget (TURN_BUDGET's tokens or
 /// MAX_REQUESTS). It asks for focus, never for the turn to end: in a repository with no check an early reply is done,
 /// and a --tasks task would lose the turns a limit gives one that is still changing files. In the session logs
 /// (2026-10-19), 81 of 709 real turns hit the token budget, at a median of 101 runs, most of them still reading files.
@@ -71,14 +71,13 @@ const PLANTED_END: &str = "The user's git would run hooks and config from there,
 /// A second look's instructions, after the turn's own system prompt, which the provider still has cached. The e2e mock
 /// (tests/e2e/mock.py) tells a second look's requests by its opening words.
 const LOOK: &str = "You are taking a second look at a turn low just finished: another conversation did the task below, \
-                    and you check its final report against the code. You get the task, its criteria, why it asked for \
-                    this look, what its runs edited and ran, its diff and its report, not that conversation. Nothing \
-                    here changes files: edit() and write() refuse, the repository is read-only, and check(), search() \
-                    and fetch() are off.\n\n\
-                    Pick the 3 to 5 claims in the report that matter most and are likeliest to be wrong, those its \
-                    reason names first: what the change does, a case it handles, something it leaves unchanged, a \
-                    command said to pass. Check each by reading the code with show(), open(), re and \
-                    sh(\"git grep ...\"), in as few runs as you can; don't build, test or run the project.";
+                    and you check its final report against the code. You get the task, its criteria, what its runs \
+                    edited and ran, its diff and its report, not that conversation. Nothing here changes files: edit() \
+                    and write() refuse, the repository is read-only, and check(), search() and fetch() are off.\n\n\
+                    Pick the 3 to 5 claims in the report that matter most and are likeliest to be wrong: what the change \
+                    does, a case it handles, something it leaves unchanged, a command said to pass. Check each by \
+                    reading the code with show(), open(), re and sh(\"git grep ...\"), in as few runs as you can; don't \
+                    build, test or run the project.";
 /// The instructions of a second look at the model's answer to the claims a first one found contradicted: it checks
 /// those alone, with the runs and the diff since. It opens as LOOK does, for the e2e mock.
 const RECHECK: &str = "You are taking a second look at a turn low just finished, after an earlier one: that look found \
@@ -118,13 +117,15 @@ const REFUTED_END: &str = "Fix the code or correct the report, then finish again
 /// DeepSeek's own tool-call markup, which leaks into a run()'s code at times: what follows it is no Python.
 const MARKUP: &[&str] = &["<｜end▁of▁thinking｜>", "｜DSML｜"];
 const HELPERS: &[&str] = &[
-    "sh", "show", "accept", "edit", "write", "undo", "check", "plan", "done", "finish", "ask", "look", "search",
-    "fetch", "recall",
+    "sh", "show", "accept", "edit", "write", "undo", "check", "plan", "done", "finish", "ask", "search", "fetch",
+    "recall",
 ];
 /// The undo() line, in the prompt only inside a git repository, where a turn has a snapshot to restore from.
 const UNDO: &str = "undo(*paths)                  # put files back as they were when this turn began (default: all this \
                     turn changed); files write() created are removed\n";
-/// The helpers that reach the web, in the prompt only when config.toml's search names a provider.
+/// The provider whose API key search() and fetch() use, for DeepSeek's tools API.
+const SEARCH: &str = "deepseek";
+/// The helpers that reach the web, in the prompt only when there is a SEARCH provider.
 const WEB: &str = "search(query, count=10) -> list  # web search: [{title, url, summary, date, site_name}]; site:, \"phrase\", \
                    after:2025 work; query up to 128 chars, count up to 50\nfetch(url) -> str             # a web page \
                    as markdown, a text file (JSON, code) as text; a URL a search() returned or the task gives, or any \
@@ -140,8 +141,8 @@ const WEB_AT_ONCE: usize = 10;
 const WEB_LIST: usize = 50;
 /// What a request the tools API would make gets without a search provider: a search(), and a fetch() off the open hosts.
 const UNSET: [&str; 2] = [
-    "web search is not set up: config.toml's search names no provider",
-    "without a search provider in config.toml, fetch() reads only URLs on the open hosts its help lists",
+    "web search is not set up: providers.toml has no [deepseek] provider",
+    "without a [deepseek] provider in providers.toml, fetch() reads only URLs on the open hosts its help lists",
 ];
 /// Hosts where fetch() takes any URL, not only one a search() returned: package registries, CDNs and docs that show no
 /// one the URLs asked of them, so a URL a run made up there can't carry what it read to someone who would see it. The
@@ -185,7 +186,6 @@ pub struct Agent {
     compact_at: u64,
     pending: Option<Value>,
     current: Option<(usize, Instant)>,
-    discarded: Option<(usize, String)>,
     restarts: usize,
     broken: Option<String>,
     passed: Option<(String, String)>,
@@ -249,7 +249,7 @@ impl Agent {
             };
             web(provider, &config.providers[provider].base_url)?;
             let profile = config.models.get(&model).cloned().unwrap_or_default();
-            let system = system_prompt(root, yolo, &config, repo, config.search.is_some());
+            let system = system_prompt(root, yolo, &config, repo, config.providers.contains_key(SEARCH));
             Session::create(home, root, provider, &model, &system, profile, context(root, &config, yolo))?
         };
         let baseline = config.detected.as_ref().and_then(|d| d.passed.clone());
@@ -268,7 +268,6 @@ impl Agent {
             compact_at,
             pending: None,
             current: None,
-            discarded: None,
             restarts: 0,
             broken: None,
             passed: None,
@@ -327,16 +326,9 @@ impl Agent {
         }
     }
 
-    /// How often an idle --serve session re-sends its prompt: keep_warm seconds from the model's profile, where 0 turns
-    /// it off, else WARM_EVERY.
-    pub fn keep_warm(&self) -> Option<Duration> {
-        let every = self.session.header()["keep_warm"].as_u64().unwrap_or(WARM_EVERY);
-        (every > 0).then(|| Duration::from_secs(every))
-    }
-
     /// Re-sends the conversation so far, cut at one output token, so the provider keeps it cached for the next task.
     /// Nothing is sent before the first reply or right after a compaction. The request is logged as a warm event with
-    /// its usage, so /cost counts it.
+    /// its usage, so the session log's totals count it.
     pub async fn warm(&mut self) -> Result<()> {
         if self.session.last_prompt_tokens() == 0 {
             return Ok(());
@@ -364,18 +356,6 @@ impl Agent {
         &self.provider
     }
 
-    pub fn set_providers(&mut self, providers: Providers) -> Result<()> {
-        self.config.providers = providers;
-        match connect(&self.config.providers, &self.session) {
-            Ok((provider, llm)) => (self.provider, self.llm) = (provider, llm),
-            Err(e) => {
-                ui::note(&format!("{e:#}; still connected as before until a provider is added"));
-                return Ok(());
-            }
-        }
-        self.record()
-    }
-
     pub async fn models(&self) -> Vec<(String, String, bool)> {
         let mut known: Vec<(String, String)> = self
             .config
@@ -383,7 +363,7 @@ impl Agent {
             .iter()
             .flat_map(|(name, p)| p.models.iter().map(move |m| (name.clone(), m.clone())))
             .collect();
-        // A provider that lists its models shows just those; /providers lists the rest of what it serves.
+        // A provider that lists its models shows just those; one that lists none shows what it serves.
         if self.config.providers.get(&self.provider).is_none_or(|p| p.models.is_empty()) {
             match self.llm.models().await {
                 Ok(listed) => known.extend(listed.into_iter().map(|m| (self.provider.clone(), m))),
@@ -413,10 +393,8 @@ impl Agent {
         let header = self.session.header();
         let (model, system) = (self.model().to_string(), header["system"].as_str().unwrap_or_default().to_string());
         let mut profile = header["params"].as_object().cloned().unwrap_or_default();
-        for key in ["compact_at", "keep_warm", "turn_budget", "session_budget", "fallback"] {
-            if !header[key].is_null() {
-                profile.insert(key.into(), header[key].clone());
-            }
+        if !header["compact_at"].is_null() {
+            profile.insert("compact_at".into(), header["compact_at"].clone());
         }
         profile.insert("reasoning_effort".into(), effort.into());
         // A profile that sends no temperature (temperature = false) keeps sending none.
@@ -434,7 +412,7 @@ impl Agent {
         anyhow::ensure!(self.config.providers.contains_key(provider), "no provider named {provider}");
         web(provider, &self.config.providers[provider].base_url)?;
         let profile = self.config.models.get(model).cloned().unwrap_or_default();
-        let web = self.config.search.is_some();
+        let web = self.config.providers.contains_key(SEARCH);
         let system = system_prompt(&self.root, self.yolo, &self.config, self.repo, web);
         self.session.switch(provider, model, &system, profile)?;
         (self.provider, self.llm) = connect(&self.config.providers, &self.session)?;
@@ -543,23 +521,18 @@ impl Agent {
             self.session.push(json!({"role": "user", "content": format!("[{moved}]"), "meta": {"host": true}}))?;
         }
         let mut state = TurnState::default();
-        let budget = self.session.header()["turn_budget"].as_u64().unwrap_or(TURN_BUDGET);
-        let ceiling = self.compact_at * budget;
+        let ceiling = self.compact_at * TURN_BUDGET;
         let rule = "cached input counts a quarter";
         let mut limit = format!("stopped after {MAX_REQUESTS} model requests in one turn");
-        // Whether the limit that stops the turn is the turn's own, which the model is asked to hand off from. Not the
-        // session's budget, a cap on spending, nor a model that is stuck or keeps sending unusable replies.
+        // Whether the limit that stops the turn is the turn's own, which the model is asked to hand off from. Not a
+        // model that is stuck or keeps sending unusable replies.
         let mut handoff = true;
         for made in 1..=MAX_REQUESTS {
             if state.spent >= ceiling {
-                limit =
-                    format!("stopped after {} in one turn ({budget} × compact_at; {rule})", ui::tokens(state.spent));
-                break;
-            }
-            if let Some(total) = self.over_budget() {
-                let spent = ui::tokens(self.spent());
-                limit = format!("stopped: the session has spent {spent} (session_budget {total} × compact_at; {rule})");
-                handoff = false;
+                limit = format!(
+                    "stopped after {} in one turn ({TURN_BUDGET} × compact_at; {rule})",
+                    ui::tokens(state.spent)
+                );
                 break;
             }
             // What the user sent from the REPL during the turn goes in between requests, where every run has its result.
@@ -622,17 +595,11 @@ impl Agent {
     }
 
     /// Asks the model for its next reply. What can be retried is handled here: a context overflow (compact and ask
-    /// again), a provider out of credit (go on with the profile's fallback, once a turn), a lost stream, reasoning cut
-    /// off in a loop, and an empty or cut-off reply (ask again, twice in a row at most). None when the turn asks again,
-    /// or when a third loop in a row stalls it; otherwise the reply, counted against the turn's budget.
+    /// again), a lost stream, reasoning cut off in a loop, and an empty or cut-off reply (ask again, twice in a row at
+    /// most). None when the turn asks again, or when a third loop in a row stalls it; otherwise the reply, counted
+    /// against the turn's budget.
     async fn request(&mut self, state: &mut TurnState) -> Result<Option<Value>> {
         let result = self.llm.complete(self.session.messages(), &tools()).await;
-        if let Some(lost) = result.as_ref().err().and_then(llm::lost) {
-            self.discard("the provider cut the stream", &lost.thinking);
-        }
-        if let Some(llm::Looping(lost)) = result.as_ref().err().and_then(|e| e.downcast_ref()) {
-            self.discard("the reasoning kept repeating itself", &lost.thinking);
-        }
         let mut message = match result {
             Err(e) if e.is::<llm::ContextOverflow>() && !state.overflowed => {
                 state.overflowed = true;
@@ -651,22 +618,14 @@ impl Agent {
                     size.min(AGENTS_MAX) / 1024
                 );
             }
-            // Out of credit or quota on this provider: once a turn, go on with the model profile's fallback.
-            Err(e) if e.is::<llm::Exhausted>() && !state.failed_over && self.fallback().is_some() => {
-                state.failed_over = true;
-                let (provider, model) = self.fallback().unwrap_or_default();
-                ui::event("failover", &format!("{e:#}; going on with {provider}:{model}"), Value::Null);
-                self.switch(&provider, &model)?;
-                return Ok(None);
-            }
             Err(e) if state.retries < 2 && llm::lost(&e).is_some_and(|l| !l.stalled) => {
                 (state.spent, state.retries) = (state.spent + self.sent(), state.retries + 1);
                 self.retry("was lost: the provider cut the stream")?;
                 return Ok(None);
             }
-            // Its usage never came, so the event carries an estimate for /cost: what was sent, cached as far as the last
-            // request went, and the reasoning's bytes / 4 out. Like an empty reply it is dropped and the model asked
-            // to act.
+            // Its usage never came, so the event carries an estimate for the totals: what was sent, cached as far as
+            // the last request went, and the reasoning's bytes / 4 out. Like an empty reply it is dropped and the
+            // model asked to act.
             Err(ref e) if let Some(llm::Looping(lost)) = e.downcast_ref() => {
                 let (sent, out) = (self.sent(), lost.thinking.len() as u64 / 4);
                 let cached = self.session.last_prompt_tokens().min(sent);
@@ -710,8 +669,6 @@ impl Agent {
                 let extra =
                     json!({"meta": {"usage": meta["usage"], "timing": meta["timing"]}, "finish": meta["finish"]});
                 ui::event("empty", "the model sent an empty reply; asking it to act", extra);
-                let thinking = message["reasoning_content"].as_str().unwrap_or_default();
-                self.discard("the reply was empty", thinking);
                 self.retry("was empty")?;
             } else {
                 ui::event("length", "the reply hit the output limit; asking the model to continue", Value::Null);
@@ -817,10 +774,9 @@ impl Agent {
             }
             checked = ok;
         }
-        // Nothing has run the report's claims, so a second look reads the code for them, when the model asked for one with
-        // look(). What it finds contradicted goes back to the model once, and a second look at the answer checks those
-        // claims again; the others stand.
-        if changed && !checked && !state.stalled && !asked(&self.session.entries[began..]).is_empty() {
+        // Nothing has run the report's claims, so a second look reads the code for them. What it finds contradicted goes
+        // back to the model once, and a second look at the answer checks those claims again; the others stand.
+        if changed && !checked && !state.stalled {
             let earlier = self.claims.take().filter(|_| state.refuted.is_some());
             let claims = self.look(state, start, began, earlier.as_ref()).await?;
             self.claims = match earlier {
@@ -839,13 +795,12 @@ impl Agent {
         Ok(Some((changed, checked)))
     }
 
-    /// A second look at the report of a turn that changed files with no check passing, where the model asked for one
-    /// with look(). The same model, in a conversation of its own that starts with the turn's system prompt and the brief
-    /// but has none of the turn's messages, checks the report's riskiest claims by reading the code in a worker that
-    /// can't change files. Its requests are logged as aside events: the turn's cost and /cost count them, the turn's
-    /// conversation never sees them. After the model was asked about the claims an `earlier` look found contradicted, it
-    /// checks those alone (RECHECK). None when it settled nothing: no report, an error, or no verdict even when its last
-    /// request was told to give one.
+    /// A second look at the report of a turn that changed files with no check passing. The same model, in a conversation
+    /// of its own that starts with the turn's system prompt and the brief but has none of the turn's messages, checks
+    /// the report's riskiest claims by reading the code in a worker that can't change files. Its requests are logged as
+    /// aside events: the turn's cost counts them, the turn's conversation never sees them. After the model was
+    /// asked about the claims an `earlier` look found contradicted, it checks those alone (RECHECK). None when it
+    /// settled nothing: no report, an error, or no verdict even when its last request was told to give one.
     async fn look(
         &mut self,
         state: &mut TurnState,
@@ -917,9 +872,8 @@ impl Agent {
         Ok(None)
     }
 
-    /// What a second look gets: the task with the user's steers, the criteria, why the model asked for it, what each of
-    /// the turn's runs edited and ran, the diff of the turn's own files (redacted, at most LOOK_DIFF bytes; outside git,
-    /// their names) and the report.
+    /// What a second look gets: the task with the user's steers, the criteria, what each of the turn's runs edited and
+    /// ran, the diff of the turn's own files (redacted, at most LOOK_DIFF bytes; outside git, their names) and the report.
     /// A RECHECK gets the claims found contradicted, and the runs and the diff since the tree and the entry it names.
     async fn brief(
         &self,
@@ -935,7 +889,6 @@ impl Agent {
             task += &format!("\n\n{}", text(&compact::wire(steer)));
         }
         let criteria = self.session.state().accepted.unwrap_or_else(|| "none set".into());
-        let why = asked(turn).iter().map(|w| format!("- {w}")).collect::<Vec<_>>().join("\n");
         let (from, after) = again.map_or((start, 0), |((tree, at), _)| (tree, at - began));
         let runs = turn.iter().enumerate().filter(|(_, e)| e["role"] == "tool").enumerate();
         let runs = runs.filter(|(_, (i, _))| *i >= after);
@@ -963,8 +916,8 @@ impl Agent {
                 )
             }
             None => format!(
-                "## Task\n{task}\n\n## Criteria\n{criteria}\n\n## Why the model asked for this look\n{why}\n\n\
-                 ## What the turn's runs did\n{order}\n{runs}\n\n## Diff\n{diff}\n\n## Report\n{report}"
+                "## Task\n{task}\n\n## Criteria\n{criteria}\n\n## What the turn's runs did\n{order}\n{runs}\n\n\
+                 ## Diff\n{diff}\n\n## Report\n{report}"
             ),
         }
     }
@@ -1031,13 +984,6 @@ impl Agent {
         (!files.is_empty()).then_some(files)
     }
 
-    /// The model profile's `fallback = "provider:model"`, when it names a configured provider other than the current one.
-    fn fallback(&self) -> Option<(String, String)> {
-        let (provider, model) = self.session.header()["fallback"].as_str()?.split_once(':')?;
-        let other = provider != self.provider || model != self.session.header()["model"];
-        (other && self.config.providers.contains_key(provider)).then(|| (provider.to_string(), model.to_string()))
-    }
-
     /// Names a file low itself rewrites between turns, such as a --tasks checklist, so the turns don't report it.
     pub fn quiet(&mut self, file: &Path) {
         let file = file.canonicalize().unwrap_or_else(|_| self.root.join(file));
@@ -1096,17 +1042,6 @@ impl Agent {
         ((system + summary + kept) / 4) as u64
     }
 
-    /// The session's budget (session_budget, in compact_at units) once its replies have spent it: no turn goes on then.
-    pub fn over_budget(&self) -> Option<u64> {
-        let total = self.session.header()["session_budget"].as_u64()?;
-        (self.spent() >= self.compact_at * total).then_some(total)
-    }
-
-    /// What the session's replies have spent, weighed as a turn's budget weighs them.
-    fn spent(&self) -> u64 {
-        self.session.spent()
-    }
-
     /// Logs a request that found less than half of the previous request's prompt in the provider's cache, with the cause
     /// when low knows it: a compaction, a model switch, or a new task.
     fn cache_miss(&self, usage: &Value) {
@@ -1152,12 +1087,6 @@ impl Agent {
         Ok(())
     }
 
-    fn discard(&mut self, why: &str, thinking: &str) {
-        if !thinking.trim().is_empty() {
-            self.discarded = Some((self.session.entries.len(), format!("*Discarded: {why}.*\n\n{thinking}")));
-        }
-    }
-
     /// Asks again after a reply that came back unusable: lost, empty, or cut off at the output limit.
     fn retry(&mut self, what: &str) -> Result<()> {
         let content = format!("Your last reply {what}. {RETRY}");
@@ -1186,8 +1115,7 @@ impl Agent {
     /// Asks the model, once, where the work stands after a turn-scoped limit stopped the turn, and keeps its reply as
     /// the turn's answer. No code runs: a run() in the reply gets NOT_RUN for its result. An unusable reply or an error
     /// leaves the turn without a handoff, as it was before low asked for one; an empty one leaves request()'s nudge to
-    /// act behind it. Its request counts toward session_budget, so a session that had only that much left gives a
-    /// --tasks task no extra turn.
+    /// act behind it.
     async fn handoff(&mut self, state: &mut TurnState) -> Result<()> {
         ui::show("asking the model where the work stands; no more code runs this turn");
         self.host(HANDOFF.into())?;
@@ -1346,10 +1274,10 @@ impl Agent {
     }
 
     /// A run's search() and fetch() requests, made here since the sandbox has no network: DeepSeek's tools API, with the
-    /// provider that config.toml's search names, WEB_AT_ONCE at a time. The answer is each request's [ok, response or
-    /// why it failed], in the order asked.
+    /// SEARCH provider's key, WEB_AT_ONCE at a time. The answer is each request's [ok, response or why it failed], in
+    /// the order asked.
     async fn web(&mut self, requests: &[Value]) -> String {
-        let provider = self.config.search.as_ref().and_then(|name| self.config.providers.get(name));
+        let provider = self.config.providers.get(SEARCH);
         let provider = provider.map(|p| (p.base_url.clone(), p.api_key.clone()));
         let _busy = ui::busy(&match requests {
             [one] => format!("{} on the web", if one["fetch"].is_string() { "fetching" } else { "searching" }),
@@ -1391,8 +1319,8 @@ impl Agent {
                     let result = match &provider {
                         Some((base, key)) => llm::tool(base, key.as_deref(), tool, body).await,
                         None => Err(anyhow::anyhow!(
-                            "{}; low reads that only through DeepSeek's tools API, and config.toml's search names no \
-                             provider",
+                            "{}; low reads that only through DeepSeek's tools API, and providers.toml has no \
+                             [deepseek] provider",
                             elsewhere.as_deref().unwrap_or_default()
                         )),
                     };
@@ -1735,49 +1663,7 @@ impl Agent {
             .await?)
     }
 
-    pub fn cost(&self) {
-        let t = crate::stats::totals(&self.session.entries);
-        let tokens = &t["tokens"];
-        println!(
-            "{} requests · in {} (cached {}) · out {}",
-            t["requests"], tokens["prompt"], tokens["cached"], tokens["out"]
-        );
-        let asides: Vec<Value> = self.session.entries.iter().filter(|e| e["meta"]["aside"] == true).cloned().collect();
-        if !asides.is_empty() {
-            let a = crate::stats::totals(&asides);
-            let tokens = &a["tokens"];
-            println!(
-                "of which {} for second looks at claims · in {} (cached {}) · out {}",
-                a["requests"], tokens["prompt"], tokens["cached"], tokens["out"]
-            );
-        }
-        println!(
-            "{} runs · {} rejected before acting (syntax, unknown name, wrong arguments)",
-            t["runs"], t["rejected"]
-        );
-    }
-
-    pub fn think(&self) {
-        let mut entries = self.session.entries.iter().enumerate().rev();
-        let stored =
-            entries.find_map(|(i, e)| e["reasoning_content"].as_str().filter(|r| !r.is_empty()).map(|r| (i, r)));
-        let last = match (&self.discarded, stored) {
-            (Some((at, lost)), stored) if stored.is_none_or(|(i, _)| *at > i) => Some(lost.as_str()),
-            (_, stored) => stored.map(|(_, r)| r),
-        };
-        let mut markdown = crate::render::Markdown::default();
-        markdown.push(last.unwrap_or("no reasoning recorded yet"));
-        markdown.finish();
-    }
-
-    /// /compact: compacts the context now and says what it did.
-    pub fn compact(&mut self) -> Result<()> {
-        let done = self.compact_to(self.compact_at as usize / 5, false)?;
-        ui::note(&done);
-        self.session.flush()
-    }
-
-    /// Compacts the context and returns what it did, for /compact to show and for a compaction low decided on to log.
+    /// Compacts the context and returns what it did, for the log.
     fn compact_to(&mut self, keep_tokens: usize, whole: bool) -> Result<String> {
         let prev = self.session.keep();
         let keep = compact::cut(&self.session.entries, prev, keep_tokens, whole);
@@ -1805,7 +1691,7 @@ impl Drop for Group {
 fn web(name: &str, base_url: &str) -> Result<()> {
     anyhow::ensure!(
         crate::providers::web_url(base_url),
-        "provider {name}: base_url {} is not an http(s) URL (/providers changes it)",
+        "provider {name}: base_url {} is not an http(s) URL; fix it in ~/.config/low/providers.toml",
         ui::printable(base_url)
     );
     Ok(())
@@ -1836,11 +1722,11 @@ fn connect(providers: &Providers, session: &Session) -> Result<(String, Llm)> {
         .or(fallback)
         .with_context(|| format!("no provider: {}", crate::providers::example(model)))?;
     match recorded {
-        Some(old) if old != name => {
-            ui::note(&format!("provider {old} is gone; sending {model} to {name} (/model or /providers changes it)"))
-        }
+        Some(old) if old != name => ui::note(&format!(
+            "provider {old} is gone; sending {model} to {name} (/model or providers.toml changes it)"
+        )),
         None if listed.is_none() && providers.len() > 1 => {
-            ui::note(&format!("no provider lists {model}; using {name} (/model or /providers changes it)"))
+            ui::note(&format!("no provider lists {model}; using {name} (/model or providers.toml changes it)"))
         }
         _ => {}
     }
@@ -1980,7 +1866,7 @@ async fn grouped(mut cmd: tokio::process::Command) -> Result<(bool, String)> {
 /// The exit status for an error, as low gives it for a turn's outcome: see outcome().
 pub const ERROR: i64 = 3;
 
-/// The reasoning efforts /effort and --effort set, sent as the request's reasoning_effort. DeepSeek knows low, high
+/// The reasoning efforts --effort and /models set, sent as the request's reasoning_effort. DeepSeek knows low, high
 /// and max, and runs medium and xhigh as high; other providers may tell them apart.
 pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
@@ -2229,8 +2115,6 @@ struct TurnState {
     /// The model was asked about claims a second look found the code contradicts: the tree then, and the entry its
     /// answer starts at.
     refuted: Option<(String, usize)>,
-    /// The turn went on with the profile's fallback provider.
-    failed_over: bool,
     /// Tokens spent, cached input counting a quarter.
     spent: u64,
     /// The model was told the turn has used three quarters of its budget.
@@ -2259,7 +2143,7 @@ impl TurnState {
 
 /// What a reply counts against a budget: cached input is billed at a fraction of fresh input, so a long, well-cached
 /// session isn't stopped for re-sending its own context.
-pub fn weighted(meta: &Value) -> u64 {
+fn weighted(meta: &Value) -> u64 {
     let usage = &meta["usage"];
     let attempts = meta["timing"]["attempts"].as_u64().unwrap_or(1).max(1);
     let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
@@ -2419,11 +2303,6 @@ fn changed_path(line: &str) -> Option<String> {
     let marks = [" (new)", " (deleted)", " (binary)", " (ignored by git)"];
     let marked = marks.iter().find_map(|mark| line.strip_suffix(mark));
     marked.or_else(|| line.rsplit_once(" +").map(|(path, _)| path)).map(String::from)
-}
-
-/// What the turn's look() calls gave as the reason to check its claims, in order: none when it asked for no second look.
-fn asked(turn: &[Value]) -> Vec<&str> {
-    turn.iter().filter_map(|e| e["meta"]["look"].as_str()).collect()
 }
 
 fn edited(meta: &Value) -> bool {

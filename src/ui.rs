@@ -142,7 +142,7 @@ impl Steer {
         }
     }
 
-    /// The lines sent before the first command, as one message: a command (/cost, /models) waits for the turn to end.
+    /// The lines sent before the first command, as one message: a command (/models) waits for the turn to end.
     fn take(&mut self) -> Option<String> {
         let lines = self.sent.iter().position(|l| command(l)).unwrap_or(self.sent.len());
         (lines > 0).then(|| self.sent.drain(..lines).collect::<Vec<_>>().join("\n"))
@@ -1121,10 +1121,10 @@ mod tests {
 
     #[test]
     fn typing_sends_lines_and_takes_one_back() {
-        let mut steer = typed(b"use tabsx\x7f\r  \r\x15gone\x15/cost\rand tests\rhalf");
+        let mut steer = typed(b"use tabsx\x7f\r  \r\x15gone\x15/models\rand tests\rhalf");
         assert_eq!(
             (&steer.sent[..], steer.typing.as_str()),
-            (&["use tabs", "/cost", "and tests"].map(String::from)[..], "half")
+            (&["use tabs", "/models", "and tests"].map(String::from)[..], "half")
         );
         steer.typing.clear();
         steer.key(Key::Up);
@@ -1136,19 +1136,19 @@ mod tests {
 
     #[test]
     fn a_command_waits_for_the_lines_before_it() {
-        let mut steer = typed(b"one\r/src/main.rs too\r/cost\rthree\r");
+        let mut steer = typed(b"one\r/src/main.rs too\r/models\rthree\r");
         assert_eq!(steer.take().as_deref(), Some("one\n/src/main.rs too"));
         assert_eq!(steer.take(), None);
-        assert_eq!(steer.sent, ["/cost", "three"]);
+        assert_eq!(steer.sent, ["/models", "three"]);
     }
 
     #[test]
     fn a_paste_is_one_message_however_many_lines() {
-        let mut steer = typed(b"\x1b[200~fix this:\r\n\tfn f() {\r\n\r\n/cost\x1b[201~");
+        let mut steer = typed(b"\x1b[200~fix this:\r\n\tfn f() {\r\n\r\n/models\x1b[201~");
         let row = steer.row(60);
-        assert!(row.ends_with("fix this:⏎ fn f() {⏎⏎/cost▏") && !row.contains(['\n', '\t']), "{row:?}");
+        assert!(row.ends_with("fix this:⏎ fn f() {⏎⏎/models▏") && !row.contains(['\n', '\t']), "{row:?}");
         steer.key(Key::Enter);
-        assert_eq!(steer.take().as_deref(), Some("fix this:\n\tfn f() {\n\n/cost"));
+        assert_eq!(steer.take().as_deref(), Some("fix this:\n\tfn f() {\n\n/models"));
         // Only the blank lines around it go: the first line keeps its indentation, as the others do.
         let mut steer = typed(b"\x1b[200~\r\n  \r\n    def f():\r\n        pass\r\n\r\n\x1b[201~\r");
         assert_eq!(steer.take().as_deref(), Some("    def f():\n        pass"));
@@ -1161,7 +1161,7 @@ mod tests {
             let first = parts.next().unwrap_or_default().to_string();
             first + &parts.map(|p| p.split_once('m').map_or(p, |(_, rest)| rest)).collect::<String>()
         };
-        for bytes in [&b""[..], b"queued\r", b"/cost\r", "a long line with 漢字 in it ".repeat(9).as_bytes()] {
+        for bytes in [&b""[..], b"queued\r", b"/models\r", "a long line with 漢字 in it ".repeat(9).as_bytes()] {
             let steer = typed(bytes);
             for cols in [20, 41, 100] {
                 let row = plain(steer.row(cols));

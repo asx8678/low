@@ -65,7 +65,7 @@ r.send(['/models\r'], wait='esc cancel')
 r.send([UP, LEFT, ESC])
 r.send(['/models\r'], wait='esc cancel')
 r.send([UP, '\x03'])
-r.send(['/cost\r'], wait='› ')
+r.send(['\r'], wait='› ')
 check('Esc and Ctrl-C change nothing', len(switches()) == count, switches()[count:])
 
 r.send(['/models\r'], wait='esc cancel')

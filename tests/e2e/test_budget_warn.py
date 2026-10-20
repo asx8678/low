@@ -1,8 +1,7 @@
 """Once a turn has used three quarters of its budget, the model is told about how many requests it has left, once, and
 asked to spend them on the change, not to end the turn; the limit still stops the turn. A turn-scoped limit then gets
 one last request for a handoff, with no code run, which becomes the turn's answer: a --tasks task cut off while still
-changing files keeps its extra turns, and starts them from that answer. The session's budget, a cap on spending, gets
-no handoff."""
+changing files keeps its extra turns, and starts them from that answer."""
 import os
 from harness import Env, check, done, user_messages
 
@@ -60,10 +59,7 @@ calls = [c['id'] for m in last if m['role'] == 'assistant' for c in m.get('tool_
 answered = {m['tool_call_id'] for m in last if m['role'] == 'tool'}
 check('the next turn answers every call', r['code'] == 0 and set(calls) <= answered, (r['code'], calls, answered))
 
-# The session's budget gets no handoff. (MAX_REQUESTS's note and handoff are in test_slow_requests.py.)
-e = Env([{'code': "write('t1.txt', '1\\n')"}, {'content': 'never'}], profile=PROFILE + 'session_budget = 1\n')
-r = e.low('--json', 'write')
-check('session_budget: no handoff', len(r['requests']) == 1 and r['code'] == 5, len(r['requests']))
+# MAX_REQUESTS's note and handoff are in test_slow_requests.py.
 
 # --tasks: a task still writing files when the ceiling stops it gets its handoff, then its extra turn as before, and
 # the extra turn has the handoff in its context.

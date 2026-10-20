@@ -7,7 +7,7 @@ from harness import LOW, Env, check, done
 
 SLEEP = "import time\ntime.sleep({})\nprint('slept')"
 e = Env([
-    {'code': SLEEP.format(4)}, {'content': 'done first'},  # first, steered during the run, then /cost
+    {'code': SLEEP.format(4)}, {'content': 'done first'},  # first, steered during the run, then /models
     {'content': 'final', 'delay': 3}, {'content': 'ok next'},  # second; next thing, sent during its final reply
     {'code': SLEEP.format(3)}, {'content': 'done third'}, {'content': 'ok half'},  # third; half done, typed unsent
     {'code': SLEEP.format(30)}, {'content': 'ok redo'},  # fourth, interrupted; redo it, sent before the Ctrl-C
@@ -67,18 +67,18 @@ r = Repl()
 r.until('› ')
 r.send('first\r', wait='step 1 running')
 shown = r.send('use tabs\r', wait='queued: use tabs')
-shown += r.send('/cost\r', wait='/cost runs when the turn ends')
+shown += r.send('/models\r', wait='/models runs when the turn ends')
 check('the row above the bar says how to steer, then what is queued',
-      'type to steer the model' in r.out and 'queued: use tabs' in shown and '/cost runs' in shown, shown[-800:])
-after = plain(r.until('requests · in'))
+      'type to steer the model' in r.out and 'queued: use tabs' in shown and '/models runs' in shown, shown[-800:])
+after = plain(r.until('esc cancel'))
 sent = requests(2)[1]['body']['messages']
 check('the steer goes with the next request, after the run\'s result',
       [m['role'] for m in sent[-2:]] == ['tool', 'user'] and sent[-1]['content'] == '[Steered by the user]\nuse tabs', sent[-3:])
 check('it shows where the model got it, and the command runs when the turn ends',
-      '› use tabs' in plain(r.out) and 'requests · in' in after, after[-600:])
+      '› use tabs' in plain(r.out) and 'esc cancel' in after, after[-600:])
 check('a steer is logged as one, and is no new task', ('use tabs', True) in users(), users())
 
-r.until('› ', start=r.out.rindex('requests · in'))
+r.send('\x1b', wait='› ')
 r.send('second\r')
 requests(3)
 r.send('next thing\r', wait='ok next')

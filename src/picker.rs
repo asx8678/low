@@ -494,8 +494,8 @@ mod tests {
 
     #[test]
     fn a_paste_is_one_key_and_waits_for_its_end() {
-        let paste = b"a\x1b[200~fn f() {\r\n\tx\r\n\r\n/cost\x1b[2J\x1b[201~\r";
-        let text = "fn f() {\n\tx\n\n/cost[2J".to_string();
+        let paste = b"a\x1b[200~fn f() {\r\n\tx\r\n\r\n/models\x1b[2J\x1b[201~\r";
+        let text = "fn f() {\n\tx\n\n/models[2J".to_string();
         assert_eq!(keys(paste), [Key::Char('a'), Key::Paste(text), Key::Enter]);
         for cut in [9, 20, paste.len() - 4] {
             assert!(incomplete(&paste[..cut]) && pasting(&paste[..cut]), "{cut}");

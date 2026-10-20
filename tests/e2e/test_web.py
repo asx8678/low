@@ -24,7 +24,7 @@ for url in ("https://example.org/made-up", "http://registry.npmjs.org/three/late
     except RuntimeError as e:
         print("refused", url, "|", e)
 '''
-e = Env([{'code': CODE}, {'content': 'done'}], config='search = "mock"')
+e = Env([{'code': CODE}, {'content': 'done'}], search=True)
 r = e.low('--json', 'which three.js is latest?')
 out = (e.tools() or [''])[-1]
 line = lambda start: next((l for l in out.splitlines() if l.startswith(start)), '')

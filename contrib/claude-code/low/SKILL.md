@@ -56,7 +56,7 @@ low --send --json "next task"
 low --send /stop                     # ends the server
 ```
 
-While it waits, the server re-sends the conversation every `keep_warm` seconds (default 600) so the next task's prompt stays cached, and stops an hour after the last task. Start the server without a task when scripting: a task given to `--serve` itself has no completion signal. `--send --session ID` targets one server when several run. `--send` waits as long as the task runs: like a one-shot task, run a long one with `run_in_background`. Killing `--send`, or a `timeout` around it, stops only the waiting: the server finishes the task, and the session log has its turn.
+While it waits, the server re-sends the conversation every 10 minutes so the next task's prompt stays cached, and stops an hour after the last task. Start the server without a task when scripting: a task given to `--serve` itself has no completion signal. `--send --session ID` targets one server when several run. `--send` waits as long as the task runs: like a one-shot task, run a long one with `run_in_background`. Killing `--send`, or a `timeout` around it, stops only the waiting: the server finishes the task, and the session log has its turn.
 
 ## Task lists
 
@@ -79,7 +79,7 @@ low marks each line `[x]` done, `[!]` not verified or `[?]` asked a question, wr
 
 ## Web search
 
-Inside a task, low's model can always call `fetch(url)` on package registries, CDNs and docs hosts (npm, PyPI, crates.io, docs.rs, GitHub's API and raw files, jsDelivr, unpkg, cdnjs, and the Rust, Python and MDN docs): low fetches those itself, with no setup. `search(query)`, and `fetch(url)` of any other page, go through DeepSeek's search API: they need a `[deepseek]` provider with an API key in providers.toml, or `search = "<provider>"` in `~/.config/low/config.toml` naming one, and without it `search()` is not offered. Off those hosts, `fetch(url)` takes only a URL that a `search()` returned or that the task text gives, so put a URL in the task when low should read a specific page.
+Inside a task, low's model can always call `fetch(url)` on package registries, CDNs and docs hosts (npm, PyPI, crates.io, docs.rs, GitHub's API and raw files, jsDelivr, unpkg, cdnjs, and the Rust, Python and MDN docs): low fetches those itself, with no setup. `search(query)`, and `fetch(url)` of any other page, go through DeepSeek's search API: they need a `[deepseek]` provider with an API key in providers.toml, and without it `search()` is not offered. Off those hosts, `fetch(url)` takes only a URL that a `search()` returned or that the task text gives, so put a URL in the task when low should read a specific page.
 
 ## Rules
 

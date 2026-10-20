@@ -37,8 +37,6 @@ struct Marks {
     /// The newest task: a user message that is not from low and does not steer a turn.
     task: Option<usize>,
     state: State,
-    /// What the replies have spent, weighed as a turn's budget weighs them.
-    spent: u64,
     /// The folders' instructions (AGENTS.md) runs have shown, each with the entry of the run that showed it.
     guides: Vec<(usize, String)>,
 }
@@ -68,9 +66,6 @@ impl Marks {
         }
         if meta["plan"].is_object() {
             self.state.plan = meta["plan"].clone();
-        }
-        if entry["role"] == "assistant" || meta["aside"] == true {
-            self.spent += crate::agent::weighted(meta);
         }
         if entry["role"] == "tool" {
             let shown = meta["guides"].as_array().into_iter().flatten().filter_map(Value::as_str);
@@ -230,11 +225,6 @@ impl Session {
         self.marks.task
     }
 
-    /// What the session's replies have spent, weighed as a turn's budget weighs them.
-    pub fn spent(&self) -> u64 {
-        self.marks.spent
-    }
-
     /// The prompt size the provider last reported; 0 once a compaction since then has made it stale.
     pub fn last_prompt_tokens(&self) -> u64 {
         let current = self.entries.iter().rev().take_while(|e| e["compact"].is_null());
@@ -338,17 +328,14 @@ fn stamp(entry: &mut Value, at: u64) {
 }
 
 fn settings(provider: &str, model: &str, system: &str, mut params: Map<String, Value>) -> Value {
-    let (compact_at, keep_warm) = (params.remove("compact_at"), params.remove("keep_warm"));
-    let (turn_budget, fallback) = (params.remove("turn_budget"), params.remove("fallback"));
-    let session_budget = params.remove("session_budget");
+    let compact_at = params.remove("compact_at");
     // temperature = false in a model's profile sends none, for models that refuse the field.
     if params.get("temperature") == Some(&Value::Bool(false)) {
         params.remove("temperature");
     } else {
         params.entry("temperature").or_insert(crate::llm::TEMPERATURE.into());
     }
-    json!({"provider": provider, "model": model, "params": params, "compact_at": compact_at, "keep_warm": keep_warm,
-           "turn_budget": turn_budget, "session_budget": session_budget, "fallback": fallback, "system": system})
+    json!({"provider": provider, "model": model, "params": params, "compact_at": compact_at, "system": system})
 }
 
 fn answer_missing(out: &mut Vec<Value>, open: &mut Vec<Value>) {
@@ -440,7 +427,6 @@ mod tests {
             .unwrap();
         session.push(json!({"role": "user", "content": "use tabs", "meta": {"steer": true}})).unwrap();
         assert_eq!((session.state().accepted.as_deref(), session.newest_task()), (Some("done"), Some(7)));
-        assert_eq!(session.spent(), 3020);
         // The folders' instructions runs showed stay known across tasks, until a compaction drops their runs.
         assert_eq!(session.guides(), ["pkg/AGENTS.md", "pkg/sub/AGENTS.md"]);
         session.switch("p", "m2", "sys2", Map::new()).unwrap();
@@ -458,11 +444,10 @@ mod tests {
             .unwrap();
         assert_eq!(session.guides(), ["lib/AGENTS.md"]);
         let messages = session.messages();
-        let live = (messages, session.header().clone(), session.keep(), session.compaction(), session.spent());
+        let live = (messages, session.header().clone(), session.keep(), session.compaction());
         drop(session);
         let session = resume(&home, &root);
-        let resumed =
-            (session.messages(), session.header().clone(), session.keep(), session.compaction(), session.spent());
+        let resumed = (session.messages(), session.header().clone(), session.keep(), session.compaction());
         assert_eq!(live, resumed);
         assert_eq!(session.guides(), ["lib/AGENTS.md"]);
         assert_eq!((resumed.1["model"].as_str(), resumed.2, resumed.3), (Some("m2"), 10, Some(11)));

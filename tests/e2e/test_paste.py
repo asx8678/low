@@ -41,7 +41,7 @@ def users():
     return [(x['content'], x.get('meta', {}).get('steer')) for x in e.log() if x.get('role') == 'user']
 
 
-PASTED = 'fix this:\n    indented\n\n/cost\n'
+PASTED = 'fix this:\n    indented\n\n/models\n'
 r = Repl()
 r.until('› ')
 shown = r.send('first\r', wait='step 1 running')
@@ -50,10 +50,10 @@ check('the turn has the terminal mark pastes', '\x1b[?2004h' in shown, shown[-40
 # sequence gets to finish.
 os.write(r.fd, b'\x1b[200~' + PASTED[:14].replace('\n', '\r').encode())
 r.until('\x00', timeout=0.5)
-shown = r.send(PASTED[14:].replace('\n', '\r') + '\x1b[201~', wait='/cost⏎▏')
+shown = r.send(PASTED[14:].replace('\n', '\r') + '\x1b[201~', wait='/models⏎▏')
 check('the paste stays on the row, unsent, its line breaks shown as ⏎',
-      'fix this:⏎    indented⏎⏎/cost⏎▏' in plain(shown) and 'queued' not in plain(shown), plain(shown)[-400:])
-r.send('\r', wait='queued: fix this: indented /cost')
+      'fix this:⏎    indented⏎⏎/models⏎▏' in plain(shown) and 'queued' not in plain(shown), plain(shown)[-400:])
+r.send('\r', wait='queued: fix this: indented /models')
 # Reading the terminal while the turn ends: low blocks on a full one.
 r.until('done first')
 sent = e.entries()[1]['body']['messages'] if len(e.entries()) > 1 else []
@@ -68,8 +68,8 @@ r.until('› ', start=back)
 time.sleep(1)
 r.until('\x00', timeout=0.3)
 check('the turn ends with the terminal no longer marking pastes', '\x1b[?2004l' in r.out[at:back], r.out[at:back][-300:])
-check('the /cost line went with the steer: nothing runs after the turn',
-      len(e.entries()) == 2 and 'requests · in' not in plain(r.out[back:]), (len(e.entries()), plain(r.out[back:])))
+check('the /models line went with the steer: nothing runs after the turn',
+      len(e.entries()) == 2 and 'esc cancel' not in plain(r.out[back:]), (len(e.entries()), plain(r.out[back:])))
 
 os.write(r.fd, b'\x04')
 r.until('\x00', timeout=5)

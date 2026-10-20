@@ -58,11 +58,6 @@ const LOOP_SHARE: f64 = 0.2;
 const CHUNK: &[&str] = &["choices", "object", "created", "usage", "error", "obfuscation"];
 const HEADERS: &[&str] = &["request-id", "cf-ray", "server", "via", "retry-after", "server-timing"];
 
-/// The provider refused for want of credit or quota on this key: retrying won't help, another provider might.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct Exhausted(String);
-
 /// The provider refused the request as too long; `window` is the context size its error states, if any.
 #[derive(Debug, thiserror::Error)]
 #[error("context window exceeded: {text}")]
@@ -249,8 +244,8 @@ impl Llm {
     }
 
     /// Sends reasoning back under the field this endpoint used last in the session, so that after a resume, a model
-    /// switch or an /effort the first request carries the same bytes as before (the prompt stays cached) and the field
-    /// the provider expects.
+    /// switch or an effort change the first request carries the same bytes as before (the prompt stays cached) and
+    /// the field the provider expects.
     pub fn recall(&self, entries: &[Value]) {
         let url = endpoint(&format!("{}/chat/completions", self.base));
         let mut ours = entries.iter().rev().filter(|e| e["meta"]["request"]["url"] == url.as_str());
@@ -516,10 +511,8 @@ impl Llm {
                     if status == 413 || !retryable && overflow(&text) {
                         return Err(ContextOverflow::new(format!("{status}: {text}")).into());
                     }
-                    if status == 402 || EXHAUSTED.iter().any(|e| text.to_lowercase().contains(e)) {
-                        return Err(Exhausted(format!("{status}: {text}")).into());
-                    }
-                    if !retryable {
+                    // Out of credit or quota on this key: retrying won't help.
+                    if !retryable || status == 402 || EXHAUSTED.iter().any(|e| text.to_lowercase().contains(e)) {
                         bail!("{status}: {text}")
                     }
                     (status.as_u16().to_string(), format!("{status}: {text}"), after)

@@ -161,12 +161,11 @@ pub async fn run(agent: &mut Agent, file: &Path) -> Result<Value> {
             _ => '!',
         };
         update(file, next.line, &next.text, mark, &summary(&result), &id)?;
-        // A task cut off by a turn limit that was still changing files continues in a fresh turn of the same session,
-        // unless the session has spent its budget.
+        // A task cut off by a turn limit that was still changing files continues in a fresh turn of the same session.
         let turn = result.turn.as_ref();
         let progressed = turn.is_some_and(|t| !t.changes.is_empty());
         let limited = result.status == "stopped" && turn.is_some_and(|t| t.limit.is_some());
-        let more = mark != 'x' && limited && progressed && again < AGAIN && agent.over_budget().is_none();
+        let more = mark != 'x' && limited && progressed && again < AGAIN;
         let stop = mark != 'x' && !more;
         again += usize::from(more);
         exit = result.exit;

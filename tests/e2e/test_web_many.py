@@ -24,7 +24,7 @@ except ValueError as e:
 print("empty", fetch([]), search(()))
 print("past 50", search.__globals__["_web"]([{"fetch": "https://registry.npmjs.org/three/latest"}] * 51)[49:])
 '''.replace('SLOW', repr(SLOW))
-e = Env([{'code': CODE}, {'content': 'done'}], config='search = "mock"')
+e = Env([{'code': CODE}, {'content': 'done'}], search=True)
 r = e.low('--json', 'read the release pages')
 out = (e.tools() or [''])[-1]
 line = lambda name: next((l for l in out.splitlines() if l.startswith(name + ' ')), '')

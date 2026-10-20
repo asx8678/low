@@ -927,10 +927,6 @@ def ask(question):
     _report["ask"] = str(question)
 
 
-def look(why):
-    _report["look"] = str(why)
-
-
 def _web(requests):
     # The sandbox has no network: the host makes the requests, several at once, and sends back each one's [ok, response
     # or why it failed], in order.
@@ -979,8 +975,7 @@ def fetch(url):
 
 
 TOOLS = {"sh": sh, "show": show, "edit": edit, "write": write, "undo": undo, "accept": accept, "plan": plan, "done": done,
-         "check": check, "finish": finish, "ask": ask, "look": look, "search": search, "fetch": fetch,
-         "recall": recall}
+         "check": check, "finish": finish, "ask": ask, "search": search, "fetch": fetch, "recall": recall}
 G = {"__name__": "__main__", **TOOLS}
 HELPERS = tuple(f"{name}()" for name in TOOLS)
 

@@ -21,7 +21,6 @@ plan(steps)                   # this task's steps, shown to the user; replaces a
 done(step=None) -> str|None   # mark a step done (default: current); returns the next step
 finish(report)                # end the turn with report as your final message, from the run that verifies (step 4)
 ask(question)                 # end the turn with a question for the user, only when you can't go on without the answer
-look(why)                     # when no check covers a change you aren't sure of, have a reader check your report against the code after you end
 search(query, count=10) -> list  # web search: [{title, url, summary, date, site_name}]; site:, "phrase", after:2025 work; query up to 128 chars, count up to 50
 fetch(url) -> str             # a web page as markdown, a text file (JSON, code) as text; a URL a search() returned or the task gives, or any URL on HOSTS, where text comes exactly as served
 search([query, ...]), fetch([url, ...]) -> list  # up to 50 at once, 10 at a time: the answers in order, a RuntimeError in place of each that failed

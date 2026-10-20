@@ -11,9 +11,10 @@ _envs, _failed = [], []
 
 
 class Env:
-    """One HOME, one repo and one mock serving `script` to every low run in it, in order."""
+    """One HOME, one repo and one mock serving `script` to every low run in it, in order. `search` adds the mock as
+    the [deepseek] provider that search() and fetch() go through."""
 
-    def __init__(self, script, files=None, profile='', config='', low_toml='', git=True):
+    def __init__(self, script, files=None, profile='', config='', low_toml='', git=True, search=False):
         self.dir = os.path.realpath(tempfile.mkdtemp(prefix='low-e2e-'))
         self.home, self.repo = os.path.join(self.dir, 'home'), os.path.join(self.dir, 'repo')
         os.makedirs(os.path.join(self.home, '.config/low'))
@@ -30,7 +31,8 @@ class Env:
         self.port = int(open(portfile).read())
         url = f'http://127.0.0.1:{self.port}/v1'
         self.write_home('.config/low/providers.toml', f'[mock]\nbase_url = "{url}"\napi_key = "{KEY}"\n'
-                        f'models = ["mock-model"]\n[spare]\nbase_url = "{url}"\napi_key = "{KEY}"\nmodels = ["spare-model"]\n')
+                        f'models = ["mock-model"]\n[spare]\nbase_url = "{url}"\napi_key = "{KEY}"\nmodels = ["spare-model"]\n'
+                        + (f'[deepseek]\nbase_url = "{url}"\napi_key = "{KEY}"\n' if search else ''))
         self.write_home('.config/low/config.toml', f'model = "mock-model"\n{config}\n[models."mock-model"]\n{profile}\n')
         for rel, text in (files if files is not None else {'README.md': 'hello\n'}).items():
             self.write(rel, text)
