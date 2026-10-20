@@ -2,9 +2,11 @@
 //! test target, then the first of Cargo.toml, package.json, a pytest setup, go.mod and mix.exs, each with its build and
 //! tests first and its build alone after. A new session runs them in that order on the tree as it finds it, before its
 //! system prompt is written, and adopts the first that passes: tests that already fail can't hold its verdicts, and a
-//! repository whose tests need a database it doesn't have still gets its build checked. check = "" in low.toml turns
-//! this off. In the session logs (2026-10-19), 508 of 709 real turns ended NO CHECK, 502 of them in one repository
-//! without a low.toml, where the model ran its type checker itself 34 times.
+//! repository whose tests need a database it doesn't have still gets its build checked. One that settled for less moves
+//! up to a fuller command once that passes on a turn's final tree, unless it ran out of time here: in 23 bench sessions
+//! (2026-10-20) whose tests failed as found, every verdict rested on `cargo build -q` alone. check = "" in low.toml
+//! turns this off. In the session logs (2026-10-19), 508 of 709 real turns ended NO CHECK, 502 of them in one
+//! repository without a low.toml, where the model ran its type checker itself 34 times.
 //!
 //! Each result is kept for an hour in ~/.low/checks, by tree and command, behind a lock: lows started together in one
 //! tree, as --tasks batches are, wait for one baseline and reuse it instead of each running their own.
@@ -18,9 +20,13 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// How long a baseline may run: a check slower than this would be slow at every turn's end too, so the build alone,
-/// next in line, is tried instead.
-const TIMEOUT: Duration = Duration::from_mins(5);
+/// How long a baseline may run, and a fuller command a session moves up to: a check slower than this would be slow at
+/// every turn's end too, so the build alone, next in line, is tried instead.
+pub const TIMEOUT: Duration = Duration::from_mins(5);
+/// Whether a command ran out of time, from what trial() gives in place of its output then.
+pub fn timed_out(out: &str) -> bool {
+    out.starts_with("timeout after ")
+}
 /// How long another low's baseline on the same tree is reused.
 const FRESH_MS: u64 = 3_600_000;
 /// Baselines kept per repository.
@@ -143,8 +149,20 @@ pub struct Detected {
     pub check: Option<String>,
     /// The commands that failed on the tree as found, fullest first.
     pub failed: Vec<String>,
+    /// Those of them that ran out of time, as found or at a turn's end: too slow for every turn's end, so the check
+    /// never moves up to them.
+    pub slow: Vec<String>,
     /// The tree the adopted command passed on and its output, so a check() before any change reuses the pass.
     pub passed: Option<(String, String)>,
+}
+
+impl Detected {
+    /// What a session that checks with `check` may move up to on a turn's final tree, fullest first: the commands
+    /// fuller than it that failed on the tree as found, but not for time.
+    pub fn fuller(&self, check: &str) -> Vec<String> {
+        let fuller = self.failed.iter().take_while(|c| *c != check);
+        fuller.filter(|c| !self.slow.contains(c)).cloned().collect()
+    }
 }
 
 /// Runs the candidates on the tree as found, fullest first, and adopts the first that passes. None when the repository
@@ -234,6 +252,9 @@ async fn run(root: &Path, dir: &Path, index: &Path, yolo: bool, candidates: &[Ca
             ui::note(&format!("check: `{shown}` failed on the tree as found: {}", reason(&out)));
         }
         detected.failed.push(command.clone());
+        if timed_out(&out) {
+            detected.slow.push(command.clone());
+        }
     }
     if detected.check.is_none() {
         ui::note(
@@ -295,7 +316,7 @@ fn reason(out: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidate, candidates, reason};
+    use super::{Candidate, Detected, candidates, reason};
     use std::path::{Path, PathBuf};
 
     fn repo(name: &str, files: &[(&str, &str)]) -> PathBuf {
@@ -395,6 +416,18 @@ mod tests {
                 assert_eq!(crate::redact::redact(&command).0, command);
             }
         }
+    }
+
+    /// A session moves up only to a command fuller than the one it checks with, and never to one that ran out of time.
+    #[test]
+    fn moving_up() {
+        let failed = ["make check", "cargo build -q && cargo test -q"].map(String::from).to_vec();
+        let detected = Detected { failed: failed.clone(), ..Default::default() };
+        assert_eq!(detected.fuller("cargo build -q"), failed);
+        assert_eq!(detected.fuller("cargo build -q && cargo test -q"), ["make check"]);
+        assert!(detected.fuller("make check").is_empty());
+        let slow = Detected { slow: vec!["make check".into()], ..detected };
+        assert_eq!(slow.fuller("cargo build -q"), ["cargo build -q && cargo test -q"]);
     }
 
     #[test]

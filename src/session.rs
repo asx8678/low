@@ -124,12 +124,12 @@ impl Session {
     }
 
     /// The newest session of this repository, or the one `id` names (its id, or its log's path). `context` gives what
-    /// the resume entry records, from the session's header.
+    /// the resume entry records, from the session's entries: its header, then what happened since.
     pub fn resume(
         home: &Path,
         root: &Path,
         id: Option<&str>,
-        context: impl FnOnce(&Value) -> Map<String, Value>,
+        context: impl FnOnce(&[Value]) -> Map<String, Value>,
     ) -> Result<Self> {
         let id = id.map(|id| Path::new(id).file_stem().and_then(|s| s.to_str()).unwrap_or(id));
         sweep(&home.join(".low/sessions"));
@@ -171,7 +171,7 @@ impl Session {
                 let mut marks = Marks::default();
                 entries.iter().enumerate().for_each(|(i, entry)| marks.add(i, entry));
                 let mut session = Self { file, path, entries, opened, marks };
-                let context = context(&session.entries[0]);
+                let context = context(&session.entries);
                 session.push(json!({"resume": context}))?;
                 return Ok(session);
             }

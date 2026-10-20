@@ -1,4 +1,4 @@
-use crate::detect::Detected;
+use crate::detect::{self, Detected};
 use crate::fetch::{self, Fetched};
 use crate::git::{changes, git, guard_git, snapshot};
 use crate::llm::{self, Llm};
@@ -219,8 +219,8 @@ impl Agent {
         guard_git(root);
         ui::rooted(root);
         let session = if resume || id.is_some() {
-            Session::resume(home, root, id, |header| {
-                adopt(&mut config, header);
+            Session::resume(home, root, id, |entries| {
+                adopt(&mut config, entries);
                 context(root, &config, yolo)
             })?
         } else {
@@ -520,6 +520,12 @@ impl Agent {
             ui::record("moved", &moved, Value::Null);
             self.session.push(json!({"role": "user", "content": format!("[{moved}]"), "meta": {"host": true}}))?;
         }
+        // The system prompt names the check the session started with.
+        if let Some(check) = self.moved_check(began) {
+            let text =
+                format!("[check() now runs `{}`, which passed on the tree your last turn left.]", redact(&check).0);
+            self.session.push(json!({"role": "user", "content": text, "meta": {"host": true, "moved_up": check}}))?;
+        }
         let mut state = TurnState::default();
         let ceiling = self.compact_at * TURN_BUDGET;
         let rule = "cached input counts a quarter";
@@ -773,6 +779,9 @@ impl Agent {
                 return Ok(None);
             }
             checked = ok;
+            if ok {
+                self.move_up().await;
+            }
         }
         // Nothing has run the report's claims, so a second look reads the code for them. What it finds contradicted goes
         // back to the model once, and a second look at the answer checks those claims again; the others stand.
@@ -1428,6 +1437,61 @@ impl Agent {
         let ms = ui::ms(clock);
         ui::log(json!({"check": {"ok": ok, "gate": gate, "ms": ms, "out": compact::tail(&out, 1500)}}));
         (ok, out)
+    }
+
+    /// A detected check that settled for less, because a fuller command failed on the tree as found, moves up to the
+    /// fullest one that passes on a turn's final tree, so later verdicts rest on it: the tests, say, not the build
+    /// alone. Each try is logged; one that fails changes nothing, and the next turn's end tries it again unless it ran
+    /// out of time.
+    async fn move_up(&mut self) {
+        let (Some(detected), Some(check)) = (&self.config.detected, &self.config.check) else { return };
+        let (fuller, kept) = (detected.fuller(check), detected.from.clone());
+        // Where each comes from, for the check row: a Makefile's target is fuller than the manifest's tests.
+        let found = if fuller.is_empty() { vec![] } else { detect::candidates(&self.root) };
+        for command in fuller {
+            let from = found.iter().find(|c| c.command == command).map_or(kept.clone(), |c| c.from.into());
+            ui::activity(&format!("trying `{}` on the final tree", ui::printable(&command)));
+            let clock = Instant::now();
+            let before = self.tree().await;
+            let index = self.session.index();
+            let (ok, out, after) =
+                trial(&self.root, &index, self.repo, self.yolo, &command, &before, detect::TIMEOUT).await;
+            let (ms, tail) = (ui::ms(clock), compact::tail(&out, 1500));
+            let mut entry = json!({"ok": ok, "fuller": true, "check": command, "from": from, "ms": ms, "out": tail});
+            // Too slow for every turn's end, so it isn't tried again, here or after a resume.
+            if detect::timed_out(&out) {
+                entry["slow"] = true.into();
+                if let Some(detected) = &mut self.config.detected {
+                    detected.slow.push(command.clone());
+                }
+            }
+            ui::log(json!({"check": entry}));
+            if ok {
+                let shown = ui::printable(&command);
+                ui::note(&format!(
+                    "check: `{shown}` passes on the final tree, so this session checks with it from now on"
+                ));
+                self.passed = after.ok().map(|tree| (tree, out));
+                self.config.check = Some(command);
+                if let Some(detected) = &mut self.config.detected {
+                    detected.from = from;
+                }
+                return;
+            }
+        }
+    }
+
+    /// The check a turn's end moved up to, if the model hasn't heard of it: no note telling of a move came after the
+    /// newest one.
+    fn moved_check(&self, began: usize) -> Option<String> {
+        let detected = self.config.detected.as_ref()?;
+        if detected.check == self.config.check {
+            return None;
+        }
+        let moved = |e: &Value| e["check"]["fuller"] == true && e["check"]["ok"] == true;
+        let told = |e: &Value| e["meta"]["moved_up"].is_string();
+        let newest = self.session.entries[..began].iter().rev().find(|e| moved(e) || told(e))?;
+        moved(newest).then(|| self.config.check.clone()).flatten()
     }
 
     /// The working tree as a git tree id. Git runs on the blocking pool, so Ctrl-C and the status bar stay live
@@ -2223,21 +2287,38 @@ fn context(root: &Path, config: &Config, yolo: bool) -> serde_json::Map<String, 
         "check": config.check.as_deref().map(|c| redact(c).0), "fmt": config.fmt.as_deref().map(|f| redact(f).0),
     });
     let mut context = context.as_object().cloned().unwrap_or_default();
-    // Where a detected check came from, and what failed on the tree as found: a resumed session keeps that decision.
+    // Where a detected check came from, what failed on the tree as found and what of that ran out of time: a resumed
+    // session keeps that decision.
     if let Some(detected) = &config.detected {
         context.insert("check_from".into(), detected.from.clone().into());
         context.insert("check_failed".into(), detected.failed.iter().map(|c| redact(c).0).collect());
+        context.insert("check_slow".into(), detected.slow.iter().map(|c| redact(c).0).collect());
     }
     context
 }
 
-/// A resumed session keeps the check its start detected, as its system prompt says, unless low.toml now names one or
-/// turns detection off; the tree may have moved since, so its baseline's pass isn't reused.
-fn adopt(config: &mut Config, header: &Value) {
+/// A resumed session keeps the check its start detected, as its system prompt says, or the one a turn's end moved up to
+/// since, unless low.toml now names one or turns detection off; the tree may have moved since, so its baseline's pass
+/// isn't reused.
+fn adopt(config: &mut Config, entries: &[Value]) {
+    let header = &entries[0];
     let Some(from) = header["check_from"].as_str().filter(|_| config.detect && config.check.is_none()) else { return };
     config.check = header["check"].as_str().map(String::from);
-    let failed = header["check_failed"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from));
-    let detected = Detected { from: from.into(), check: config.check.clone(), failed: failed.collect(), passed: None };
+    let list = |key: &str| -> Vec<String> {
+        header[key].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect()
+    };
+    let failed = list("check_failed");
+    // One started before low noted what ran out of time doesn't move up: any of it might have.
+    let mut slow = if header.get("check_slow").is_some() { list("check_slow") } else { failed.clone() };
+    // And no session moves up to a command that ran out of time when a turn's end tried it.
+    let tried = entries.iter().map(|e| &e["check"]).filter(|c| c["fuller"] == true && c["slow"] == true);
+    slow.extend(tried.filter_map(|c| c["check"].as_str().map(String::from)));
+    let mut detected = Detected { from: from.into(), check: config.check.clone(), failed, slow, passed: None };
+    let moved = entries.iter().rev().map(|e| &e["check"]).find(|c| c["fuller"] == true && c["ok"] == true);
+    if let Some(check) = moved.and_then(|c| c["check"].as_str()) {
+        config.check = Some(check.into());
+        detected.from = moved.and_then(|c| c["from"].as_str()).unwrap_or(from).into();
+    }
     config.detected = Some(detected);
 }
 
@@ -2420,13 +2501,18 @@ fn system_prompt(root: &Path, yolo: bool, config: &Config, repo: bool, search: b
     if !repo {
         prompt = prompt.replace(UNDO, "");
     }
-    // A detected check ran on the tree as found, so a failure after an edit is the edit's.
-    prompt += &match config.check.as_deref() {
-        Some(check) if config.detected.is_some() => {
+    // A detected check passed on the tree as found, or on a later turn's when it moved up, so a failure after an edit is
+    // the edit's.
+    let started = config.detected.as_ref().map(|d| d.check == config.check);
+    prompt += &match (config.check.as_deref(), started) {
+        (Some(check), Some(true)) => {
             format!("\ncheck() runs `{}`, which passed on the tree as found.", redact(check).0)
         }
-        Some(check) => format!("\ncheck() runs `{}`.", redact(check).0),
-        None => "\nNo check command is configured, so check() runs nothing.".into(),
+        (Some(check), Some(false)) => {
+            format!("\ncheck() runs `{}`, which passed on the tree an earlier turn left.", redact(check).0)
+        }
+        (Some(check), None) => format!("\ncheck() runs `{}`.", redact(check).0),
+        (None, _) => "\nNo check command is configured, so check() runs nothing.".into(),
     };
     let read_only = !yolo && worker::read_only(root);
     if read_only {
@@ -2606,6 +2692,30 @@ mod tests {
         let uncounted = json!({"actions": [{"tool": "write", "path": "c.py", "ok": true}], "cmds": [["make", 2, []]]});
         assert_eq!(super::did(&uncounted).as_deref(), Some("write c.py · $ make → exit 2"));
         assert_eq!(super::did(&json!({})), None);
+    }
+
+    /// A resumed session keeps the check its start detected, or the one a turn's end moved up to since; one started
+    /// before low noted what ran out of time doesn't move up.
+    #[test]
+    fn a_resumed_session_keeps_its_check() {
+        use serde_json::{Value, json};
+        let (build, tests) = ("cargo build -q", "cargo build -q && cargo test -q");
+        let header = json!({"check": build, "check_from": "Cargo.toml", "check_failed": [tests], "check_slow": []});
+        let adopted = |entries: &[Value]| {
+            let mut config = crate::Config { detect: true, ..Default::default() };
+            super::adopt(&mut config, entries);
+            (config.check.unwrap_or_default(), config.detected.unwrap())
+        };
+        let (check, detected) = adopted(std::slice::from_ref(&header));
+        assert_eq!((check.as_str(), detected.fuller(build)), (build, vec![tests.to_string()]));
+        let moved = json!({"check": {"ok": true, "fuller": true, "check": tests, "from": "Cargo.toml"}});
+        let (check, detected) = adopted(&[header.clone(), json!({"check": {"ok": false, "gate": true}}), moved]);
+        assert_eq!((check.as_str(), detected.check.as_deref()), (tests, Some(build)));
+        let slow = json!({"check": {"ok": false, "fuller": true, "slow": true, "check": tests, "from": "Cargo.toml"}});
+        assert!(adopted(&[header.clone(), slow]).1.fuller(build).is_empty());
+        let mut old = header;
+        old.as_object_mut().unwrap().remove("check_slow");
+        assert!(adopted(&[old]).1.fuller(build).is_empty());
     }
 
     /// The e2e mock tells a second look's requests by LOOK's opening words.

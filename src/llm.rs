@@ -12,6 +12,13 @@ const LONG: Duration = Duration::from_secs(150);
 const FIRST_BYTE: Duration = Duration::from_secs(90);
 const IDLE: Duration = Duration::from_mins(5);
 const TOTAL: Duration = Duration::from_hours(1);
+/// Tries per request while the provider answers 429 or 5xx or the connection fails. OpenCode Go's bursts outlasted 5
+/// tries (60s of waiting) in 2 of 144 bench runs on 2026-10-20, the only runs low lost there; with 8, seek lost none of
+/// 336.
+const ATTEMPTS: u32 = 8;
+/// The longest wait between tries, in seconds, where no Retry-After (honored up to 300s) sets one: 4, 8, 16, then 30s,
+/// about 2.5 minutes in all.
+const BACKOFF: u64 = 30;
 const LINE_MAX: usize = 16 << 20;
 const BODY_MAX: usize = 2000;
 const FIELDS: [&str; 2] = ["reasoning_content", "reasoning"];
@@ -531,10 +538,10 @@ impl Llm {
                     (problem.clone(), problem, Some(1))
                 }
             };
-            if attempt == 5 {
+            if attempt == ATTEMPTS {
                 bail!("giving up after {attempt} attempts: {detail}")
             }
-            let wait = wait.unwrap_or(2 << attempt).clamp(1, 300);
+            let wait = wait.unwrap_or((2 << attempt).min(BACKOFF)).clamp(1, 300);
             let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             let extra = json!({"status": problem, "attempt": attempt, "wait_s": wait});
             // On the status bar only while low waits; if it gives up, the error says what failed.

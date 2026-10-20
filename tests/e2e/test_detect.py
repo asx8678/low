@@ -2,11 +2,16 @@
 on the tree as found: the system prompt says so, a check() before any change reuses that pass, and a turn's verdict
 comes from it. A second session on the same tree reuses the first one's baseline, and a resumed session keeps the
 check its start detected without running a baseline. One that fails on the tree as found leaves the session with no
-check, and check = "" in low.toml turns detection off."""
-from harness import Env, check, done
+check, and check = "" in low.toml turns detection off. A session that settled for a lesser check moves up to the
+fuller one once that passes at a turn's end: a resumed session keeps it, the model is told once, and a later turn that
+breaks it is asked to fix it."""
+import os
+from harness import Env, check, done, user_messages
 
 PASSES = {'README.md': 'hello\n', 'Makefile': 'check:\n\t@grep -q hello README.md\n'}
 FAILS = {'README.md': 'hello\n', 'Makefile': 'check:\n\t@echo the tests already fail; exit 1\n'}
+# make check fails until state.txt says fixed; the pytest setup's stand-in python passes from the start.
+LESSER = {'Makefile': 'check:\n\t@grep -q fixed state.txt\n', 'pytest.ini': '', '.venv/bin/python': '#!/bin/sh\nexit 0\n'}
 
 
 def system(r):
@@ -61,4 +66,34 @@ check('check = "" turns detection off', not baselines(e) and 'No check command i
       and 'check_from' not in e.log()[0], baselines(e))
 check('and the turn has no check', r['result'].get('verdict') == 'NO CHECK'
       and r['result'].get('check') == 'none configured: set check in low.toml', r['result'])
+
+e = Env([{'code': "write('state.txt', 'fixed\\n')"}, {'content': 'wrote state.txt'},
+         {'code': "write('state.txt', 'broken\\n')"}, {'content': 'wrote state.txt'},
+         {'code': "write('state.txt', 'fixed\\n')"}, {'content': 'fixed state.txt'},
+         {'content': 'Nothing to change.'}], files=LESSER)
+os.chmod(os.path.join(e.repo, '.venv/bin/python'), 0o755)
+e.git('commit', '-qam', 'executable')
+r = e.low('--json', 'write state.txt')
+lesser = 'PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider'
+check('a lesser command passing on the tree as found is adopted',
+      f'check() runs `{lesser}`, which passed on the tree as found.' in system(r), system(r)[-300:])
+moves = [x['check'] for x in e.log() if isinstance(x.get('check'), dict) and x['check'].get('fuller')]
+check('the session moves up to the fuller one once a turn\'s final tree passes it',
+      [(m['check'], m['ok'], m['from']) for m in moves] == [('make check', True, 'Makefile')], moves)
+check('and the verdict says where it came from', r['result'].get('verdict') == 'VERIFIED'
+      and r['result'].get('check') == 'passed on the final tree (detected from Makefile)', r['result'])
+
+r = e.low('--json', '--resume', 'break state.txt')
+resumed = [x['resume'] for x in e.log() if 'resume' in x]
+check('a resumed session keeps the move',
+      resumed and (resumed[-1].get('check'), resumed[-1].get('check_from')) == ('make check', 'Makefile'), resumed)
+told = user_messages(r['requests'][0])[-1] if r['requests'] else ''
+check('the model is told with its next task', 'check() now runs `make check`' in told, told)
+gated = [m for body in r['requests'] for m in user_messages(body) if 'The project check failed' in m]
+check('a later turn that breaks it is asked to fix it', gated and r['result'].get('verdict') == 'VERIFIED',
+      r['result'])
+
+r = e.low('--json', '--resume', 'anything else?')
+last = user_messages(r['requests'][0])[-1] if r['requests'] else ''
+check('and is told once', last.startswith('anything else?') and 'check() now runs' not in last, last)
 done()
