@@ -318,6 +318,8 @@ def _guide(path):
 def _change(tool, path, make, fmt=True):
     rel = _rel(path)
     real = os.path.realpath(os.path.join(ROOT, rel))
+    # The commands the run listed before this change, as check() keeps them: a second look reads the run in this order.
+    ran = len(_report.get("cmds", []))
     signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
     try:
         if READONLY:
@@ -341,7 +343,8 @@ def _change(tool, path, make, fmt=True):
         before, written, *notes = make(os.path.join(ROOT, rel), rel)
         notes = notes[0] if notes else []
         delta = [l[0] for l in difflib.unified_diff(before.splitlines(), written.splitlines(), lineterm="")][2:]
-        action = {"tool": tool, "path": changed, "ok": True, "added": delta.count("+"), "removed": delta.count("-")}
+        action = {"tool": tool, "path": changed, "ok": True, "added": delta.count("+"), "removed": delta.count("-"),
+                  "cmds": ran}
         if tool == "write" and st:
             action["replaced"] = True
         if notes:
@@ -351,7 +354,7 @@ def _change(tool, path, make, fmt=True):
         if tool == "write" and not st:
             _turn.setdefault("created", set()).add(changed)
     except Exception as e:
-        _report.setdefault("actions", []).append({"tool": tool, "path": rel, "ok": False, "error": str(e)})
+        _report.setdefault("actions", []).append({"tool": tool, "path": rel, "ok": False, "error": str(e), "cmds": ran})
         raise
     finally:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})

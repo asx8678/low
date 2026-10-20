@@ -1,15 +1,16 @@
 """A turn that changes files with no check passing gets a second look: the same model, in a conversation of its own that
-has the system prompt and a brief (task, criteria, what the runs did, the diff, the report) but none of the turn's
-messages, reads the code in a worker that can't change files and gives each claim it checked a verdict. What it finds
-contradicted goes back to the model once, and a second look at the answer checks those claims alone, with the runs
-and the diff since; the report and --json carry the first look's other claims and what the second made of those. A
-look's last request is told to give its verdict. A passing check, or a turn without changes, gets none."""
+has the system prompt and a brief (task, criteria, what the runs did in order, the diff, the report) but none of the
+turn's messages, reads the code in a worker that can't change files and gives each claim it checked a verdict. What it
+finds contradicted goes back to the model once, and a second look at the answer checks those claims alone, with the
+runs and the diff since; the report and --json carry the first look's other claims and what the second made of those.
+A look's last request is told to give its verdict. A passing check, or a turn without changes, gets none."""
 from harness import Env, check, done, user_messages
 
 LOOK = 'You are taking a second look'
 FILES = {'app.py': "def greet():\n    return 'hi'\n\n\ndef bye():\n    return 'bye'\n"}
 EDITED = "def greet():\n    return 'hello'\n\n\ndef bye():\n    return 'bye'\n"
-FINAL = ("accept('greet() says hello; bye() is unchanged')\nedit('app.py', \"return 'hi'\", \"return 'hello'\")\n"
+FINAL = ("accept('greet() says hello; bye() is unchanged')\nsh('true')\n"
+         "edit('app.py', \"return 'hi'\", \"return 'hello'\")\n"
          "finish(\"greet() now returns 'hello'; bye() is unchanged\")")
 READS = ("try:\n    write('app.py', 'x')\nexcept ValueError as e:\n    print('refused:', e)\n"
          "try:\n    open('app.py', 'a').write('x')\nexcept OSError as e:\n    print('denied:', type(e).__name__)\n"
@@ -33,9 +34,10 @@ first = asides[0]['messages']
 brief = first[1]['content'] if len(first) == 2 else ''
 check('second look: the same system prompt, then only the brief',
       [m['role'] for m in first] == ['system', 'user'] and first[0] == r['requests'][0]['messages'][0], first[1:])
-check('second look: the brief has the task, criteria, runs, diff and report',
+check('second look: the brief has the task, criteria, the runs in order, diff and report',
       brief.startswith(LOOK) and 'make greet say hello' in brief and 'greet() says hello; bye() is unchanged' in brief
-      and 'run 1: edit app.py' in brief and "+    return 'hello'" in brief and "-    return 'hi'" in brief
+      and 'run 1: $ true → exit 0 · edit app.py' in brief
+      and "+    return 'hello'" in brief and "-    return 'hi'" in brief
       and "## Report\ngreet() now returns 'hello'; bye() is unchanged" in brief, brief)
 ran = asides[1]['messages'][-1]['content']
 check('second look: edit()/write() refuse, the sandbox denies writes in the repo, temp dirs stay writable',

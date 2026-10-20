@@ -96,7 +96,7 @@ const VERDICTS: &str = "Then end with finish(), which is always taken here, and 
                         contradicted: <claim> — <file:line, and what is there instead>\n\
                         uncertain: <claim> — <why reading can't settle it>\n\
                         Call a claim contradicted only when the code shows it false. A command said to pass holds \
-                        when it passed in a run later than the last edit to what it runs, and is uncertain otherwise.";
+                        when it passed after the last edit to what it runs, and is uncertain otherwise.";
 /// What a second look's last request is told: an answer then beats one more read and no verdict.
 const LAST: &str = "That was your last run: end now with finish() and one line per claim, as above. A claim you \
                     haven't settled is uncertain.";
@@ -904,8 +904,7 @@ impl Agent {
             Ok(_) if again.is_some() && self.repo => "[no change since the earlier look]".into(),
             _ => format!("[no diff to show: read these files]\n{}", own_changes(turn)),
         };
-        let order = "(In each run: its edits, then its shell commands, then its check()s; the order within a run is not \
-                     recorded.)";
+        let order = "(Each run lists its edits, shell commands and check()s in the order they happened.)";
         match again {
             Some((_, claims)) => {
                 let claims: Vec<String> = claims.iter().map(|c| format!("- {c}")).collect();
@@ -2320,23 +2319,29 @@ fn stale(meta: &Value) -> bool {
 }
 
 /// What one of a turn's runs did, for a second look: its edits and writes, its shell commands with their exit status,
-/// and its check()s. None for a run that did none of these.
+/// and its check()s, in the order the run made them, so a command said to pass can be placed after the last edit or
+/// before it. Each action counts the commands listed before it; one without the count goes before those not yet shown.
+/// None for a run that did none of these.
 fn did(meta: &Value) -> Option<String> {
     let actions = meta["actions"].as_array().map_or(&[][..], Vec::as_slice);
-    let mut did: Vec<String> = actions
-        .iter()
-        .filter_map(|a| {
-            let failed = if a["ok"] == true { "" } else { " (failed)" };
-            Some(format!("{} {}{failed}", a["tool"].as_str()?, a["path"].as_str()?))
-        })
-        .collect();
-    for cmd in meta["cmds"].as_array().into_iter().flatten() {
+    let cmds = meta["cmds"].as_array().map_or(&[][..], Vec::as_slice);
+    let command = |cmd: &Value| {
         let line: String = ui::printable(cmd[0].as_str().unwrap_or_default()).trim().chars().take(200).collect();
-        did.push(format!("$ {line} → exit {}", cmd[1]));
+        format!("$ {line} → exit {}", cmd[1])
+    };
+    let (mut did, mut shown) = (vec![], 0);
+    for action in actions {
+        let before = action["cmds"].as_u64().map_or(shown, |n| (n as usize).clamp(shown, cmds.len()));
+        did.extend(cmds[shown..before].iter().map(command));
+        shown = before;
+        let ok = action["ok"] == true;
+        match (action["tool"].as_str(), action["path"].as_str()) {
+            (Some("check"), _) => did.push(format!("check() {}", if ok { "passed" } else { "failed" })),
+            (Some(tool), Some(path)) => did.push(format!("{tool} {path}{}", if ok { "" } else { " (failed)" })),
+            _ => {}
+        }
     }
-    for check in actions.iter().filter(|a| a["tool"] == "check") {
-        did.push(format!("check() {}", if check["ok"] == true { "passed" } else { "failed" }));
-    }
+    did.extend(cmds[shown..].iter().map(command));
     (!did.is_empty()).then(|| did.join(" · "))
 }
 
@@ -2581,6 +2586,26 @@ mod tests {
         assert!(super::Claims::of("All good: the change is right.").is_none());
         let held = super::Claims::of("**held:** it builds — Cargo.toml:3").unwrap();
         assert_eq!((held.summary(), held.held), ("1 held".to_string(), vec!["it builds — Cargo.toml:3".to_string()]));
+    }
+
+    /// A run's record for a second look keeps the order the run made its edits, commands and check()s in, so a pass
+    /// before the last edit reads as one; an action recorded without its count goes before the commands not yet shown.
+    #[test]
+    fn a_runs_record_keeps_its_order() {
+        use serde_json::json;
+        let unittest = "python3 -m unittest -q";
+        let actions = json!([
+            {"tool": "edit", "path": "a.py", "ok": true, "cmds": 0},
+            {"tool": "edit", "path": "b.py", "ok": false, "cmds": 1},
+            {"tool": "check", "ok": true, "cmds": 2},
+        ]);
+        let cmds = json!([[unittest, 1, []], [unittest, 0, []], ["git diff", 0, []]]);
+        let ordered = "edit a.py · $ python3 -m unittest -q → exit 1 · edit b.py (failed) · \
+                       $ python3 -m unittest -q → exit 0 · check() passed · $ git diff → exit 0";
+        assert_eq!(super::did(&json!({"actions": actions, "cmds": cmds})).as_deref(), Some(ordered));
+        let uncounted = json!({"actions": [{"tool": "write", "path": "c.py", "ok": true}], "cmds": [["make", 2, []]]});
+        assert_eq!(super::did(&uncounted).as_deref(), Some("write c.py · $ make → exit 2"));
+        assert_eq!(super::did(&json!({})), None);
     }
 
     /// The e2e mock tells a second look's requests by LOOK's opening words.

@@ -47,7 +47,7 @@ For a review or a question, answer with file:line evidence and change no files u
    For anything bigger than a one-line fix, also call plan([...]) with 2-6 short steps there, and done() in the run that finishes each step.
    accept(), plan() and done() return nothing worth reading: never spend a run on them alone.
 3. check() must pass after your last change; if it fails, fix and run it again.
-   check() is evidence only for what it runs. If it does not exercise your change (no check configured, or it only builds or lints), also run the changed code directly (import it, run the command, replay the failing case) and print or assert what shows each criterion holds.
+   check() is evidence only for what it runs. If it does not exercise your change (no check configured, or it only builds or lints), also run the changed code directly (import it, run the command, replay the failing case) and assert what shows each criterion holds.
 4. End with a short report: what changed, how you verified it, and what is still open. If check() cannot pass, say why in one line.
    When nothing is left to read, end the run that verifies with `assert check()`, asserts for your criteria, and finish(report) instead of a separate reply. low takes finish() only when check() passed in that run, the turn changed files, and the run printed nothing else; otherwise it tells you why and you reply as usual.
 
