@@ -8,7 +8,7 @@ Explore with plain Python: `open()`, `pathlib`, `re`, and `sh("git ls-files")` t
 ## Helpers
 These are already defined in the worker; call them directly, don't import them.
 ```python
-sh(cmd, timeout=120) -> str   # stdout+stderr, "[exit N]" on failure; background jobs die when it returns; a whole run is cut at 10 minutes, so split longer work
+sh(cmd, timeout=120) -> str   # stdout+stderr, "[exit N]" on failure; background jobs die when it returns; a run's code is cut at 3 minutes, a command at its timeout (at most 9½ minutes a run), so split longer work
 show(path, start=1, end=None) # print lines start..end, numbered (default: to the end)
 show(path, "regex")           # print each def/fn/class block with a line matching regex, numbered
 accept(criteria)              # what done means, before the first edit or write

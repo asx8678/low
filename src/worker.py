@@ -12,7 +12,8 @@ LIMIT = 8 << 20
 OUT_CAP = 64 << 20  # what a run's own printing may put on disk; past it, output is dropped
 SPILLS = 10  # the cut runs' whole outputs kept on disk for show(); older ones are deleted
 SPILL_AGE = 86400  # seconds another worker's spilled output is kept: one that is gone can't delete its own
-RUN_CAP = 570
+RUN_CAP = 180  # seconds a run's own code may take: a stuck loop costs 3 minutes, not 10, unless it keeps calling sh()
+RUN_MAX = 570  # what a run may take when its sh() commands ask for longer, inside the host's 10 minutes
 GUIDES = ("AGENTS.md", "CLAUDE.md")  # a folder's instructions: the first of these it has
 GUIDE_CAP = 8 << 10  # characters of one folder's instructions a run shows; show() reads the rest
 DEFINITION = re.compile(r"\s*(?:(?:pub(?:\([^)]*\))?|async|export|default|static|public|private|protected|final|"
@@ -35,16 +36,42 @@ _groups = set()
 _spawned = []  # the commands this run's code started with subprocess, each with its Popen, for their exit status
 _spilled = []  # this worker's spilled outputs, oldest first
 _Popen, _os_system = subprocess.Popen, os.system  # low's own commands; the run's code gets _Seen and _system
-_deadline = time.monotonic() + RUN_CAP
+_deadline = _latest = time.monotonic() + RUN_CAP
 _running = _dropped = _executing = False
 _flow = threading.Lock()  # held while a run's output is switched, so the watch never switches the wrong run's
+
+
+class RunTimeout(BaseException):
+    """What a run's code gets past its deadline. Not an Exception: a test loop that catches those, one per case, would
+    take TimeoutError for one more failing case and go on until the host killed the worker and its variables."""
+
+
+_stops = 0  # the run's stops so far: once it has caught one, the next can't be caught
+_TOOL = 4  # sys.monitoring's tool id for that (3.12+)
+if hasattr(sys, "monitoring"):
+    sys.monitoring.use_tool_id(_TOOL, "low")
+
+
+def _again(code, line):
+    # Each line of the run's own code (its runs, the repo's files) raises the stop again once the run caught one, so a
+    # bare except or except BaseException can't keep it. The worker's helpers and installed packages finish first.
+    f = code.co_filename
+    if _executing and (f.startswith("<run ") or (f.startswith(ROOT + os.sep) and "site-packages" not in f)):
+        raise RunTimeout(f"the run went past its {_limit()} s limit and caught the stop")
 
 
 def _overrun(signum, frame):
     # Code that never returns, a pure-Python loop say, ends here, before the host's timeout kills the worker and its
     # variables; sh() commands meet their own deadline first.
+    global _stops
     if _executing:
-        raise TimeoutError(f"the run went past its {RUN_CAP} s limit")
+        _stops += 1
+        signal.setitimer(signal.ITIMER_REAL, 1)  # again in a second, should the run catch this one
+        if _stops > 1 and hasattr(sys, "monitoring"):
+            sys.monitoring.register_callback(_TOOL, sys.monitoring.events.LINE, _again)
+            sys.monitoring.set_events(_TOOL, sys.monitoring.events.LINE)
+        raise RunTimeout(f"the run went past its {_limit()} s limit; sh(cmd, timeout=...) gives a command longer, "
+                           f"up to {RUN_MAX} s a run")
 
 
 SURROGATE = re.compile("[\ud800-\udfff]")
@@ -60,15 +87,26 @@ def _frame(message):
 def _host(message):
     # The run's clock stops while the host answers (a check can take far longer than a run), and starts over after it,
     # as the host's own timeout does.
-    global _deadline
     signal.setitimer(signal.ITIMER_REAL, 0)
     _outbox.write(_frame(message))
     _outbox.flush()
     answer = json.loads(_inbox.readline() or "{}")
-    _deadline = time.monotonic() + RUN_CAP
+    _clock()
     if _executing:
         signal.setitimer(signal.ITIMER_REAL, RUN_CAP + 5)
     return answer
+
+
+def _clock():
+    # The run's time starts over: RUN_CAP for its code, and as far as RUN_MAX for a command given longer.
+    global _deadline, _latest
+    now = time.monotonic()
+    _deadline, _latest = now + RUN_CAP, now + RUN_MAX
+
+
+def _limit():
+    # The run's deadline in seconds from when its time last started over: RUN_CAP, or later once a command moved it.
+    return round(_deadline - _latest + RUN_MAX)
 
 
 def _children(pid):
@@ -141,7 +179,16 @@ threading.Thread(target=_watch, args=(os.getppid(),), daemon=True).start()
 
 
 def _exec(cmd, timeout):
-    left = _deadline - time.monotonic()
+    global _deadline
+    now = time.monotonic()
+    # A command whose timeout runs past the run's deadline moves it, as far as RUN_MAX: the cap is for the run's own
+    # code, which a stuck loop holds, not for a build or an install the model gave the time it needs. A run that caught
+    # a stop gets no more.
+    if timeout and now + timeout > _deadline and not _stops:
+        _deadline = min(now + timeout, _latest)
+        if _executing:
+            signal.setitimer(signal.ITIMER_REAL, _deadline - now + 5)
+    left = _deadline - now
     if not timeout or timeout > left:
         timeout = max(1, int(left))
     p = _Popen(cmd, shell=True, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -959,7 +1006,7 @@ for n, request in enumerate(_inbox, 1):
     if _state.get("turn") != _turn.get("turn"):
         _turn = {"turn": _state.get("turn"), "touched": set(_state.get("touched") or ()),
                  "created": set(_state.get("created") or ())}
-    _deadline = time.monotonic() + RUN_CAP
+    _clock()
     _report.clear()
     _said = 0
     os.chdir(ROOT)
@@ -988,6 +1035,9 @@ for n, request in enumerate(_inbox, 1):
         finally:
             _executing = False
             signal.setitimer(signal.ITIMER_REAL, 0)
+            _stops = 0
+            if hasattr(sys, "monitoring"):
+                sys.monitoring.set_events(_TOOL, 0)
         sys.stdout.flush()
         if value is not None and not os.fstat(1).st_size:
             print(value)

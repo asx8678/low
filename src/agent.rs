@@ -77,15 +77,33 @@ const LOOK: &str = "You are taking a second look at a turn low just finished: an
                     Pick the 3 to 5 claims in the report that matter most and are likeliest to be wrong: what the change \
                     does, a case it handles, something it leaves unchanged, a command said to pass. Check each by \
                     reading the code with show(), open(), re and sh(\"git grep ...\"), in as few runs as you can; don't \
-                    build, test or run the project.\n\n\
-                    Then end with finish(), which is always taken here, and one line per claim:\n\
-                    held: <claim> — <file:line that shows it>\n\
-                    contradicted: <claim> — <file:line, and what is there instead>\n\
-                    uncertain: <claim> — <why reading can't settle it>\n\
-                    Call a claim contradicted only when the code shows it false. A command said to pass holds when it \
-                    passed in a run later than the last edit to what it runs, and is uncertain otherwise.";
-/// The requests one second look may make before it settles nothing.
+                    build, test or run the project.";
+/// The instructions of a second look at the model's answer to the claims a first one found contradicted: it checks
+/// those alone, with the runs and the diff since. It opens as LOOK does, for the e2e mock.
+const RECHECK: &str = "You are taking a second look at a turn low just finished, after an earlier one: that look found \
+                       claims in the turn's report that the code contradicts, the conversation that did the task was \
+                       asked about them, and its answer is below. You get the task, its criteria, those claims, what \
+                       the turn's runs edited and ran since, the diff since and the answer, not that conversation. \
+                       Nothing here changes files: edit() and write() refuse, the repository is read-only, and \
+                       check(), search() and fetch() are off.\n\n\
+                       Check only those claims, as the answer leaves them: the code fixed, the report corrected, or \
+                       the earlier look shown wrong. What the answer says it did about one is part of the claim. Read \
+                       the code with show(), open(), re and sh(\"git grep ...\"), in as few runs as you can; don't \
+                       build, test or run the project.";
+/// How a second look ends, after LOOK or RECHECK.
+const VERDICTS: &str = "Then end with finish(), which is always taken here, and one line per claim:\n\
+                        held: <claim> — <file:line that shows it>\n\
+                        contradicted: <claim> — <file:line, and what is there instead>\n\
+                        uncertain: <claim> — <why reading can't settle it>\n\
+                        Call a claim contradicted only when the code shows it false. A command said to pass holds \
+                        when it passed in a run later than the last edit to what it runs, and is uncertain otherwise.";
+/// What a second look's last request is told: an answer then beats one more read and no verdict.
+const LAST: &str = "That was your last run: end now with finish() and one line per claim, as above. A claim you \
+                    haven't settled is uncertain.";
+/// The requests one second look may make, the last of them told to give its verdict.
 const LOOK_REQUESTS: usize = 6;
+/// The requests a RECHECK may make: it has a claim or two to read, not a report.
+const RECHECK_REQUESTS: usize = 3;
 /// The diff a second look gets; it reads the files for the rest.
 const LOOK_DIFF: usize = 24 * 1024;
 /// The turn's runs a second look is told about: the last ones.
@@ -799,12 +817,17 @@ impl Agent {
             checked = ok;
         }
         // Nothing has run the report's claims, so a second look reads the code for them. What it finds contradicted goes
-        // back to the model once, and the answer gets a second look of its own.
+        // back to the model once, and a second look at the answer checks those claims again; the others stand.
         if changed && !checked && !state.stalled {
-            self.claims = self.look(state, start, began).await?;
-            let refuted = self.claims.as_ref().filter(|c| !c.contradicted.is_empty() && !state.refuted);
+            let earlier = self.claims.take().filter(|_| state.refuted.is_some());
+            let claims = self.look(state, start, began, earlier.as_ref()).await?;
+            self.claims = match earlier {
+                Some(earlier) => Some(earlier.then(claims)),
+                None => claims,
+            };
+            let refuted = self.claims.as_ref().filter(|c| !c.contradicted.is_empty() && state.refuted.is_none());
             if let Some(lines) = refuted.map(|c| c.contradicted.iter().map(|c| format!("- {c}")).collect::<Vec<_>>()) {
-                (state.refuted, state.stalled) = (true, false);
+                (state.refuted, state.stalled) = (Some((self.tree().await?, self.session.entries.len())), false);
                 let text = "the second look found claims the code contradicts: asking the model about them";
                 ui::event("nudge", text, Value::Null);
                 self.host(format!("{REFUTED}\n{}\n{REFUTED_END}", lines.join("\n")))?;
@@ -817,22 +840,36 @@ impl Agent {
     /// A second look at the report of a turn that changed files with no check passing. The same model, in a conversation
     /// of its own that starts with the turn's system prompt and the brief but has none of the turn's messages, checks
     /// the report's riskiest claims by reading the code in a worker that can't change files. Its requests are logged as
-    /// aside events: the turn's cost and /cost count them, the turn's conversation never sees them. None when it settled
-    /// nothing: no report, an error, or no verdict within LOOK_REQUESTS.
-    async fn look(&mut self, state: &mut TurnState, start: &str, began: usize) -> Result<Option<Claims>> {
+    /// aside events: the turn's cost and /cost count them, the turn's conversation never sees them. After the model was
+    /// asked about the claims an `earlier` look found contradicted, it checks those alone (RECHECK). None when it
+    /// settled nothing: no report, an error, or no verdict even when its last request was told to give one.
+    async fn look(
+        &mut self,
+        state: &mut TurnState,
+        start: &str,
+        began: usize,
+        earlier: Option<&Claims>,
+    ) -> Result<Option<Claims>> {
         let turn = &self.session.entries[began..];
         let report = turn.iter().rev().find(|e| e["role"] == "assistant").and_then(|e| e["content"].as_str());
         let Some(report) = report.filter(|r| !r.trim().is_empty()).map(String::from) else { return Ok(None) };
-        let brief = self.brief(start, began, &report).await;
-        ui::show(
-            "second look: checking the report's claims against the code, in a conversation that can't change files",
-        );
+        let since = earlier.and(state.refuted.as_ref()).map(|(tree, at)| (tree.as_str(), *at));
+        let again = since.zip(earlier.map(|c| c.contradicted.as_slice()));
+        let brief = self.brief(start, began, &report, again).await;
+        let (text, how, limit) = match again {
+            Some(_) => ("checking the claims it contradicted against the model's answer", RECHECK, RECHECK_REQUESTS),
+            None => ("checking the report's claims against the code", LOOK, LOOK_REQUESTS),
+        };
+        ui::show(&format!("second look: {text}, in a conversation that can't change files"));
         let mut messages = vec![
             json!({"role": "system", "content": self.session.header()["system"]}),
-            json!({"role": "user", "content": format!("{LOOK}\n\n{brief}")}),
+            json!({"role": "user", "content": format!("{how}\n\n{VERDICTS}\n\n{brief}")}),
         ];
         let mut worker = None;
-        for n in 1..=LOOK_REQUESTS {
+        for n in 1..=limit {
+            if n == limit && n > 1 {
+                messages.push(json!({"role": "user", "content": LAST}));
+            }
             let mut message = match self.llm.complete(messages.clone(), &tools()).await {
                 Ok(message) => message,
                 Err(e) => {
@@ -872,14 +909,21 @@ impl Agent {
                 return Ok(claims);
             }
         }
-        let text = format!("second look: no verdict in {LOOK_REQUESTS} requests, so it settled nothing");
+        let text = format!("second look: no verdict in {limit} requests, so it settled nothing");
         ui::event("claims", &text, Value::Null);
         Ok(None)
     }
 
     /// What a second look gets: the task with the user's steers, the criteria, what each of the turn's runs edited and
     /// ran, the diff of the turn's own files (redacted, at most LOOK_DIFF bytes; outside git, their names) and the report.
-    async fn brief(&self, start: &str, began: usize, report: &str) -> String {
+    /// A RECHECK gets the claims found contradicted, and the runs and the diff since the tree and the entry it names.
+    async fn brief(
+        &self,
+        start: &str,
+        began: usize,
+        report: &str,
+        again: Option<((&str, usize), &[String])>,
+    ) -> String {
         let turn = &self.session.entries[began..];
         let text = |e: &Value| e["content"].as_str().unwrap_or_default().to_string();
         let mut task = text(&turn[0]);
@@ -887,24 +931,37 @@ impl Agent {
             task += &format!("\n\n{}", text(&compact::wire(steer)));
         }
         let criteria = self.session.state().accepted.unwrap_or_else(|| "none set".into());
-        let runs = turn.iter().filter(|e| e["role"] == "tool").enumerate();
+        let (from, after) = again.map_or((start, 0), |((tree, at), _)| (tree, at - began));
+        let runs = turn.iter().enumerate().filter(|(_, e)| e["role"] == "tool").enumerate();
+        let runs = runs.filter(|(_, (i, _))| *i >= after);
         let runs: Vec<String> =
-            runs.filter_map(|(n, e)| Some(format!("run {}: {}", n + 1, did(&e["meta"])?))).collect();
+            runs.filter_map(|(n, (_, e))| Some(format!("run {}: {}", n + 1, did(&e["meta"])?))).collect();
         let runs = if runs.is_empty() { "-".into() } else { runs[runs.len().saturating_sub(LOOK_RUNS)..].join("\n") };
-        let diff = match self.patch(start, began).await {
+        let diff = match self.patch(from, began).await {
             Ok(diff) if diff.len() > LOOK_DIFF => {
                 let (kb, cut) = (diff.len().div_ceil(1024), diff.floor_char_boundary(LOOK_DIFF));
                 format!("{}\n[cut at {} KB of {kb} KB: read the files for the rest]", &diff[..cut], LOOK_DIFF / 1024)
             }
             Ok(diff) if !diff.trim().is_empty() => diff,
+            Ok(_) if again.is_some() && self.repo => "[no change since the earlier look]".into(),
             _ => format!("[no diff to show: read these files]\n{}", own_changes(turn)),
         };
-        format!(
-            "## Task\n{task}\n\n## Criteria\n{criteria}\n\n## What the turn's runs did\n\
-                 (In each run: its edits, then its shell commands, then its check()s; the order within a run is not \
-                 recorded.)\n{runs}\n\n## Diff\n{diff}\n\n\
-                 ## Report\n{report}"
-        )
+        let order = "(In each run: its edits, then its shell commands, then its check()s; the order within a run is not \
+                     recorded.)";
+        match again {
+            Some((_, claims)) => {
+                let claims: Vec<String> = claims.iter().map(|c| format!("- {c}")).collect();
+                format!(
+                    "## Task\n{task}\n\n## Criteria\n{criteria}\n\n## Claims the earlier look found contradicted\n{}\n\n\
+                     ## What the turn's runs did since\n{order}\n{runs}\n\n## Diff since\n{diff}\n\n## Answer\n{report}",
+                    claims.join("\n")
+                )
+            }
+            None => format!(
+                "## Task\n{task}\n\n## Criteria\n{criteria}\n\n## What the turn's runs did\n{order}\n{runs}\n\n\
+                 ## Diff\n{diff}\n\n## Report\n{report}"
+            ),
+        }
     }
 
     /// The turn's own changes as a patch from its snapshot to the tree now, redacted; empty outside git.
@@ -2059,6 +2116,16 @@ impl Claims {
         any.then_some(claims)
     }
 
+    /// These claims with the contradicted ones as a RECHECK left them; ones it settled nothing about stay contradicted.
+    fn then(mut self, recheck: Option<Self>) -> Self {
+        if let Some(recheck) = recheck {
+            self.held.extend(recheck.held);
+            self.uncertain.extend(recheck.uncertain);
+            self.contradicted = recheck.contradicted;
+        }
+        self
+    }
+
     /// How many claims held, were contradicted or stayed uncertain, leaving out the verdicts no claim got.
     fn summary(&self) -> String {
         let counts =
@@ -2154,8 +2221,9 @@ struct TurnState {
     strayed: bool,
     /// The model was asked about a git repository it made inside the tree.
     planted: bool,
-    /// The model was asked about claims a second look found the code contradicts.
-    refuted: bool,
+    /// The model was asked about claims a second look found the code contradicts: the tree then, and the entry its
+    /// answer starts at.
+    refuted: Option<(String, usize)>,
     /// The turn went on with the profile's fallback provider.
     failed_over: bool,
     /// Tokens spent, cached input counting a quarter.
