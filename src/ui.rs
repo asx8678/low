@@ -272,11 +272,120 @@ pub fn steerable() {
 
 /// What the user sent to steer the turn since the last request, as one message.
 pub fn steers() -> Option<String> {
-    let taken = STEER.lock().unwrap().take();
+    let mut steer = STEER.lock().unwrap();
+    let before = steer.sent.len();
+    let taken = steer.take();
+    let count = before - steer.sent.len();
+    drop(steer);
     if taken.is_some() {
+        progress(|p| p.steers.1 += count as u64);
         draw();
     }
     taken
+}
+
+/// A steer `low --send "/steer <text>"` left for the turn a server runs: it goes with the next request, as a line
+/// typed in the REPL does.
+pub fn steer(text: &str) {
+    let text = text.trim();
+    if !text.is_empty() {
+        STEER.lock().unwrap().sent.push(text.to_string());
+        progress(|p| p.steers.0 += 1);
+    }
+}
+
+/// Forgets what was sent to steer a turn and not taken, so a server's next task doesn't start with it.
+pub fn unsteer() {
+    let mut steer = STEER.lock().unwrap();
+    (steer.typing, steer.sent) = (String::new(), Vec::new());
+}
+
+/// Whether `low --send /abort` asked the running turn to stop, as Ctrl-C does.
+static ABORT: AtomicBool = AtomicBool::new(false);
+
+pub fn abort(on: bool) {
+    ABORT.store(on, Ordering::Relaxed);
+}
+
+/// Waits until abort(true).
+pub async fn aborted() {
+    while !ABORT.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// What a task a server runs is doing, kept whether or not a terminal shows the bar, for the status file `low --serve`
+/// keeps in its inbox: what the bar and the live rows show, and when any of it last moved.
+struct Progress {
+    task: Option<(Instant, String)>,
+    activity: String,
+    requests: u64,
+    tokens: (u64, u64, u64),
+    /// Steers sent to the task and steers a request took.
+    steers: (u64, u64),
+    moved: u64,
+}
+
+static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
+    task: None,
+    activity: String::new(),
+    requests: 0,
+    tokens: (0, 0, 0),
+    steers: (0, 0),
+    moved: 0,
+});
+
+/// Changes the progress and marks it as moved now.
+fn progress(change: impl FnOnce(&mut Progress)) {
+    let mut progress = PROGRESS.lock().unwrap();
+    change(&mut progress);
+    progress.moved = now_ms();
+}
+
+/// Starts the progress of a task a server took.
+pub fn begin(task: &str) {
+    // A run an abort cut short never ended.
+    LIVE.lock().unwrap().running = None;
+    progress(|p| {
+        *p = Progress {
+            task: Some((Instant::now(), flat(task, 300))),
+            activity: "waiting for the model".into(),
+            requests: 0,
+            tokens: (0, 0, 0),
+            steers: (0, 0),
+            moved: 0,
+        }
+    });
+}
+
+/// Ends the progress of a server's task: the steers a request took, and those sent too late for one.
+pub fn end() -> Value {
+    let pending = STEER.lock().unwrap().sent.len() as u64;
+    let mut progress = PROGRESS.lock().unwrap();
+    progress.task = None;
+    serde_json::json!({"taken": progress.steers.1, "dropped": pending})
+}
+
+/// What the running task is doing: its step, the run under way and how long it has run, what the model said it is after,
+/// the plan, its requests and tokens so far, and the steers waiting for a request. `moved` is when any of it last
+/// changed, in ms since the epoch; a client that sees it stand still for long sees a task that is stuck.
+pub fn status() -> Value {
+    let (step, plan) = (STEP.load(Ordering::Relaxed), PLAN.lock().unwrap().clone());
+    let (running, intent) = {
+        let live = LIVE.lock().unwrap();
+        let running = live.running.as_ref().map(|(at, label, _)| serde_json::json!({"what": label, "ms": ms(*at)}));
+        (running, live.intent.as_ref().map(|(text, _)| flat(text, 300)))
+    };
+    let pending = STEER.lock().unwrap().sent.len();
+    let p = PROGRESS.lock().unwrap();
+    let Some((started, task)) = &p.task else { return serde_json::json!({"state": "idle"}) };
+    let plan = (!plan.0.is_empty()).then(|| serde_json::json!({"steps": plan.0, "done": plan.1}));
+    serde_json::json!({
+        "state": "running", "task": task, "ms": ms(*started), "activity": p.activity, "step": step, "running": running,
+        "intent": intent, "plan": plan, "requests": p.requests,
+        "tokens": {"prompt": p.tokens.0, "cached": p.tokens.1, "out": p.tokens.2},
+        "steers": {"pending": pending, "taken": p.steers.1}, "moved": p.moved,
+    })
 }
 
 /// Shows a message the user sent during the turn where the model gets it.
@@ -404,6 +513,11 @@ pub fn tokens(n: u64) -> String {
 }
 
 pub fn activity(text: &str) {
+    progress(|p| {
+        if p.activity != text {
+            p.activity = text.to_string();
+        }
+    });
     let mut bar = BAR.lock().unwrap();
     match bar.as_mut() {
         Some(bar) if bar.activity != text => bar.activity = text.to_string(),
@@ -414,16 +528,20 @@ pub fn activity(text: &str) {
 }
 
 /// Shows text as the bar's activity until dropped, then puts back what the bar showed before.
-pub struct Busy(Option<String>);
+pub struct Busy(Option<String>, String);
 
 pub fn busy(text: &str) -> Busy {
+    let mut shown = String::new();
+    progress(|p| shown = std::mem::replace(&mut p.activity, text.into()));
     let before = BAR.lock().unwrap().as_mut().map(|bar| std::mem::replace(&mut bar.activity, text.into()));
     draw();
-    Busy(before)
+    Busy(before, shown)
 }
 
 impl Drop for Busy {
     fn drop(&mut self) {
+        let shown = std::mem::take(&mut self.1);
+        progress(|p| p.activity = shown);
         if let Some(before) = self.0.take() {
             activity(&before);
         }
@@ -438,6 +556,11 @@ pub fn cached(usage: &Value) -> Option<u64> {
 pub fn usage(usage: &Value) {
     let cached = cached(usage);
     let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+    let out = usage["completion_tokens"].as_u64().unwrap_or(0);
+    progress(|p| {
+        p.requests += 1;
+        p.tokens = (p.tokens.0 + prompt, p.tokens.1 + cached.unwrap_or(0), p.tokens.2 + out);
+    });
     update(|bar| bar.tokens = (bar.tokens.0 + prompt, bar.tokens.1 + cached.unwrap_or(0)));
 }
 
@@ -780,9 +903,12 @@ pub fn run(code: &str) {
     live.rows = vec![("2", format!("▸ {label}"))];
     live.running = Some((Instant::now(), label, named));
     redraw(&mut live);
+    drop(live);
+    progress(|_| {});
 }
 
 pub fn ran(meta: &Value, out: &str) {
+    progress(|_| {});
     let strings = |v: &Value| -> Vec<String> {
         v.as_array().into_iter().flatten().filter_map(Value::as_str).map(|s| flat(s, 120)).collect()
     };

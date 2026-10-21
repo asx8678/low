@@ -427,6 +427,7 @@ impl Agent {
         let finished = tokio::select! {
             biased;
             _ = tokio::signal::ctrl_c() => None,
+            _ = ui::aborted() => None,
             result = self.turn(task) => Some(result),
         };
         ui::settle();
